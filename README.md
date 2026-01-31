@@ -159,7 +159,7 @@ git clone https://github.com/asaotomo/DeepSentry.git
 cd DeepSentry
 
 # ⚠️ [中国大陆用户必选] 配置 Go 代理，防止依赖下载失败
-go env -w GOPROXY=[https://goproxy.cn](https://goproxy.cn),direct
+go env -w GOPROXY=https://goproxy.cn,direct
 
 # 整理并下载依赖 (这一步显式下载所有包)
 go mod tidy
@@ -229,6 +229,7 @@ go build -o deepsentry cmd/main.go
 DeepSentry/
 ├── cmd/                 # 入口文件 (Windows/Unix 兼容处理)
 ├── config.yaml          # 配置文件 (API Key, SSH Host)
+├── build.sh             # 交叉编译DeepSentry的Bash脚本（可一键构建多个操作系统和架构的可执行文件）
 ├── internal/
 │   ├── analyzer/        # [大脑] LLM 交互核心与 Prompt 构造
 │   ├── collector/       # [感知] 自动识别 OS (Ubuntu/CentOS/Win/Mac)
