@@ -1,4 +1,24 @@
-# DeepSentry v2.0 Ultimate
+<div align="center">
+
+# 🛡️ DeepSentry v2.0 Ultimate - 深海哨兵
+
+<h3>"让 AI 成为你的红蓝对抗伙伴与安全运维专家。"</h3>
+
+<p>
+  <i>Your AI-powered Security Agent for Local, Remote & Fleet Auditing.</i>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Team-Hx0-red?style=flat-square" alt="Team">
+  <img src="https://img.shields.io/badge/Version-v2.0%20Ultimate-2f81f7?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-gray?style=flat-square&logo=linux&logoColor=white" alt="Platform">
+  <img src="https://img.shields.io/badge/Go-1.21+-00ADD8?style=flat-square&logo=go&logoColor=white" alt="Go">
+  <img src="https://img.shields.io/badge/AI-Multi--Provider-blueviolet?style=flat-square" alt="AI">
+</p>
+
+[一眼看懂](#一眼看懂) • [版本亮点](#最新版本亮点) • [快速开始](#5-分钟快速开始) • [配置说明](#配置文件说明) • [多目标 Fleet](#多目标-fleet-用法) • [安全建议](#安全建议)
+
+</div>
 
 DeepSentry 是一个 AI 安全应急与智能运维 Agent。你只需要用自然语言描述任务，它会自动规划步骤、调用 Shell 或内置 Go 原生工具、连接本地或远程目标、持续观察结果，并生成可审计的 Markdown 报告。
 
