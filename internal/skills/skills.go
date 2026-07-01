@@ -1,9 +1,10 @@
 package skills
 
 import (
-	"ai-edr/internal/security" // 确保这里的 module 名和你 go.mod 里的一致
+	"ai-edr/internal/security"
 	"fmt"
 	"os/exec"
+	"strings"
 )
 
 // SkillResult 统一返回格式
@@ -52,7 +53,11 @@ func CheckCronJobs() string {
 
 // 4. RunSafeQuery 执行用户指定的任意（安全）查询
 func RunSafeQuery(bin string, args ...string) string {
-	out, err := security.SafeExec(bin, args...)
+	cmd := bin
+	if len(args) > 0 {
+		cmd += " " + strings.Join(args, " ")
+	}
+	out, err := security.SafeExecV3(cmd)
 	if err != nil {
 		return fmt.Sprintf("执行被阻断或失败: %v", err)
 	}

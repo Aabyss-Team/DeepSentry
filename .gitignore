@@ -1,0 +1,26 @@
+# Local configuration and secrets
+config.yaml
+.env
+.env.*
+*.pem
+*.key
+
+# Build artifacts
+/build/
+/bin/
+/deepsentry
+/deepsentry.exe
+*.zip
+*.tar
+*.tar.gz
+
+# Runtime output
+/reports/
+*.log
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+

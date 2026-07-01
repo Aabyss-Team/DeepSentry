@@ -4,6 +4,7 @@ import (
 	"ai-edr/internal/executor"
 	"crypto/md5"
 	"fmt"
+	"regexp"
 	"strings"
 	"sync"
 )
@@ -41,7 +42,10 @@ func isApproved(cmd string) bool {
 	return approvedCache[hash]
 }
 
-// CheckRisk 评估命令的风险等级
+var shellSplitRe = regexp.MustCompile(`\s*(?:&&|\|\||;)\s*`)
+
+// CheckRisk 评估命令的风险等级。
+// 策略尽量贴近 Claude Code 的交互体验：只读观测命令默认放行，明确有副作用的操作才确认。
 // 返回值: (riskLevel: "high"|"low", reason: string)
 func CheckRisk(cmd string) (string, string) {
 	cmd = strings.TrimSpace(cmd)
@@ -54,46 +58,90 @@ func CheckRisk(cmd string) (string, string) {
 		return "low", "用户已授权 (Session)"
 	}
 
-	// 1. 预处理：移除 local_run 等前缀并清洗
-	analyzeCmd := cmd
-	if strings.HasPrefix(cmd, "local_run ") {
-		analyzeCmd = strings.TrimPrefix(cmd, "local_run ")
-	}
-	analyzeCmd = cleanShellWrapper(analyzeCmd)
+	analyzeCmd := normalizeCommand(cmd)
 
-	// 2. 全局高危特征检测
-	// 检测重定向 (>)，防止文件覆盖风险
-	if strings.Contains(analyzeCmd, ">") {
-		return "high", "检测到文件重定向 (>)"
+	if reason := dangerousShellPattern(analyzeCmd); reason != "" {
+		return "high", reason
 	}
 
-	// 3. 复合命令拆分逻辑
-	// 将 &&, ;, || 统一替换为分隔符并拆分，逐个检查
-	normalizedCmd := analyzeCmd
-	normalizedCmd = strings.ReplaceAll(normalizedCmd, "&&", "::SPLIT::")
-	normalizedCmd = strings.ReplaceAll(normalizedCmd, ";", "::SPLIT::")
-	normalizedCmd = strings.ReplaceAll(normalizedCmd, "||", "::SPLIT::")
-
-	subCmds := strings.Split(normalizedCmd, "::SPLIT::")
-
-	// 4. 逐个分析子命令
+	subCmds := splitShellCommands(analyzeCmd)
 	for _, sub := range subCmds {
-		// 只要有一个子命令是高危，整体就是高危
 		risk, reason := checkSingleCommand(sub)
 		if risk == "high" {
 			return "high", reason
 		}
 	}
 
-	// 所有子命令都通过检查
-	return "low", "安全操作"
+	return "low", "只读/低副作用操作"
+}
+
+// CanReviewHighRiskWithAI 判断一条规则命中的高风险命令是否适合交给 LLM 二次复核。
+// 明确破坏、提权、持久化和管道执行脚本的命令仍保持硬拦截；只对容易误判的观测/枚举类命令链开放复核。
+func CanReviewHighRiskWithAI(cmd, reason string) bool {
+	cmd = strings.TrimSpace(cmd)
+	reason = strings.TrimSpace(reason)
+	if cmd == "" || reason == "" {
+		return false
+	}
+	if isApproved(cmd) {
+		return false
+	}
+	if isClearlyDestructive(cmd, reason) {
+		return false
+	}
+	return true
+}
+
+func isClearlyDestructive(cmd, reason string) bool {
+	analyzeCmd := strings.ToLower(normalizeCommand(cmd))
+	reason = strings.ToLower(reason)
+
+	if strings.Contains(reason, "管道执行脚本") {
+		return true
+	}
+
+	hardVerbs := map[string]bool{
+		"rm": true, "del": true, "erase": true, "rmdir": true,
+		"mkfs": true, "format": true, "fdisk": true, "dd": true,
+		"shred": true, "wipe": true, "truncate": true,
+		"reboot": true, "shutdown": true, "halt": true, "poweroff": true, "init": true,
+		"chown": true, "chgrp": true, "useradd": true, "usermod": true, "userdel": true,
+		"passwd": true, "groupadd": true, "groupmod": true, "groupdel": true,
+		"sudo": true, "su": true, "doas": true, "mount": true, "umount": true,
+		"kill": true, "pkill": true, "killall": true, "taskkill": true,
+		"invoke-expression": true, "iex": true,
+	}
+	for _, sub := range splitShellCommands(analyzeCmd) {
+		parts := strings.Fields(sub)
+		if len(parts) == 0 {
+			continue
+		}
+		verb := strings.Trim(strings.ToLower(parts[0]), "\"'")
+		if hardVerbs[verb] {
+			return true
+		}
+	}
+
+	if strings.Contains(analyzeCmd, "| sh") || strings.Contains(analyzeCmd, "| bash") ||
+		strings.Contains(analyzeCmd, "| sudo") || strings.Contains(analyzeCmd, "| powershell") ||
+		strings.Contains(analyzeCmd, "| pwsh") {
+		return true
+	}
+
+	return false
+}
+
+func normalizeCommand(cmd string) string {
+	cmd = strings.TrimSpace(cmd)
+	if strings.HasPrefix(cmd, "local_run ") {
+		cmd = strings.TrimSpace(strings.TrimPrefix(cmd, "local_run "))
+	}
+	return cleanShellWrapper(cmd)
 }
 
 // cleanShellWrapper 清洗 Shell 包装器和引号
 func cleanShellWrapper(cmd string) string {
 	cmd = strings.TrimSpace(cmd)
-
-	// 移除常见 Shell 前缀 (不区分大小写的简单处理)
 	prefixes := []string{"/bin/sh -c", "sh -c", "/bin/bash -c", "bash -c", "cmd /c", "powershell -Command", "powershell -c"}
 	for _, p := range prefixes {
 		if len(cmd) > len(p) && strings.EqualFold(cmd[:len(p)], p) {
@@ -115,6 +163,36 @@ func cleanShellWrapper(cmd string) string {
 	return strings.TrimSpace(cmd)
 }
 
+func splitShellCommands(cmd string) []string {
+	raw := shellSplitRe.Split(cmd, -1)
+	out := make([]string, 0, len(raw))
+	for _, part := range raw {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
+}
+
+func dangerousShellPattern(cmd string) string {
+	lower := strings.ToLower(cmd)
+	if strings.Contains(cmd, ">") {
+		return "检测到文件重定向，可能覆盖/写入文件"
+	}
+	if strings.Contains(cmd, "|") {
+		if strings.Contains(lower, "| sh") || strings.Contains(lower, "| bash") ||
+			strings.Contains(lower, "| sudo") || strings.Contains(lower, "| powershell") ||
+			strings.Contains(lower, "| pwsh") {
+			return "检测到管道执行脚本"
+		}
+	}
+	if strings.Contains(lower, "$(") || strings.Contains(lower, "`") {
+		return "检测到命令替换，需确认真实执行内容"
+	}
+	return ""
+}
+
 // checkSingleCommand 单个命令判定逻辑
 func checkSingleCommand(subCmd string) (string, string) {
 	subCmd = strings.TrimSpace(subCmd)
@@ -132,7 +210,10 @@ func checkSingleCommand(subCmd string) (string, string) {
 	// 二次清洗：防止动词本身带引号 (如 "cd")
 	verb = strings.Trim(verb, "\"'")
 
-	// --- 白名单 (Low Risk) ---
+	if isAssignmentOrEnvPrefix(verb) && len(parts) > 1 {
+		return checkSingleCommand(strings.Join(parts[1:], " "))
+	}
+
 	lowRiskVerbs := map[string]bool{
 		// 浏览与查看
 		"ls": true, "dir": true, "pwd": true, "cd": true,
@@ -140,20 +221,27 @@ func checkSingleCommand(subCmd string) (string, string) {
 		"more": true, "less": true, "tree": true,
 		"find": true, "grep": true, "findstr": true,
 		"stat": true, "file": true, "where": true, "which": true,
+		"awk": true, "sed": true, "sort": true, "uniq": true, "wc": true,
+		"cut": true, "tr": true, "xargs": true,
 
 		// 系统/网络信息
 		"whoami": true, "id": true, "hostname": true, "uname": true,
-		"uptime": true, "date": true, "w": true,
+		"uptime": true, "date": true, "w": true, "who": true, "last": true,
+		"lastlog": true, "groups": true, "env": true, "printenv": true,
+		"history": true, "locale": true, "ulimit": true,
 		"ps": true, "top": true, "tasklist": true, "free": true, "df": true, "du": true,
+		"vmstat": true, "iostat": true, "mpstat": true, "sar": true,
+		"lsof": true, "fuser": true, "journalctl": true, "dmesg": true,
+		"loginctl": true, "systemd-analyze": true,
 		"ipconfig": true, "ifconfig": true, "ip": true, "netstat": true, "ss": true,
 		"ping": true, "arp": true, "route": true, "nslookup": true, "dig": true,
-		"wmic": true, "ver": true,
+		"host": true, "traceroute": true, "tracepath": true, "mtr": true,
+		"wmic": true, "ver": true, "scutil": true, "sw_vers": true,
+		"curl": true, "wget": true,
 
 		// 文件操作 (非破坏性)
 		"mkdir": true, "touch": true, "type": true,
 
-		// 🟢 [新增] PowerShell 常用安全动词
-		// 注意：已移除重复的 "ls"
 		"get-childitem": true, "gci": true,
 		"get-content": true, "gc": true,
 		"get-location": true, "gl": true,
@@ -165,27 +253,33 @@ func checkSingleCommand(subCmd string) (string, string) {
 	}
 
 	if lowRiskVerbs[verb] {
-		return "low", "安全操作"
+		if reason := lowRiskCommandWithDangerousArgs(verb, parts[1:]); reason != "" {
+			return "high", reason
+		}
+		return "low", "只读/低副作用操作"
 	}
 
-	// --- 黑名单 (High Risk) ---
 	highRiskVerbs := map[string]bool{
 		// 破坏性操作
 		"rm": true, "del": true, "erase": true, "rmdir": true,
 		"mv": true, "move": true, "cp": true, "copy": true,
 		"mkfs": true, "format": true, "fdisk": true, "dd": true,
-		"shred": true, "wipe": true,
+		"shred": true, "wipe": true, "truncate": true,
 
 		// 系统控制与权限
 		"reboot": true, "shutdown": true, "halt": true, "poweroff": true, "init": true,
 		"systemctl": true, "service": true, "sc": true, "reg": true,
 		"chmod": true, "chown": true, "chgrp": true, "attrib": true,
 		"useradd": true, "usermod": true, "userdel": true, "passwd": true,
-		"sudo": true, "su": true,
+		"groupadd": true, "groupmod": true, "groupdel": true,
+		"sudo": true, "su": true, "doas": true,
+		"mount": true, "umount": true, "crontab": true,
 
 		// 进程与网络传输
 		"kill": true, "pkill": true, "killall": true, "taskkill": true,
-		"wget": true, "curl": true, "nc": true, "ncat": true,
+		"nc": true, "ncat": true, "socat": true,
+		"ssh": true, "scp": true, "rsync": true, "ftp": true, "sftp": true,
+		"nmap": true, "masscan": true, "tcpdump": true,
 
 		// PowerShell 敏感操作
 		"invoke-expression": true, "iex": true,
@@ -196,8 +290,63 @@ func checkSingleCommand(subCmd string) (string, string) {
 		return "high", fmt.Sprintf("敏感指令: %s", verb)
 	}
 
-	// --- 默认策略 ---
-	return "high", fmt.Sprintf("未知指令(%s)，需人工确认", verb)
+	return "low", fmt.Sprintf("未识别指令(%s)，未发现写入/破坏/提权特征，按低风险执行", verb)
+}
+
+func isAssignmentOrEnvPrefix(verb string) bool {
+	if verb == "env" {
+		return true
+	}
+	return strings.Contains(verb, "=") && !strings.HasPrefix(verb, "-")
+}
+
+func lowRiskCommandWithDangerousArgs(verb string, args []string) string {
+	for i, arg := range args {
+		lower := strings.ToLower(strings.TrimSpace(arg))
+		if lower == "" {
+			continue
+		}
+		if lower == "-exec" || strings.HasPrefix(lower, "-exec=") || lower == "-delete" {
+			return fmt.Sprintf("%s 参数包含可执行/删除动作: %s", verb, arg)
+		}
+		if verb == "xargs" && isDangerousToken(lower) {
+			return fmt.Sprintf("xargs 将执行敏感指令: %s", arg)
+		}
+		if (verb == "sed" || verb == "perl") && (lower == "-i" || strings.HasPrefix(lower, "-i")) {
+			return fmt.Sprintf("%s 原地修改文件", verb)
+		}
+		if verb == "curl" {
+			if lower == "-o" || lower == "--output" || lower == "-O" || strings.HasPrefix(lower, "--output=") {
+				return "curl 下载写入文件"
+			}
+			if lower == "-d" || lower == "--data" || lower == "--data-raw" || lower == "--data-binary" || strings.HasPrefix(lower, "-d") {
+				return "curl 发送请求体，可能改变远端状态"
+			}
+			if (lower == "-x" || lower == "--request") && i+1 < len(args) {
+				method := strings.ToUpper(strings.Trim(args[i+1], "\"'"))
+				if method != "GET" && method != "HEAD" && method != "OPTIONS" {
+					return "curl 使用非只读 HTTP 方法: " + method
+				}
+			}
+		}
+		if verb == "wget" && (lower == "-o" || lower == "-O" || lower == "--output-document" || strings.HasPrefix(lower, "--output-document=")) {
+			return "wget 下载写入文件"
+		}
+		if i == 0 && isDangerousToken(lower) {
+			return fmt.Sprintf("%s 将调用敏感指令: %s", verb, arg)
+		}
+	}
+	return ""
+}
+
+func isDangerousToken(token string) bool {
+	token = strings.Trim(token, "\"'")
+	switch token {
+	case "rm", "sh", "bash", "sudo", "su", "chmod", "chown", "systemctl", "service", "kill", "curl", "wget", "nc", "ncat":
+		return true
+	default:
+		return false
+	}
 }
 
 // SafeExecV3 执行命令的安全封装

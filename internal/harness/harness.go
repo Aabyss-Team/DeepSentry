@@ -1,0 +1,1231 @@
+package harness
+
+import (
+	"ai-edr/internal/analyzer"
+	"ai-edr/internal/config"
+	"ai-edr/internal/executor"
+	"ai-edr/internal/harness/subagent"
+	"ai-edr/internal/logger"
+	"ai-edr/internal/mcp"
+	"ai-edr/internal/memory"
+	"ai-edr/internal/scheduler"
+	"ai-edr/internal/security"
+	"ai-edr/internal/skills"
+	"ai-edr/internal/tools"
+	termui "ai-edr/internal/ui"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+)
+
+// DeepAgent Deep Agent Harness（对标 deepagents create_deep_agent）
+type DeepAgent struct {
+	Middleware     []Middleware
+	State          *AgentState
+	Catalog        *skills.SkillCatalog
+	MemoryStore    *memory.Store
+	UseNativeTools bool
+	SessionID      string
+	Checkpoint     *CheckpointStore
+	StartStep      int // resume 起始步数
+}
+
+// Config Harness 配置
+type Config struct {
+	SkillSources         []string
+	DisabledSkillSources []string
+	WorkspaceDir         string
+	BatchMode            bool
+	MemoryScope          string
+	SessionID            string
+	UseNativeTools       bool
+	MCPServers           []string // 格式: "name:command:arg1,arg2"
+	MCPServerConfigs     []config.MCPServerConfig
+}
+
+// NewDeepAgent 创建 Deep Agent（组装 middleware stack + 可扩展 Option）
+func NewDeepAgent(cfg Config, opts ...Option) (*DeepAgent, error) {
+	b := &agentBuilder{cfg: cfg}
+
+	if cfg.WorkspaceDir == "" {
+		home, _ := os.UserHomeDir()
+		cfg.WorkspaceDir = filepath.Join(home, ".deepsentry", "workspace")
+		b.cfg.WorkspaceDir = cfg.WorkspaceDir
+	}
+
+	for _, opt := range opts {
+		opt(b)
+	}
+	cfg = b.cfg
+
+	sources := cfg.SkillSources
+	if len(sources) == 0 && len(config.GlobalConfig.SkillSources) > 0 {
+		sources = config.GlobalConfig.SkillSources
+	}
+	if len(sources) == 0 {
+		sources = skills.DefaultSources()
+	}
+	sources = filterSkillSources(sources, append(config.GlobalConfig.DisabledSkillSources, cfg.DisabledSkillSources...))
+
+	catalog, err := skills.LoadCatalog(sources)
+	if err != nil {
+		fmt.Printf("%sSkills 加载失败，继续无 Skill 模式: %v\n", termui.Prefix("⚠️", "[WARN]"), err)
+		catalog = &skills.SkillCatalog{}
+	}
+
+	state := NewAgentState(cfg.WorkspaceDir)
+
+	_ = memory.EnsureDefaultAgentsMD()
+	memScope := cfg.MemoryScope
+	if memScope == "" {
+		isRemote := config.GlobalConfig.SSHHost != "" && executor.Current != nil && executor.Current.IsRemote()
+		memScope = memory.ScopeForTarget(isRemote, config.GlobalConfig.SSHHost)
+	}
+	memStore, err := memory.NewStore(memScope)
+	if err != nil {
+		return nil, fmt.Errorf("加载 Memory 失败: %w", err)
+	}
+
+	stack := defaultMiddlewareStack(catalog, memStore)
+	for _, mw := range b.middleware {
+		stack = mergeMiddleware(stack, mw)
+	}
+
+	useNative := config.GlobalConfig.UseNativeTools
+	if cfg.UseNativeTools {
+		useNative = true
+	}
+	tools.ConfigureEnabled(config.GlobalConfig.EnabledTools, config.GlobalConfig.DisabledTools)
+
+	// MCP 服务器
+	for _, spec := range cfg.MCPServers {
+		if err := connectMCPServer(spec); err != nil {
+			fmt.Printf("%sMCP 连接失败 [%s]: %v\n", termui.Prefix("⚠️", "[WARN]"), spec, err)
+		}
+	}
+	for _, spec := range config.GlobalConfig.MCPServers {
+		if err := connectMCPServer(spec); err != nil {
+			fmt.Printf("%sMCP 连接失败 [%s]: %v\n", termui.Prefix("⚠️", "[WARN]"), spec, err)
+		}
+	}
+	for _, spec := range cfg.MCPServerConfigs {
+		if err := connectStructuredMCPServer(spec); err != nil {
+			fmt.Printf("%sMCP 连接失败 [%s]: %v\n", termui.Prefix("⚠️", "[WARN]"), spec.Name, err)
+		}
+	}
+	for _, spec := range config.GlobalConfig.MCPServerConfigs {
+		if err := connectStructuredMCPServer(spec); err != nil {
+			fmt.Printf("%sMCP 连接失败 [%s]: %v\n", termui.Prefix("⚠️", "[WARN]"), spec.Name, err)
+		}
+	}
+
+	sessionID := cfg.SessionID
+	if sessionID == "" {
+		sessionID = NewSessionID()
+	}
+	cp, _ := NewCheckpointStore(sessionID)
+
+	agent := &DeepAgent{
+		Middleware:     stack,
+		State:          state,
+		Catalog:        catalog,
+		MemoryStore:    memStore,
+		UseNativeTools: useNative,
+		SessionID:      sessionID,
+		Checkpoint:     cp,
+	}
+	wireSubAgentParent(agent)
+	return agent, nil
+}
+
+func wireSubAgentParent(agent *DeepAgent) {
+	for _, mw := range agent.Middleware {
+		if sm, ok := mw.(*SubAgentMiddleware); ok {
+			sm.SetParent(agent)
+		}
+	}
+}
+
+func mergeMiddleware(stack []Middleware, mw Middleware) []Middleware {
+	for i, existing := range stack {
+		if existing.Name() == mw.Name() {
+			stack[i] = mw
+			return stack
+		}
+	}
+	return append(stack, mw)
+}
+
+func connectMCPServer(spec string) error {
+	parts := strings.SplitN(spec, ":", 3)
+	if len(parts) < 2 {
+		return fmt.Errorf("格式应为 name:command:arg1,arg2")
+	}
+	var args []string
+	if len(parts) == 3 && parts[2] != "" {
+		args = strings.Split(parts[2], ",")
+	}
+	return mcp.ConnectStdio(mcp.ServerConfig{Name: parts[0], Command: parts[1], Args: args})
+}
+
+func connectStructuredMCPServer(spec config.MCPServerConfig) error {
+	return mcp.ConnectStdio(mcp.ServerConfig{
+		Name:     spec.Name,
+		Type:     spec.Type,
+		Command:  spec.Command,
+		Args:     spec.Args,
+		Env:      spec.Env,
+		CWD:      spec.CWD,
+		URL:      spec.URL,
+		Disabled: spec.Disabled,
+	})
+}
+
+func filterSkillSources(sources, disabled []string) []string {
+	if len(disabled) == 0 {
+		return sources
+	}
+	blocked := make(map[string]bool, len(disabled))
+	for _, value := range disabled {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			blocked[value] = true
+		}
+	}
+	out := sources[:0]
+	for _, source := range sources {
+		if !blocked[source] {
+			out = append(out, source)
+		}
+	}
+	return out
+}
+
+// BuildSystemPrompt 通过 middleware 链增强 system prompt
+func (a *DeepAgent) BuildSystemPrompt(base string) string {
+	prompt := base + a.deepAgentBasePrompt()
+	for _, mw := range a.Middleware {
+		prompt = mw.EnhancePrompt(prompt, a.State)
+	}
+	return prompt
+}
+
+// ParseAction 从 AgentResponse 解析为 AgentAction
+func ParseAction(resp analyzer.AgentResponse) AgentAction {
+	action := AgentAction{
+		Thought:        resp.Thought,
+		RiskLevel:      resp.RiskLevel,
+		Reason:         resp.Reason,
+		IsFinished:     resp.IsFinished,
+		FinalReport:    resp.FinalReport,
+		Question:       resp.Question,
+		Options:        resp.Options,
+		Command:        resp.Command,
+		TaskName:       resp.TaskName,
+		TaskPrompt:     resp.TaskPrompt,
+		TaskMaxSteps:   resp.TaskMaxSteps,
+		TargetSelector: resp.TargetSelector,
+		TargetName:     resp.TargetName,
+		TargetProtocol: resp.TargetProtocol,
+		TargetHost:     resp.TargetHost,
+		SkillName:      resp.SkillName,
+		Path:           resp.Path,
+		Content:        resp.Content,
+		Pattern:        resp.Pattern,
+		OldString:      resp.OldString,
+		NewString:      resp.NewString,
+		ReplaceAll:     resp.ReplaceAll,
+		GlobPattern:    resp.GlobPattern,
+		MemoryKey:      resp.MemoryKey,
+		MemoryValue:    resp.MemoryValue,
+		MemoryScope:    resp.MemoryScope,
+		ToolName:       resp.ToolName,
+		ToolArgs:       resp.ToolArgs,
+	}
+
+	if len(resp.Todos) > 0 {
+		action.Todos = make([]TodoItem, len(resp.Todos))
+		for i, t := range resp.Todos {
+			action.Todos[i] = TodoItem{ID: t.ID, Content: t.Content, Status: t.Status}
+		}
+	}
+	if len(resp.ParallelTasks) > 0 {
+		action.ParallelTasks = make([]SubAgentTaskAction, 0, len(resp.ParallelTasks))
+		for _, t := range resp.ParallelTasks {
+			action.ParallelTasks = append(action.ParallelTasks, SubAgentTaskAction{
+				TaskName:       t.TaskName,
+				TaskPrompt:     t.TaskPrompt,
+				TargetSelector: t.TargetSelector,
+				TaskMaxSteps:   t.TaskMaxSteps,
+			})
+		}
+	}
+
+	if resp.Action != "" {
+		action.Type = ActionType(resp.Action)
+		return action
+	}
+
+	// 兜底推断 action 类型
+	action.Type = inferActionType(action)
+	return action
+}
+
+func inferActionType(a AgentAction) ActionType {
+	if a.IsFinished {
+		return ActionFinish
+	}
+	if a.Question != "" {
+		return ActionAskUser
+	}
+	if a.ToolName != "" {
+		return ActionTool
+	}
+	if a.TaskName != "" || a.TaskPrompt != "" || len(a.ParallelTasks) > 0 {
+		return ActionTask
+	}
+	if a.SkillName != "" {
+		return ActionLoadSkill
+	}
+	if len(a.Todos) > 0 {
+		return ActionTodo
+	}
+	if a.MemoryKey != "" && a.MemoryValue != "" {
+		return ActionRemember
+	}
+	if a.MemoryKey != "" && a.MemoryValue == "" {
+		return ActionForget
+	}
+	if a.GlobPattern != "" {
+		return ActionGlob
+	}
+	if a.OldString != "" && a.Path != "" {
+		return ActionEditFile
+	}
+	if a.Path != "" && a.Content != "" {
+		return ActionWriteFile
+	}
+	if a.Path != "" && a.Pattern != "" {
+		return ActionGrep
+	}
+	if a.Path != "" {
+		return ActionReadFile
+	}
+	if a.Command != "" {
+		return ActionExecute
+	}
+	return ""
+}
+
+// HandleAction 通过 middleware 链处理动作
+func (a *DeepAgent) HandleAction(ctx *StepContext, action *AgentAction) (*ActionResult, error) {
+	if action.Type == ActionFinish || action.IsFinished {
+		report := action.FinalReport
+		if report == "" {
+			report = action.Thought
+		}
+		return &ActionResult{ShouldStop: true, FinalReport: report}, nil
+	}
+
+	if action.Type == ActionExecute || (action.Type == "" && action.Command != "") {
+		return a.handleExecute(ctx, action)
+	}
+
+	for _, mw := range a.Middleware {
+		result, handled, err := mw.HandleAction(ctx, action)
+		if err != nil {
+			return &ActionResult{Output: fmt.Sprintf("执行失败: %v", err)}, err
+		}
+		if handled {
+			if result == nil {
+				result = &ActionResult{Output: "(无输出)"}
+			}
+			result.Output = a.offloadLargeOutput(ctx.StepNum, result.Output)
+			return result, nil
+		}
+	}
+
+	return &ActionResult{Output: unknownActionGuidance(*action)}, nil
+}
+
+func unknownActionGuidance(action AgentAction) string {
+	name := strings.TrimSpace(string(action.Type))
+	if name == "" {
+		name = "(空)"
+	}
+	switch action.Type {
+	case "upload", "download":
+		return fmt.Sprintf("未知动作类型: %s。文件传输不是独立 action；优先用 action=\"execute\" 调用原生命令。需要传输文件时，使用 execute 的 command=\"upload <本地路径> <远程路径>\" 或 command=\"download <远程路径> <本地路径>\"；如果只是创建脚本，优先用远程 shell 的 cat <<'EOF' / printf 写入目标文件。", name)
+	default:
+		return fmt.Sprintf("未知动作类型: %s。默认优先使用 action=\"execute\" 执行目标机原生 Shell；只有 Shell 无法稳定完成、需要结构化跨平台解析、文档/pcap/定时任务/MCP 等能力时才使用 action=\"tool\" 或文件类 action。支持动作: execute/task/load_skill/todo/ask_user/read_file/write_file/edit_file/glob/grep/ls/remember/forget/tool/finish。", name)
+	}
+}
+
+func (a *DeepAgent) offloadLargeOutput(stepNum int, output string) string {
+	for _, mw := range a.Middleware {
+		if ctxMW, ok := mw.(*ContextMiddleware); ok {
+			return ctxMW.OffloadOutput(a.State, fmt.Sprintf("step%d", stepNum), output)
+		}
+	}
+	if len(output) > 8000 {
+		return output[:8000] + "\n...(输出过长已截断)..."
+	}
+	return output
+}
+
+func (a *DeepAgent) handleExecute(ctx *StepContext, action *AgentAction) (*ActionResult, error) {
+	cmd := action.Command
+	if cmd == "" {
+		return &ActionResult{Output: "空命令"}, nil
+	}
+	if guidance, blocked := blockDeepSentryConfigShell(cmd, ctx.Executor); blocked {
+		return &ActionResult{Output: guidance}, nil
+	}
+	var output string
+	var err error
+	if ctx.Executor != nil {
+		if streaming, ok := ctx.Executor.(executor.StreamingExecutor); ok && ctx.UI != nil {
+			output, err = streaming.RunWithStreaming(cmd, func(line string) {
+				ctx.UI.Emit(UIEvent{Kind: EventCommandOutput, Message: line})
+			})
+			if err != nil {
+				output = fmt.Sprintf("执行错误: %v\n%s", err, output)
+			}
+			output = a.offloadLargeOutput(ctx.StepNum, output)
+			return &ActionResult{Output: output, Streamed: true}, nil
+		}
+		output, err = ctx.Executor.Run(cmd)
+	} else {
+		output, err = security.SafeExecV3(cmd)
+	}
+	if err != nil {
+		output = fmt.Sprintf("执行错误: %v\n%s", err, output)
+	}
+	output = a.offloadLargeOutput(ctx.StepNum, output)
+	return &ActionResult{Output: output}, nil
+}
+
+func blockDeepSentryConfigShell(cmd string, ex executor.Executor) (string, bool) {
+	lower := strings.ToLower(strings.TrimSpace(cmd))
+	if !strings.Contains(lower, "config.yaml") {
+		return "", false
+	}
+	compact := " " + strings.NewReplacer("\\\n", " ", "\n", " ", "\t", " ").Replace(lower) + " "
+	protectedRefs := []string{
+		" /root/config.yaml",
+		" ./config.yaml",
+		" config.yaml",
+		" 'config.yaml'",
+		" \"config.yaml\"",
+		"'config.yaml'",
+		"\"config.yaml\"",
+		" ~/.deepsentry/config.yaml",
+		" .deepsentry/config.yaml",
+	}
+	matched := false
+	for _, ref := range protectedRefs {
+		if strings.Contains(compact, ref) {
+			matched = true
+			break
+		}
+	}
+	if !matched {
+		return "", false
+	}
+	scope := "控制端"
+	if ex != nil && ex.IsRemote() {
+		scope = "远端目标机"
+	}
+	return fmt.Sprintf(`已拦截 Shell 直接访问 DeepSentry 配置文件（当前 execute 视角: %s）。
+修改 DeepSentry 自身 config.yaml 必须使用控制端配置管理工具，避免误改目标服务器文件、绕过备份或写坏 YAML。
+
+请改用:
+{"action":"tool","tool_name":"config_manage","tool_args":{"action":"status"}}
+{"action":"tool","tool_name":"config_manage","tool_args":{"action":"add_target","protocol":"ssh","host":"<host:port>","user":"<user>","password":"<password>","tags":"<tag>"}}
+{"action":"tool","tool_name":"config_manage","tool_args":{"action":"set_ssh","host":"<host:port>","user":"<user>","password":"<password>"}}
+
+如果你确实要排查目标业务应用自己的 config.yaml，请让用户明确说明这是目标业务文件，并使用完整业务路径。`, scope), true
+}
+
+func (a *DeepAgent) deepAgentBasePrompt() string {
+	return `
+【Deep Agent Harness — 动作协议】
+你是 DeepSentry Deep Agent，具备多工具协作能力。每次响应必须是严格 JSON（无 Markdown 代码块），或通过 agent_action 工具调用。
+
+支持的动作 (action 字段):
+| action       | 用途                          | 必填字段                    |
+|--------------|-------------------------------|-----------------------------|
+| execute      | 执行 Shell 命令               | command                     |
+| task         | 委派子 Agent                  | task_name, task_prompt，可选 task_max_steps/target_selector/parallel_tasks |
+| load_skill   | 加载安全 Skill 完整指令       | skill_name                  |
+| todo         | 更新任务清单                  | todos[]                     |
+| read_file    | 读取文件（目标机或控制端 workspace） | path                 |
+| write_file   | 写入文件                      | path, content               |
+| edit_file    | 增量编辑文件                  | path, old_string, new_string |
+| glob         | 文件名 glob 搜索              | path, glob_pattern          |
+| grep         | 文件内搜索                    | path, pattern               |
+| ls           | 列出目录                      | path                        |
+| remember     | 保存跨会话记忆                | memory_key, memory_value    |
+| forget       | 删除跨会话记忆                | memory_key                  |
+| tool         | 调用内置/MCP 工具             | tool_name, tool_args        |
+| ask_user     | 缺少关键信息时暂停并询问用户  | question，可选 options[]     |
+| finish       | 完成任务                      | final_report                |
+
+AGENTS.md 可通过 write_file/edit_file 写入 ~/.deepsentry/AGENTS.md 实现跨会话记忆闭环。
+
+规则:
+1. 复杂独立任务优先委派子 Agent (task)。给子 Agent 任务时按难度预估 task_max_steps：简单 8-12，普通 12-18，复杂日志/多证据链 20-35；运行器会按用户配置的 subagent_max_steps 自动截断。
+   - 多个互相独立的方向要并发协作时，使用 action="task" + parallel_tasks 数组，例如同时委派 log-analyst、network-analyst、webshell-hunter；每个子任务包含 task_name/task_prompt，可选 task_max_steps/target_selector。
+   - 并行子 Agent 完成后，你必须综合它们的结果，合并证据链和冲突结论，再决定下一步。
+2. 专业排查前先 load_skill
+3. 多步任务先用 todo 规划
+4. DeepSentry 自身配置管理硬规则：
+   - 当用户要求添加/修改/修复 DeepSentry config.yaml、添加 SSH/Fleet 目标、添加/关闭 MCP、添加/关闭 Skill 来源时，必须使用 action="tool" 且 tool_name="config_manage"。
+   - 禁止用 execute/read_file/write_file/edit_file/grep/ls 去 cat/sed/tee/echo/python 修改或查看目标机上的 /root/config.yaml、./config.yaml、~/.deepsentry/config.yaml 来完成 DeepSentry 配置管理。
+   - config_manage 是控制端视角，会自动备份并重载配置；远程 execute 是目标机视角，会误改服务器文件。
+5. 文件操作用 read_file/grep/ls/edit_file/glob，复杂系统操作用 execute
+6. Shell-first 原则：默认优先使用 action="execute" 执行目标机原生 Shell 命令来解决排查问题。原生命令能稳定完成的事，不要上来就用 action="tool"；但 DeepSentry 自身配置管理例外，必须用 config_manage。
+   - 适合优先 Shell：系统状态、进程、端口、磁盘、服务、日志 tail/grep/awk/sed、创建脚本、chmod、crontab/systemd、curl 发送通知等。
+   - 需要写脚本到目标机时，优先用远程 shell heredoc/printf 创建文件并 chmod；不要输出 action="upload" 或 action="download"，这不是合法动作。确需传输控制端文件时，使用 action="execute" 且 command 为 upload/download 伪命令。
+7. 工具作为 fallback：只有目标机缺少常用命令、输出过大/格式复杂、需要跨平台结构化解析、控制端探测、文档/pcap 解析、定时任务编排、MCP 扩展或 DeepSentry 配置管理时，才先调用 tool_catalog 调研，再选择具体工具；注意 🎯目标机 vs 💻控制端 视角
+   - 遇到 PDF/Word/Excel/CSV/RTF 等流版式或表格文件，优先使用 document_parse 提取文本、表格和元信息，避免直接 read_file 读取二进制
+   - 遇到 pcap/cap 流量文件，优先使用 pcap_analyze 做 gopacket 离线解析，提取协议统计、会话、DNS/HTTP/TLS/SMB/NTLM 线索
+   - 代理/转发仅用于用户明确授权的短生命周期排查：tcp_forward 做端口映射，socks5_proxy 做本地 SOCKS5；不要设计持久化、反连控制面或自动隐藏通道
+   - 遇到“明天/后天/每天/每周/几点/定时/提醒/发钉钉/发飞书/发邮件”等未来时间需求，使用 schedule_task 创建本地定时任务；巡检类默认 kind=inspection，按时生成报告并可通过钉钉、飞书、邮件网关通知。泛化 Agent 无人值守任务只有用户明确要求 allow_batch=true 时才设置。
+   - 配置外部通知时必须逐项确认：先问通知通道（钉钉/飞书/邮件网关/多个通道）；再问对应 webhook 或网关地址/收件人；再问机器人安全设置（无加签/关键词/IP 段/加签）；若用户选择或提到加签，下一轮必须单独询问 secret。不要假设加签密钥可省略。
+8. remember 持久化重要结论（禁止存凭证）
+9. JSON 字符串内双引号转义为 \\"，反斜杠转义为 \\\\
+10. 当任务还缺少必要信息（如 webhook、凭证路径、目标范围、阈值、策略选择）时，必须使用 action="ask_user" 提问；不要用 finish/final_report 提问，也不要结束任务。每次 ask_user 只问一个最关键的阻塞问题；用户回答后再问下一个。
+
+【Coding / 脚本工程能力】
+- 你应该像 Claude Code / Codex 一样擅长创建、编写、修改、编辑、优化脚本来解决问题；不要因为脚本有 bug 就直接报错结束。
+- 脚本任务采用闭环：先 read/grep/sed 查看现状 -> 判断根因 -> 最小修改或重写脚本 -> chmod/语法检查 -> 运行一次验证 -> 根据输出继续修复，直到可用或明确阻塞。
+- 修改已有脚本前先查看相关片段和变量来源；不要凭空编辑。复杂替换优先用 python/perl/sed 或 heredoc 生成临时文件再 mv，避免 JSON 多行 old_string 转义出错。
+- 远程目标脚本优先通过 execute 使用 cat <<'EOF'、python - <<'PY'、sed/perl -i 等原生 Shell 技法完成；文件工具可用于读取、精确写入、增量编辑，但必须保证 JSON 合法。
+- todo 的 id 必须使用字符串（如 "1"），字段使用 content/status；不要输出 title/detail 作为唯一任务内容。
+- 每次脚本修复后都要用 execute 验证关键路径，例如 bash -n、shellcheck(若存在)、脚本 dry-run、curl/日志检查、crontab/systemctl 状态检查。
+- SSH EOF/断线/超时通常由执行器自动重连；不要轻易要求用户重启 DeepSentry。先继续执行一个低风险连接验证命令（如 echo ok && uptime）确认状态。
+
+【Coding Plan 协调】
+- 遇到跨文件修改、脚本编写、工具编排、长链路排查时，先用 todo 写出 3-7 步计划。
+- 每完成一个关键步骤，更新 todo 状态；不要在最终报告才一次性补计划。
+- 需要 AI 临场编写脚本时，先说明脚本目的和只读/写入边界，再通过 script_run 请求用户确认。
+- 多子 Agent/多工具结果要合并为同一证据链：目标、动作、输出、结论、风险、下一步；可用 parallel_tasks 并行运行多个不同子 Agent 后协作汇总。
+- 若用户要求“计划/方案/审计设计”，先给可执行计划；得到明确执行意图后再执行高风险操作。
+
+【Fleet 多目标运维】
+- 当任务涉及多台服务器/多个协议目标时，先调用 fleet_inventory 查看目标清单和标签。
+- 在本地直连/控制端模式下，严禁手写裸 ssh/scp/sftp root@host 访问已配置 targets；这些命令不会读取 config.yaml 中的密码/私钥，还会卡在交互式密码提示。必须改用 action="tool" 的 fleet_exec/fleet_file，或用 action="task" + target_selector 让运行器按配置创建目标执行器。
+- 批量巡检优先使用 fleet_exec/fleet_file，按 selector/tag/protocol 分批执行，避免手工逐台重复。
+- 需要每台机器独立分析时，使用 action="task" 并填写 target_selector（如 all/prod/ssh/web-01），系统会为每个目标创建隔离子 Agent。
+- fleet_exec/fleet_file 会按真实动作动态判险：fleet_exec 内部命令只读时可自动执行，写入/删除/重启等高风险命令才确认；fleet_file 的 ls/read/download 可自动执行，upload 需要确认。执行前仍要在 thought 中明确目标范围、命令和并发。
+- 对批量结果先汇总成功/失败/异常模式，再挑选异常节点进行重点排查；不要把所有原始输出无脑堆给用户。
+- FTP 目标仅做文件/目录操作；Telnet/SSH 目标可执行命令；混合目标要按协议拆分调度。
+`
+}
+
+func planModePrompt() string {
+	return `
+【计划模式】
+- 先判断是否缺少会影响执行方向的关键信息；缺少时用 action="ask_user" 只提出 1 个最关键问题，并可在 options 中给出 2-4 个短选项。
+- 如果缺少多个信息，按阻塞顺序逐个询问：先问会影响方案选择的问题，得到答案后再问 webhook、邮件网关地址、收件人、路径、凭据等具体参数。
+- 通知任务必须按顺序确认：通知通道 -> webhook/网关地址/收件人 -> 安全设置 -> 如启用加签则询问 secret；不能跳过安全设置直接生成脚本或定时任务。
+- 信息足够时先用 action="todo" 生成 3-7 步计划，只有一个步骤处于 in_progress。
+- 计划生成后继续执行计划；除非用户明确只要方案，不要在给出计划后直接 finish。
+- 用户中途补充/修改目标时，以最新用户消息为准，必要时更新 todo 后继续执行。
+`
+}
+
+func nonInteractivePrompt(_ bool) string {
+	return `
+【非交互模式】
+- 当前运行环境无法可靠进行二次输入、确认或选择；不要使用 action="ask_user"。
+- 遇到缺少可选信息时，采用保守默认值继续；缺少 webhook/凭证/密钥时跳过对应外部通知或认证步骤，并在 final_report 说明。
+- 高风险命令由运行器按无人值守策略处理；你仍需优先选择完成任务所需的最小命令，并避免无关破坏性操作。
+- 用户只是打招呼、询问能力或提出模糊需求时，请直接用 action="finish" 给出简短友好响应和可执行示例，不要 ask_user。
+- 多步骤命令的关键输出应通过 execute 返回，便于 stdout 像 fscan 一样直接展示。
+`
+}
+
+// RunLoop 主 Agent 循环
+func (a *DeepAgent) RunLoop(cfg RunLoopConfig) {
+	ui := cfg.UI
+	if ui == nil {
+		ui = NewStdoutSink()
+	}
+	sysCtx := cfg.SysCtx
+	history := cfg.History
+	reporter := cfg.Reporter
+	reportPath := cfg.ReportPath
+	batchMode := cfg.BatchMode
+	maxSteps := cfg.MaxSteps
+	subAgentMaxSteps := cfg.SubAgentMaxSteps
+	if subAgentMaxSteps <= 0 {
+		subAgentMaxSteps = 15
+	}
+	confirmFn := cfg.ConfirmFn
+	stop := cfg.Stop
+
+	stepCount := a.StartStep
+	consecutiveEmpty := 0
+	consecutiveLLMErr := 0
+	consecutiveAutoAsk := 0
+	maxLLMErr := 3
+
+	if reporter != nil && history != nil {
+		_ = reporter.SetTitle(logger.TitleFromHistory(*history))
+	}
+
+	if a.Catalog != nil && len(a.Catalog.Skills) > 0 {
+		ui.Emit(UIEvent{Kind: EventInfo, Message: fmt.Sprintf("%s已加载 %d 个 Skills", termui.Prefix("📚", "[SKILL]"), len(a.Catalog.Skills))})
+	}
+	ui.Emit(UIEvent{Kind: EventInfo, Message: fmt.Sprintf("%s已注册 %d 个子 Agent", termui.Prefix("🔀", "[SUB]"), subagent.Count())})
+	ui.Emit(UIEvent{Kind: EventInfo, Message: fmt.Sprintf("%s内置场景工具: %d 个启用 (Go原生/BusyBox，按需发现)", termui.Prefix("🔧", "[TOOL]"), tools.CountEnabled())})
+	if mcpNames := mcp.Global().ListNames(); len(mcpNames) > 0 {
+		ui.Emit(UIEvent{Kind: EventInfo, Message: fmt.Sprintf("%sMCP 扩展工具: %d 个", termui.Prefix("🔌", "[API]"), len(mcpNames))})
+	}
+	if a.UseNativeTools {
+		ui.Emit(UIEvent{Kind: EventInfo, Message: termui.Prefix("🛠️", "[CFG]") + "Native Tool Calling: 已启用"})
+	}
+	if a.Checkpoint != nil {
+		ui.Emit(UIEvent{Kind: EventInfo, Message: fmt.Sprintf("%s会话 ID: %s (支持 checkpoint 恢复)", termui.Prefix("💾", "[SESSION]"), a.SessionID)})
+	}
+	if a.MemoryStore != nil && a.MemoryStore.HasContent() {
+		parts := []string{}
+		if n := a.MemoryStore.Count(); n > 0 {
+			parts = append(parts, fmt.Sprintf("%d 条结构化记忆", n))
+		}
+		if n := a.MemoryStore.AgentsMDCount(); n > 0 {
+			parts = append(parts, fmt.Sprintf("%d 个 AGENTS.md（含内置默认）", n))
+		}
+		if len(parts) == 0 {
+			parts = append(parts, "内置默认记忆")
+		}
+		ui.Emit(UIEvent{Kind: EventInfo, Message: termui.Prefix("🧠", "[MEM]") + "跨会话 Memory: " + strings.Join(parts, " + ") + " (已注入上下文)"})
+	}
+	if !cfg.PlanMode && a.tryNativeScheduleIntent(history, ui, reporter, reportPath) {
+		return
+	}
+
+	for stepCount < maxSteps {
+		if shouldStop(stop) {
+			a.saveCheckpointUI(stepCount, history, ui)
+			ui.Emit(UIEvent{Kind: EventCheckpoint, Message: fmt.Sprintf("已停止，checkpoint 已保存。继续: deepsentry --resume %s", a.SessionID)})
+			break
+		}
+		stepCount++
+		ui.Emit(UIEvent{Kind: EventStepStart, Step: stepCount, MaxSteps: maxSteps})
+		ui.Emit(UIEvent{Kind: EventThinking})
+
+		extraPrompt := a.BuildSystemPrompt("")
+		extraPrompt += MultiTurnExtraPrompt(cfg.MultiTurn, history)
+		if cfg.PlanMode {
+			extraPrompt += planModePrompt()
+		}
+		if cfg.NonInteractive {
+			extraPrompt += nonInteractivePrompt(cfg.PauseOnAskUser)
+		}
+		if compacted, compactErr := analyzer.ManageHistoryContext(history); compactErr != nil {
+			analyzer.TruncateHistoryFallback(history, 8)
+			ui.Emit(UIEvent{Kind: EventInfo, Message: termui.Prefix("🧠", "[MEM]") + "上下文压缩失败，已保留最近关键历史继续执行"})
+		} else if compacted {
+			ui.Emit(UIEvent{Kind: EventInfo, Message: termui.Prefix("🧠", "[MEM]") + "上下文已自动压缩为前情提要，保留最近步骤继续执行"})
+			a.saveCheckpointUI(stepCount, history, ui)
+		}
+
+		var streamBuf strings.Builder
+		streamFn := func(delta string) {
+			if delta == "" {
+				return
+			}
+			streamBuf.WriteString(delta)
+			ui.Emit(UIEvent{Kind: EventStreamDelta, Message: delta, Detail: streamBuf.String()})
+		}
+
+		resp, err := analyzer.RunAgentStepWithOptions(analyzer.StepOptions{
+			SysCtx:         sysCtx,
+			History:        history,
+			ExtraPrompt:    extraPrompt,
+			UseNativeTools: a.UseNativeTools,
+			OnStream:       streamFn,
+			OnUsage: func(usage analyzer.TokenUsage) {
+				ui.Emit(UIEvent{
+					Kind:             EventTokenUsage,
+					PromptTokens:     usage.PromptTokens,
+					CompletionTokens: usage.CompletionTokens,
+					TotalTokens:      usage.TotalTokens,
+				})
+			},
+		})
+		if streamBuf.Len() > 0 {
+			ui.Emit(UIEvent{Kind: EventStreamEnd, Detail: streamBuf.String()})
+		}
+		if shouldStop(stop) {
+			a.saveCheckpointUI(stepCount, history, ui)
+			ui.Emit(UIEvent{Kind: EventCheckpoint, Message: fmt.Sprintf("已停止，checkpoint 已保存。继续: deepsentry --resume %s", a.SessionID)})
+			break
+		}
+
+		if err != nil {
+			consecutiveLLMErr++
+			ui.Emit(UIEvent{Kind: EventError, Message: fmt.Sprintf("%sAI 错误 (%d/%d): %v", termui.Prefix("❌", "[ERR]"), consecutiveLLMErr, maxLLMErr, err)})
+			a.saveCheckpointUI(stepCount, history, ui)
+			if consecutiveLLMErr >= maxLLMErr {
+				ui.Emit(UIEvent{Kind: EventCheckpoint, Message: "LLM 连续失败，已保存 checkpoint，可用 --resume 继续"})
+				break
+			}
+			time.Sleep(time.Duration(consecutiveLLMErr) * time.Second)
+			continue
+		}
+		consecutiveLLMErr = 0
+
+		action := ParseAction(resp)
+
+		if reporter != nil {
+			reporter.Log("AI Thought", fmt.Sprintf("Idea: %s\nAction: %s", action.Thought, action.Type))
+		}
+
+		if action.Thought != "" {
+			ui.Emit(UIEvent{Kind: EventThought, Message: action.Thought})
+		}
+
+		if action.Type == ActionAskUser {
+			consecutiveAutoAsk++
+			if strings.TrimSpace(action.Question) == "" {
+				action.Question = strings.TrimSpace(action.Thought)
+			}
+			if strings.TrimSpace(action.Question) == "" {
+				action.Question = "请补充继续任务所需的信息。"
+			}
+			*history = append(*history, analyzer.Message{
+				Role:    "assistant",
+				Content: actionToJSON(action),
+			})
+			if cfg.NonInteractive && cfg.AwaitUserFn == nil {
+				answer := nonInteractiveAskAnswer(action)
+				if consecutiveAutoAsk >= 3 {
+					answer += " 你已经连续多次请求补充信息；请不要再次 ask_user，必须基于现有信息继续或明确跳过缺失项后 finish。"
+				}
+				ui.Emit(UIEvent{Kind: EventInfo, Message: termui.Prefix("ℹ️", "[INFO]") + "非交互模式自动跳过补充输入，要求 Agent 基于现有信息继续。"})
+				*history = append(*history, analyzer.Message{
+					Role:    "user",
+					Content: "用户补充：" + answer,
+				})
+				a.saveCheckpointUI(stepCount, history, ui)
+				continue
+			}
+			actCopy := action
+			ui.Emit(UIEvent{Kind: EventAwaitUser, Message: formatAskUserMessage(action), Action: &actCopy})
+			a.saveCheckpointUI(stepCount, history, ui)
+			if cfg.AwaitUserFn == nil {
+				ui.Emit(UIEvent{Kind: EventCheckpoint, Message: askResumeMessage(a.SessionID, cfg.PauseOnAskUser)})
+				break
+			}
+			answer, ok := cfg.AwaitUserFn(&action)
+			if !ok || strings.TrimSpace(answer) == "" {
+				ui.Emit(UIEvent{Kind: EventCheckpoint, Message: askResumeMessage(a.SessionID, cfg.PauseOnAskUser)})
+				break
+			}
+			*history = append(*history, analyzer.Message{
+				Role:    "user",
+				Content: "用户补充：" + strings.TrimSpace(answer),
+			})
+			a.saveCheckpointUI(stepCount, history, ui)
+			continue
+		}
+		consecutiveAutoAsk = 0
+
+		if action.Type == ActionFinish || action.IsFinished {
+			report := action.FinalReport
+			if strings.TrimSpace(report) == "" {
+				report = fmt.Sprintf("%s任务完成。总结: %s", termui.Prefix("✅", "[OK]"), action.Thought)
+			}
+			CommitFinishToHistory(history, action, report)
+			a.saveCheckpointUI(stepCount, history, ui)
+			a.emitFinish(ui, report, reporter, reportPath)
+			break
+		}
+
+		if isEmptyAction(action) {
+			consecutiveEmpty++
+			if consecutiveEmpty >= 3 {
+				ui.Emit(UIEvent{Kind: EventError, Message: termui.Prefix("⚠️", "[WARN]") + "AI 多次未给出行动，强制结束。"})
+				report := action.FinalReport
+				if report == "" {
+					report = fmt.Sprintf("%s异常终止。最后思考: %s", termui.Prefix("❌", "[ERR]"), action.Thought)
+				}
+				CommitFinishToHistory(history, action, report)
+				a.emitFinish(ui, report, reporter, reportPath)
+				break
+			}
+			ui.Emit(UIEvent{Kind: EventInfo, Message: fmt.Sprintf("%s(无指令) 催促 AI 行动 [%d/3]...", termui.Prefix("⏳", "[WAIT]"), consecutiveEmpty)})
+			*history = append(*history, analyzer.Message{
+				Role:    "assistant",
+				Content: actionToJSON(action),
+			})
+			*history = append(*history, analyzer.Message{
+				Role:    "user",
+				Content: "系统警告: 请输出 action 字段执行操作，或 action=\"finish\" 结束任务。",
+			})
+			continue
+		}
+		consecutiveEmpty = 0
+
+		actCopy := action
+		enrichActionExecutionTarget(&actCopy)
+		ui.Emit(UIEvent{Kind: EventAction, Action: &actCopy})
+		if shouldStop(stop) {
+			a.saveCheckpointUI(stepCount, history, ui)
+			ui.Emit(UIEvent{Kind: EventCheckpoint, Message: fmt.Sprintf("已停止，checkpoint 已保存。继续: deepsentry --resume %s", a.SessionID)})
+			break
+		}
+
+		shouldRun := batchMode
+		if !shouldRun {
+			needsConfirm := false
+			switch action.Type {
+			case ActionExecute:
+				if action.Command != "" {
+					risk, reason := security.CheckRisk(action.Command)
+					action.RiskLevel = risk
+					action.Reason = reason
+					if risk == "high" {
+						if security.CanReviewHighRiskWithAI(action.Command, reason) {
+							ui.Emit(UIEvent{Kind: EventInfo, Message: termui.Prefix("🧠", "[AI]") + "规则判高，正在进行 AI 风险复核..."})
+							if reviewedRisk, reviewedReason, ok := reviewCommandRiskWithAI(sysCtx, action.Command, reason); ok {
+								action.RiskLevel = reviewedRisk
+								action.Reason = reviewedReason
+								if reviewedRisk == "low" {
+									ui.Emit(UIEvent{Kind: EventRiskAuto, Message: termui.Prefix("🟢", "[LOW]") + "AI 复核: 低风险 -> 自动执行 (" + reviewedReason + ")"})
+									shouldRun = true
+								} else {
+									needsConfirm = true
+								}
+							} else {
+								needsConfirm = true
+							}
+						} else {
+							needsConfirm = true
+						}
+					} else {
+						ui.Emit(UIEvent{Kind: EventRiskAuto, Message: termui.Prefix("🟢", "[LOW]") + "风险: 低 -> 自动执行"})
+						shouldRun = true
+					}
+				}
+			case ActionWriteFile, ActionEditFile:
+				needsConfirm = true
+			case ActionTask:
+				if strings.TrimSpace(action.TargetSelector) != "" {
+					action.RiskLevel = "medium"
+					action.Reason = "多目标子 Agent 编排"
+					needsConfirm = true
+				} else {
+					shouldRun = true
+				}
+			case ActionTool:
+				if t, ok := tools.Get(action.ToolName); ok {
+					risk, reason := resolveToolRisk(action, t)
+					action.RiskLevel = risk
+					action.Reason = reason
+					if risk == tools.RiskHigh || risk == tools.RiskMedium {
+						needsConfirm = true
+					} else {
+						ui.Emit(UIEvent{Kind: EventRiskAuto, Message: fmt.Sprintf("%s工具 [%s] 低风险 -> 自动执行", termui.Prefix("🟢", "[LOW]"), action.ToolName)})
+						shouldRun = true
+					}
+				} else {
+					shouldRun = true
+				}
+			default:
+				shouldRun = true
+			}
+
+			if needsConfirm {
+				if confirmFn != nil && confirmFn(&action) {
+					shouldRun = true
+					if action.Type == ActionExecute {
+						security.RecordApproval(action.Command)
+					}
+				} else {
+					ui.Emit(UIEvent{Kind: EventDenied})
+					*history = append(*history, analyzer.Message{
+						Role: "user", Content: "用户拒绝执行，请尝试其他方案。",
+					})
+					continue
+				}
+			}
+		} else {
+			ui.Emit(UIEvent{Kind: EventBatchAuto})
+		}
+
+		if !shouldRun {
+			continue
+		}
+
+		stepCtx := &StepContext{
+			SysCtx:           sysCtx,
+			State:            a.State,
+			History:          history,
+			Reporter:         reporter,
+			BatchMode:        batchMode,
+			StepNum:          stepCount,
+			MaxSteps:         maxSteps,
+			SubAgentMaxSteps: subAgentMaxSteps,
+			MemoryStore:      a.MemoryStore,
+			SessionID:        a.SessionID,
+			Checkpoint:       a.Checkpoint,
+			UI:               ui,
+			ConfirmFn:        confirmFn,
+			Executor:         executor.Current,
+		}
+
+		result, err := a.HandleAction(stepCtx, &action)
+		if err != nil {
+			ui.Emit(UIEvent{Kind: EventError, Message: fmt.Sprintf("%s执行出错: %v", termui.Prefix("⚠️", "[WARN]"), err)})
+			*history = append(*history, analyzer.Message{
+				Role: "user", Content: fmt.Sprintf("上一步执行失败: %v，请换方案。", err),
+			})
+			continue
+		}
+		if result == nil {
+			ui.Emit(UIEvent{Kind: EventError, Message: termui.Prefix("⚠️", "[WARN]") + "执行返回空结果"})
+			continue
+		}
+		if result.ShouldStop {
+			a.saveCheckpointUI(stepCount, history, ui)
+			a.emitFinish(ui, result.FinalReport, reporter, reportPath)
+			break
+		}
+
+		display := strings.TrimSpace(result.Output)
+		detail := result.Output
+		if result.Streamed && action.Type == ActionExecute {
+			if display == "" {
+				display = "命令执行完成（无输出）"
+			} else {
+				display = "命令执行完成"
+			}
+			detail = ""
+		} else {
+			if action.Type != ActionTodo && len(display) > 300 {
+				display = display[:300] + "..."
+			}
+			if display == "" {
+				display = "(无输出)"
+			}
+		}
+		ui.Emit(UIEvent{Kind: EventResult, Message: display, Detail: detail})
+
+		if reporter != nil && action.Type == ActionExecute {
+			reporter.LogCommand(action.Command, result.Output)
+		} else if reporter != nil {
+			reporter.Log(string(action.Type), result.Output)
+		}
+
+		*history = append(*history, analyzer.Message{
+			Role:    "assistant",
+			Content: actionToJSON(action),
+		})
+		*history = append(*history, analyzer.Message{
+			Role: "user", Content: fmt.Sprintf("Output:\n%s", result.Output),
+		})
+
+		a.saveCheckpointUI(stepCount, history, ui)
+	}
+}
+
+func resolveToolRisk(action AgentAction, t *tools.Tool) (string, string) {
+	if t == nil {
+		return tools.RiskLow, "未知工具按低风险处理"
+	}
+	switch action.ToolName {
+	case "fleet_exec":
+		cmd := firstToolArg(action.ToolArgs, "command", "cmd")
+		if cmd == "" {
+			return tools.RiskHigh, "fleet_exec 缺少 command，无法判断真实风险"
+		}
+		risk, reason := security.CheckRisk(cmd)
+		if risk == "low" {
+			return tools.RiskLow, "fleet_exec 内部命令低风险: " + reason
+		}
+		return tools.RiskHigh, "fleet_exec 内部命令高风险: " + reason
+	case "fleet_file":
+		switch strings.ToLower(strings.TrimSpace(action.ToolArgs["action"])) {
+		case "ls", "read", "download":
+			return tools.RiskLow, "fleet_file 只读/下载操作"
+		case "upload":
+			return tools.RiskHigh, "fleet_file upload 会写入目标文件"
+		default:
+			return tools.RiskHigh, "fleet_file action 不明确，无法判断真实风险"
+		}
+	default:
+		return t.RiskLevel, fmt.Sprintf("工具 %s [%s]", action.ToolName, t.Perspective)
+	}
+}
+
+func enrichActionExecutionTarget(action *AgentAction) {
+	if action == nil || action.Type != ActionExecute {
+		return
+	}
+	if isLocalRunCommand(action.Command) {
+		action.TargetName = ""
+		action.TargetProtocol = "local"
+		action.TargetHost = ""
+		return
+	}
+	if strings.TrimSpace(action.TargetProtocol) != "" || strings.TrimSpace(action.TargetHost) != "" {
+		return
+	}
+	mode := executor.CurrentMode()
+	switch mode {
+	case "ssh":
+		action.TargetProtocol = "ssh"
+		action.TargetHost = config.GlobalConfig.SSHHost
+	case "telnet":
+		action.TargetProtocol = "telnet"
+		action.TargetHost = config.GlobalConfig.TelnetHost
+	case "ftp":
+		action.TargetProtocol = "ftp"
+		action.TargetHost = config.GlobalConfig.FTPHost
+	case "local":
+		action.TargetProtocol = "local"
+	default:
+		if executor.Current != nil && executor.Current.IsRemote() {
+			action.TargetProtocol = "remote"
+		} else {
+			action.TargetProtocol = "local"
+		}
+	}
+}
+
+func enrichActionExecutionTargetFor(action *AgentAction, target config.TargetConfig) {
+	if action == nil || action.Type != ActionExecute {
+		return
+	}
+	if isLocalRunCommand(action.Command) {
+		action.TargetName = ""
+		action.TargetProtocol = "local"
+		action.TargetHost = ""
+		return
+	}
+	if strings.TrimSpace(action.TargetProtocol) != "" || strings.TrimSpace(action.TargetHost) != "" {
+		return
+	}
+	action.TargetName = target.Name
+	action.TargetProtocol = target.Protocol
+	action.TargetHost = target.Host
+	if strings.TrimSpace(action.TargetProtocol) == "" && strings.TrimSpace(action.TargetHost) == "" {
+		enrichActionExecutionTarget(action)
+	}
+}
+
+func isLocalRunCommand(cmd string) bool {
+	trimmed := strings.TrimSpace(cmd)
+	return trimmed == "local_run" || strings.HasPrefix(trimmed, "local_run ")
+}
+
+func formatAskUserMessage(action AgentAction) string {
+	var b strings.Builder
+	b.WriteString(strings.TrimSpace(action.Question))
+	for i, opt := range action.Options {
+		opt = strings.TrimSpace(opt)
+		if opt == "" {
+			continue
+		}
+		if i == 0 {
+			b.WriteString("\n\n可选：")
+		}
+		b.WriteString(fmt.Sprintf("\n%d. %s", i+1, opt))
+	}
+	return b.String()
+}
+
+func nonInteractiveAskAnswer(action AgentAction) string {
+	question := strings.TrimSpace(action.Question)
+	if question == "" {
+		question = strings.TrimSpace(action.Thought)
+	}
+	if question == "" {
+		question = "缺少补充信息"
+	}
+	var b strings.Builder
+	b.WriteString("当前是 WebShell/非交互模式，用户无法在运行中补充输入。")
+	b.WriteString("针对你的问题「")
+	b.WriteString(question)
+	b.WriteString("」，请基于已知信息采用保守默认方案继续。")
+	if len(action.Options) > 0 {
+		b.WriteString("如必须选择，请优先选择不依赖外部凭证、不会造成破坏的默认选项；可选项包括：")
+		for i, opt := range action.Options {
+			opt = strings.TrimSpace(opt)
+			if opt == "" {
+				continue
+			}
+			if i > 0 {
+				b.WriteString("；")
+			}
+			b.WriteString(opt)
+		}
+		b.WriteString("。")
+	}
+	b.WriteString("如果缺少 webhook、密钥、密码、目标范围等不可推断信息，请跳过对应功能并在最终报告说明，不要再次 ask_user。")
+	return b.String()
+}
+
+func askResumeMessage(sessionID string, webshell bool) string {
+	if webshell {
+		return fmt.Sprintf("等待用户补充，checkpoint 已保存。继续: deepsentry --webshell --resume %s --task \"在这里填写补充内容\"", sessionID)
+	}
+	return fmt.Sprintf("等待用户补充，checkpoint 已保存。继续: deepsentry --resume %s", sessionID)
+}
+
+func shouldStop(stop <-chan struct{}) bool {
+	if stop == nil {
+		return false
+	}
+	select {
+	case <-stop:
+		return true
+	default:
+		return false
+	}
+}
+
+func (a *DeepAgent) emitFinish(ui UISink, content string, reporter *logger.Reporter, path string) {
+	if reporter != nil {
+		reporter.Log("Final Report", content)
+	}
+	ui.Emit(UIEvent{Kind: EventFinish, Message: content, Detail: path})
+}
+
+func (a *DeepAgent) tryNativeScheduleIntent(history *[]analyzer.Message, ui UISink, reporter *logger.Reporter, reportPath string) bool {
+	if history == nil || len(*history) == 0 {
+		return false
+	}
+	latest := ""
+	for i := len(*history) - 1; i >= 0; i-- {
+		msg := (*history)[i]
+		if msg.Role != "user" {
+			continue
+		}
+		content := strings.TrimSpace(msg.Content)
+		if strings.HasPrefix(content, "Output:") || strings.HasPrefix(content, "系统警告:") {
+			return false
+		}
+		latest = strings.TrimSpace(strings.TrimPrefix(content, "需求："))
+		break
+	}
+	if latest == "" || !scheduler.LooksLikeSchedule(latest) {
+		return false
+	}
+	plan, err := scheduler.PlanTask(scheduler.PlanInput{
+		Text:     latest,
+		Timezone: config.GlobalConfig.SchedulerTimezone,
+	}, time.Now())
+	if err != nil {
+		return false
+	}
+	store := scheduler.NewStore(config.GlobalConfig.SchedulerStore)
+	if err := store.Add(plan.Task); err != nil {
+		ui.Emit(UIEvent{Kind: EventError, Message: fmt.Sprintf("定时任务创建失败: %v", err)})
+		return false
+	}
+	final := formatNativeScheduleFinish(plan, store.Path)
+	*history = append(*history, analyzer.Message{Role: "assistant", Content: final})
+	if reporter != nil {
+		reporter.Log("schedule_task", final)
+	}
+	a.emitFinish(ui, final, reporter, reportPath)
+	return true
+}
+
+func formatNativeScheduleFinish(plan scheduler.Plan, storePath string) string {
+	task := plan.Task
+	var b strings.Builder
+	b.WriteString("已创建定时任务。\n\n")
+	b.WriteString(fmt.Sprintf("- ID: %s\n", task.ID))
+	b.WriteString(fmt.Sprintf("- 名称: %s\n", task.Name))
+	b.WriteString(fmt.Sprintf("- 类型: %s\n", task.Kind))
+	b.WriteString(fmt.Sprintf("- 执行时间: %s (%s)\n", task.RunAt.Format("2006-01-02 15:04:05"), task.Timezone))
+	b.WriteString(fmt.Sprintf("- 重复: %s\n", task.Repeat))
+	b.WriteString(fmt.Sprintf("- 存储: %s\n", storePath))
+	for _, ch := range scheduler.NotifyChannels(task.Notify) {
+		switch ch {
+		case scheduler.NotifyDingTalk:
+			if strings.TrimSpace(config.GlobalConfig.DingTalkWebhook) == "" {
+				b.WriteString("- 钉钉: 已请求，但 dingtalk_webhook 还未配置，到点会生成本地报告但无法发送钉钉。\n")
+			} else {
+				b.WriteString("- 钉钉: 已配置 webhook，到点会发送通知。\n")
+			}
+		case scheduler.NotifyFeishu:
+			if strings.TrimSpace(config.GlobalConfig.FeishuWebhook) == "" {
+				b.WriteString("- 飞书: 已请求，但 feishu_webhook 还未配置，到点会生成本地报告但无法发送飞书。\n")
+			} else {
+				b.WriteString("- 飞书: 已配置 webhook，到点会发送通知。\n")
+			}
+		case scheduler.NotifyEmail:
+			if strings.TrimSpace(config.GlobalConfig.EmailGatewayURL) == "" || strings.TrimSpace(config.GlobalConfig.EmailTo) == "" {
+				b.WriteString("- 邮件: 已请求，但 email_gateway_url/email_to 还未配置完整，到点会生成本地报告但无法发送邮件。\n")
+			} else {
+				b.WriteString("- 邮件: 已配置邮件网关，到点会发送通知。\n")
+			}
+		default:
+			b.WriteString(fmt.Sprintf("- 通知: 已请求未知通道 %s，请检查配置。\n", ch))
+		}
+	}
+	if len(plan.Notes) > 0 {
+		b.WriteString("\n说明:\n")
+		for _, note := range plan.Notes {
+			b.WriteString("- " + note + "\n")
+		}
+	}
+	return b.String()
+}
+
+func (a *DeepAgent) saveCheckpointUI(step int, history *[]analyzer.Message, ui UISink) {
+	if a.Checkpoint == nil || history == nil {
+		return
+	}
+	if err := a.Checkpoint.Save(CheckpointData{
+		SessionID: a.SessionID,
+		StepNum:   step,
+		State:     a.State,
+		History:   *history,
+	}); err != nil {
+		ui.Emit(UIEvent{Kind: EventCheckpoint, Message: fmt.Sprintf("checkpoint 保存失败: %v", err)})
+	}
+}
+
+// RestoreFromCheckpoint 从 checkpoint 恢复 Agent 状态
+func (a *DeepAgent) RestoreFromCheckpoint(data *CheckpointData) {
+	if data == nil {
+		return
+	}
+	if data.State != nil {
+		a.State = data.State
+	}
+	a.StartStep = data.StepNum
+}
+
+func truncate(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "..."
+}
+
+func actionToJSON(action AgentAction) string {
+	raw, err := json.Marshal(action)
+	if err != nil {
+		return fmt.Sprintf(`{"thought":"%s","action":"%s"}`, escapeJSON(action.Thought), action.Type)
+	}
+	return string(raw)
+}
+
+func escapeJSON(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `"`, `\"`)
+	return s
+}

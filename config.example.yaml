@@ -1,0 +1,141 @@
+# DeepSentry 配置示例 — 复制为 config.yaml 后修改
+# 支持 provider: openai | anthropic | google | deepseek | qwen | hunyuan | tencent_hy | teleai | ctyun | minimax | mimo | glm | xai | grok | ollama | lmstudio | custom
+# 支持 api_protocol: auto | openai_chat | anthropic_messages | openai_responses
+
+# 各 provider 默认最新模型（model_name 留空时自动使用）:
+#   openai: gpt-5.5 | anthropic: claude-opus-4-8 | google: gemini-3.5-flash
+#   deepseek: deepseek-v4-pro | qwen: qwen-plus | hunyuan/tencent_hy: hunyuan-turbos-latest
+#   teleai/ctyun: GLM-5-Pro | minimax: MiniMax-M3 | glm: glm-5.2 | mimo: mimo-v2.5-pro
+#   xai/grok: grok-4 | ollama: llama3.3 | lmstudio: local-model
+
+provider: mimo
+api_protocol: auto
+api_url: https://token-plan-cn.xiaomimimo.com/v1   # 可只填 base /v1，自动补 /chat/completions
+api_key: YOUR_API_KEY
+model_name: mimo-v2.5-pro                          # 留空则用 provider 预设默认模型（见下表）
+
+use_native_tools: true
+# 内置 Go 原生工具支持热插拔：
+# enabled_tools 非空时作为白名单；disabled_tools 作为黑名单。
+# 默认不配置表示全部启用，但模型会通过 tool_catalog 按需发现，不会每轮展开全部工具。
+# 常用安全基线白名单示例:
+# enabled_tools: ["read_log", "net_connections", "process_list", "proc_socket_map", "sqlite_inspect", "db_config_audit", "secret_scan"]
+# 对生产环境较敏感的远程探测/传输/转发可禁用:
+# disabled_tools: ["nmap_scan", "packet_capture", "service_fingerprint", "redis_probe", "mysql_probe", "postgres_probe", "oracle_probe", "cidr_scan", "script_run", "file_upload", "archive_extract", "tcp_forward", "socks5_proxy"]
+llm_timeout_sec: 120
+llm_retries: 3
+ssh_command_timeout_sec: 90
+ssh_max_output_bytes: 524288   # SSH 单命令回传上限（字节），超出截断不报错；大日志请配合 head/tail/wc
+max_steps: 30
+subagent_max_steps: 15         # 子 Agent 步数用户上限；AI 可按任务难度估算 task_max_steps，但不会超过这里
+
+# 控制端出站代理（可选）：影响 LLM、HTTP/Web 探测、AWD HTTP 检查、无头浏览器等控制端请求。
+# 支持 http://、https://、socks5://、socks5h://；留空时使用系统环境变量 HTTP_PROXY/HTTPS_PROXY/NO_PROXY。
+controller_proxy: ""
+
+# 控制端无头浏览器（可选）。留空时自动查找 Chrome/Chromium；不可用则回退 Go 静态解析。
+browser_binary: ""
+browser_timeout_sec: 20
+browser_artifact_dir: reports/browser
+
+# 本地控制端定时任务（可选）。任务保存在 scheduler_store；进程运行时会按 interval 检查到期任务。
+# 支持自然语言创建：如“明天9点巡检服务器并生成报告发钉钉和飞书通知”。
+scheduler_enabled: true
+scheduler_store: reports/schedules/tasks.json
+scheduler_interval_sec: 30
+scheduler_timezone: Local
+
+# 通知通道（可选）。schedule_task notify 支持 dingtalk、feishu、email，也支持逗号多选：
+# notify: dingtalk,feishu,email
+# 钉钉机器人：需要发钉钉时配置 webhook；加签机器人填写 secret。
+dingtalk_webhook: ""
+dingtalk_secret: ""
+
+# 飞书/Lark 自定义机器人：需要发飞书时配置 webhook；加签机器人填写 secret。
+feishu_webhook: ""
+feishu_secret: ""
+
+# 邮件网关：DeepSentry 通过 HTTP JSON POST 调用企业邮件网关。
+# 请求体包含 to、from、subject、markdown、text、source 字段。
+# email_gateway_header 默认为 Authorization；如果 token 不是 Bearer，可填 X-API-Key 等。
+email_gateway_url: ""
+email_gateway_token: ""
+email_gateway_header: Authorization
+email_to: ""
+email_from: ""
+
+# 目标连接模式：local | ssh | telnet | ftp
+# 为空时兼容旧配置：优先 ssh_host，其次 telnet_host / ftp_host，否则本地模式
+target_protocol: ssh
+
+# SSH 远程模式（无端口时默认 :22）
+ssh_host: "1.2.3.4:2222"
+ssh_user: root
+ssh_password: ""
+ssh_key_path: ""
+
+# Telnet 远程模式（老设备/极简环境，无端口时默认 :23）
+telnet_host: ""
+telnet_user: root
+telnet_password: ""
+telnet_prompt: ""
+
+# FTP 文件模式（只支持目录/文件读写上传下载，无 shell；无端口时默认 :21）
+ftp_host: ""
+ftp_user: anonymous
+ftp_password: ""
+
+# Fleet 多目标运维清单（可选）
+# selector 可使用 name、host、protocol 或 tags，例如 fleet_exec selector=prod,ssh
+# targets:
+#   - name: web-01
+#     protocol: ssh
+#     host: "10.0.0.11:22"
+#     user: root
+#     password: ""
+#     key_path: "/Users/me/.ssh/id_rsa"
+#     tags: ["prod", "web"]
+#   - name: legacy-01
+#     protocol: telnet
+#     host: "10.0.1.20:23"
+#     user: admin
+#     password: "password"
+#     prompt: "#"
+#     tags: ["legacy", "network"]
+#   - name: filebox-01
+#     protocol: ftp
+#     host: "10.0.2.30:21"
+#     user: anonymous
+#     password: ""
+#     tags: ["ftp", "evidence"]
+
+# 外部 Skills（可选）
+# 每个来源目录下面放多个 Skill 子目录，每个 Skill 子目录必须包含 SKILL.md。
+# 默认会加载 ./skills 和 ~/.deepsentry/skills；配置 skill_sources 后使用这里声明的目录。
+# skill_sources:
+#   - "skills"
+#   - "~/.deepsentry/skills"
+#   - "/opt/deepsentry-skills"
+# disabled_skill_sources:
+#   - "/opt/old-skills"
+
+# MCP 扩展（可选）
+# 旧短格式仍兼容：name:command:arg1,arg2
+# mcp_servers:
+#   - "myserver:npx:-y,@org/mcp-server"
+#
+# 推荐使用结构化格式，支持 env/cwd/disabled，也可由 Claude Desktop JSON 导入生成。
+# mcp_server_configs:
+#   - name: fs
+#     type: stdio
+#     command: npx
+#     args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+#     cwd: "/tmp"
+#     env:
+#       EXAMPLE_TOKEN: "xxx"
+#     disabled: false
+
+# Agent 配置自管理说明：
+# 用户在 TUI 中要求“添加 skill 路径 / 添加 MCP / 保存 SSH 目标”时，
+# Agent 会使用 config_manage 工具更新本机 config.yaml，并在写入前自动备份到
+# .deepsentry_backups/config_<timestamp>.yaml。

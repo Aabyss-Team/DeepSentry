@@ -1,0 +1,394 @@
+package memory
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+)
+
+const (
+	ScopeGlobal = "global"
+	ScopeLocal  = "local"
+
+	BuiltinAgentsMDPath = "builtin://AGENTS.md"
+)
+
+const builtinAgentsMD = `# DeepSentry Built-in AGENTS.md
+
+This default memory is embedded in the DeepSentry binary. It gives the agent
+stable operating preferences even when users copy only one executable file.
+
+## Operating Preferences
+
+- Prefer Shell-first troubleshooting: inspect with native commands, then use built-in tools when structured parsing or control-plane probing is useful.
+- Keep actions auditable: summarize command purpose, important output, and final evidence.
+- Avoid storing secrets in memory. Never save API keys, passwords, tokens, private keys, or webhook signing secrets.
+- For non-interactive/WebShell mode, continue with conservative defaults and clearly report skipped optional inputs.
+
+## Safety Defaults
+
+- Read-only inspection is preferred unless the user explicitly asks for modification.
+- High-risk destructive actions require approval unless the process is running in batch/webshell mode.
+- Reports should be concise, evidence-oriented, and written in Chinese by default when the user writes Chinese.
+`
+
+// Entry 单条持久化记忆
+type Entry struct {
+	Key       string    `json:"key"`
+	Value     string    `json:"value"`
+	Scope     string    `json:"scope"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Source    string    `json:"source"` // user | agent
+}
+
+// Store 跨会话记忆存储（对标 deepagents MemoryMiddleware + store backend）
+type Store struct {
+	filePath string
+	scope    string // 当前会话作用域
+	entries  map[string]*Entry
+	agentsMD map[string]string // source path -> content
+	dirty    bool
+}
+
+// PersistedData 磁盘序列化格式
+type PersistedData struct {
+	Entries []Entry `json:"entries"`
+}
+
+// NewStore 创建并加载记忆存储
+func NewStore(scope string) (*Store, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, err
+	}
+
+	memDir := filepath.Join(home, ".deepsentry", "memory")
+	if err := os.MkdirAll(memDir, 0755); err != nil {
+		return nil, fmt.Errorf("创建 memory 目录失败: %w", err)
+	}
+
+	s := &Store{
+		filePath: filepath.Join(memDir, "store.json"),
+		scope:    scope,
+		entries:  make(map[string]*Entry),
+		agentsMD: make(map[string]string),
+	}
+
+	if err := s.load(); err != nil {
+		return nil, err
+	}
+	s.loadAgentsMD()
+	return s, nil
+}
+
+// ScopeForTarget 根据连接目标生成作用域
+func ScopeForTarget(isRemote bool, sshHost string) string {
+	if isRemote && sshHost != "" {
+		host := strings.ReplaceAll(sshHost, ":", "_")
+		return "ssh:" + host
+	}
+	return ScopeLocal
+}
+
+func (s *Store) load() error {
+	data, err := os.ReadFile(s.filePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+
+	var persisted PersistedData
+	if err := json.Unmarshal(data, &persisted); err != nil {
+		return fmt.Errorf("解析 memory 文件失败: %w", err)
+	}
+
+	for i := range persisted.Entries {
+		e := persisted.Entries[i]
+		s.entries[entryID(e.Scope, e.Key)] = &e
+	}
+	return nil
+}
+
+func (s *Store) loadAgentsMD() {
+	if strings.TrimSpace(builtinAgentsMD) != "" {
+		s.agentsMD[BuiltinAgentsMDPath] = strings.TrimSpace(builtinAgentsMD)
+	}
+	sources := DefaultAgentsMDSources()
+	for _, src := range sources {
+		path := expandPath(src)
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		content := stripHTMLComments(string(data))
+		if strings.TrimSpace(content) != "" {
+			s.agentsMD[path] = content
+		}
+	}
+}
+
+// Save 持久化到磁盘
+func (s *Store) Save() error {
+	if !s.dirty {
+		return nil
+	}
+
+	var entries []Entry
+	for _, e := range s.entries {
+		entries = append(entries, *e)
+	}
+
+	data, err := json.MarshalIndent(PersistedData{Entries: entries}, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	tmp := s.filePath + ".tmp"
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, s.filePath); err != nil {
+		return err
+	}
+	s.dirty = false
+	return nil
+}
+
+// Set 写入记忆（当前作用域）
+func (s *Store) Set(key, value, source string) error {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return fmt.Errorf("memory key 不能为空")
+	}
+	if err := validateMemoryContent(key, value); err != nil {
+		return err
+	}
+
+	id := entryID(s.scope, key)
+	s.entries[id] = &Entry{
+		Key:       key,
+		Value:     value,
+		Scope:     s.scope,
+		UpdatedAt: time.Now(),
+		Source:    source,
+	}
+	s.dirty = true
+	return s.Save()
+}
+
+// SetGlobal 写入全局记忆
+func (s *Store) SetGlobal(key, value, source string) error {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return fmt.Errorf("memory key 不能为空")
+	}
+	if err := validateMemoryContent(key, value); err != nil {
+		return err
+	}
+
+	id := entryID(ScopeGlobal, key)
+	s.entries[id] = &Entry{
+		Key:       key,
+		Value:     value,
+		Scope:     ScopeGlobal,
+		UpdatedAt: time.Now(),
+		Source:    source,
+	}
+	s.dirty = true
+	return s.Save()
+}
+
+// Delete 删除当前作用域的记忆
+func (s *Store) Delete(key string) error {
+	id := entryID(s.scope, key)
+	if _, ok := s.entries[id]; !ok {
+		return fmt.Errorf("未找到记忆: %s", key)
+	}
+	delete(s.entries, id)
+	s.dirty = true
+	return s.Save()
+}
+
+// DeleteGlobal 删除全局记忆
+func (s *Store) DeleteGlobal(key string) error {
+	id := entryID(ScopeGlobal, key)
+	if _, ok := s.entries[id]; !ok {
+		return fmt.Errorf("未找到全局记忆: %s", key)
+	}
+	delete(s.entries, id)
+	s.dirty = true
+	return s.Save()
+}
+
+// ActiveEntries 返回当前会话可见的记忆（global + 当前 scope）
+func (s *Store) ActiveEntries() []Entry {
+	var result []Entry
+	seen := make(map[string]bool)
+
+	for _, e := range s.entries {
+		if e.Scope != ScopeGlobal && e.Scope != s.scope {
+			continue
+		}
+		if seen[e.Key] && e.Scope != s.scope {
+			continue
+		}
+		seen[e.Key] = true
+		result = append(result, *e)
+	}
+	return result
+}
+
+// FormatPrompt 生成注入 system prompt 的记忆片段
+func (s *Store) FormatPrompt() string {
+	var b strings.Builder
+
+	if len(s.agentsMD) > 0 {
+		b.WriteString("\n【Agent 持久记忆 (AGENTS.md)】\n")
+		b.WriteString("以下是从 AGENTS.md 加载的项目/用户上下文，跨会话有效。\n\n")
+		for path, content := range s.agentsMD {
+			b.WriteString(fmt.Sprintf("--- %s ---\n%s\n\n", path, content))
+		}
+	}
+
+	entries := s.ActiveEntries()
+	if len(entries) > 0 {
+		b.WriteString("\n【结构化记忆 (跨会话 KV)】\n")
+		b.WriteString("以下是从历史会话中保存的关键信息。\n\n")
+		for _, e := range entries {
+			scopeTag := e.Scope
+			if e.Scope == s.scope {
+				scopeTag = "当前目标"
+			}
+			b.WriteString(fmt.Sprintf("- [%s] **%s**: %s\n", scopeTag, e.Key, e.Value))
+		}
+	}
+
+	if b.Len() == 0 {
+		return ""
+	}
+
+	b.WriteString(`
+【记忆管理 — 跨会话持久化】
+使用以下 action 保存/删除记忆（自动写入 ~/.deepsentry/memory/）:
+- remember: {"action":"remember","memory_key":"键名","memory_value":"内容","memory_scope":"target|global"}
+- forget: {"action":"forget","memory_key":"键名","memory_scope":"target|global"}
+
+何时保存: 用户偏好、常用路径、目标环境特征、排查结论、SSH 主机别名等。
+禁止保存: API Key、密码、Token 等凭证。
+`)
+	return b.String()
+}
+
+// Count 返回当前可见记忆条数
+func (s *Store) Count() int {
+	return len(s.ActiveEntries())
+}
+
+// HasContent 是否有任何可注入的记忆内容
+func (s *Store) HasContent() bool {
+	return len(s.ActiveEntries()) > 0 || len(s.agentsMD) > 0
+}
+
+// AgentsMDCount 已加载的 AGENTS.md 文件数
+func (s *Store) AgentsMDCount() int {
+	return len(s.agentsMD)
+}
+
+func entryID(scope, key string) string {
+	return scope + "::" + key
+}
+
+func expandPath(path string) string {
+	if strings.HasPrefix(path, "~/") {
+		home, _ := os.UserHomeDir()
+		return filepath.Join(home, path[2:])
+	}
+	return path
+}
+
+// DefaultAgentsMDSources AGENTS.md 来源（对标 deepagents memory sources）
+func DefaultAgentsMDSources() []string {
+	return []string{
+		"~/.deepsentry/AGENTS.md",
+		".deepsentry/AGENTS.md",
+	}
+}
+
+func stripHTMLComments(s string) string {
+	for {
+		start := strings.Index(s, "<!--")
+		if start == -1 {
+			break
+		}
+		end := strings.Index(s[start:], "-->")
+		if end == -1 {
+			break
+		}
+		s = s[:start] + s[start+end+3:]
+	}
+	return strings.TrimSpace(s)
+}
+
+func validateMemoryContent(key, value string) error {
+	lower := strings.ToLower(key + " " + value)
+	sensitive := []string{"api_key", "apikey", "password", "passwd", "secret", "token", "bearer", "private_key", "ssh_password"}
+	for _, s := range sensitive {
+		if strings.Contains(lower, s) {
+			return fmt.Errorf("禁止存储敏感凭证 (%s)", s)
+		}
+	}
+	if len(value) > 4096 {
+		return fmt.Errorf("记忆内容过长 (最大 4096 字符)")
+	}
+	return nil
+}
+
+// IsAgentsMDPath 是否为 AGENTS.md 路径
+func IsAgentsMDPath(path string) bool {
+	path = expandPath(path)
+	lower := strings.ToLower(filepath.Base(path))
+	if lower != "agents.md" {
+		return false
+	}
+	home, _ := os.UserHomeDir()
+	allowed := []string{
+		filepath.Join(home, ".deepsentry", "AGENTS.md"),
+		filepath.Join(".deepsentry", "AGENTS.md"),
+	}
+	for _, a := range allowed {
+		if path == expandPath(a) || strings.HasSuffix(path, string(os.PathSeparator)+".deepsentry"+string(os.PathSeparator)+"AGENTS.md") {
+			return true
+		}
+	}
+	return strings.Contains(path, ".deepsentry") && lower == "agents.md"
+}
+
+// UpdateAgentsMD 热更新 AGENTS.md 内容（write_file/edit_file 写回后调用）
+func (s *Store) UpdateAgentsMD(path, content string) {
+	path = expandPath(path)
+	content = stripHTMLComments(content)
+	if strings.TrimSpace(content) == "" {
+		delete(s.agentsMD, path)
+		return
+	}
+	s.agentsMD[path] = content
+}
+
+// ReloadAgentsMD 从磁盘重新加载 AGENTS.md
+func (s *Store) ReloadAgentsMD() {
+	s.agentsMD = make(map[string]string)
+	s.loadAgentsMD()
+}
+
+// EnsureDefaultAgentsMD 保留兼容入口。
+//
+// 默认 AGENTS.md 已内置进二进制，不再首次运行时强制写入 ~/.deepsentry/AGENTS.md。
+// 用户需要自定义长期偏好时，可以手动创建 ~/.deepsentry/AGENTS.md 或项目 .deepsentry/AGENTS.md。
+func EnsureDefaultAgentsMD() error {
+	return nil
+}

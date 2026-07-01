@@ -4,14 +4,10 @@ import (
 	"ai-edr/internal/collector"
 	"ai-edr/internal/config"
 	"ai-edr/internal/security"
-	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
-	"net/http"
+	"strconv"
 	"strings"
-	"time"
 )
 
 type Message struct {
@@ -20,46 +16,211 @@ type Message struct {
 }
 
 type ChatRequest struct {
-	Model       string    `json:"model"`
-	Messages    []Message `json:"messages"`
-	Stream      bool      `json:"stream"`
-	Temperature float64   `json:"temperature"`
+	Model         string           `json:"model"`
+	Messages      []Message        `json:"messages"`
+	Stream        bool             `json:"stream"`
+	Temperature   float64          `json:"temperature"`
+	Tools         []ToolDefinition `json:"tools,omitempty"`
+	ToolChoice    interface{}      `json:"tool_choice,omitempty"`
+	StreamOptions *StreamOptions   `json:"stream_options,omitempty"`
+}
+
+type StreamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
 }
 
 type ChatResponse struct {
 	Choices []struct {
 		Message struct {
-			Content string `json:"content"`
+			Content   string `json:"content"`
+			ToolCalls []struct {
+				ID       string `json:"id"`
+				Type     string `json:"type"`
+				Function struct {
+					Name      string `json:"name"`
+					Arguments string `json:"arguments"`
+				} `json:"function"`
+			} `json:"tool_calls"`
 		} `json:"message"`
+		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
+	Usage TokenUsage `json:"usage"`
 }
 
 type AgentResponse struct {
-	Thought     string `json:"thought"`
-	Command     string `json:"command"`
-	RiskLevel   string `json:"risk_level"`
-	Reason      string `json:"reason"`
-	IsFinished  bool   `json:"is_finished"`
-	FinalReport string `json:"final_report"`
+	Thought     string   `json:"thought"`
+	Command     string   `json:"command"`
+	RiskLevel   string   `json:"risk_level"`
+	Reason      string   `json:"reason"`
+	IsFinished  bool     `json:"is_finished"`
+	FinalReport string   `json:"final_report"`
+	Question    string   `json:"question"`
+	Options     []string `json:"options"`
+
+	// Deep Agent Harness 扩展字段（对标 deepagents 多工具协议）
+	Action         string     `json:"action"`
+	TaskName       string     `json:"task_name"`
+	TaskPrompt     string     `json:"task_prompt"`
+	TaskMaxSteps   int        `json:"task_max_steps"`
+	ParallelTasks  []TaskSpec `json:"parallel_tasks"`
+	TargetSelector string     `json:"target_selector"`
+	TargetName     string     `json:"target_name"`
+	TargetProtocol string     `json:"target_protocol"`
+	TargetHost     string     `json:"target_host"`
+	SkillName      string     `json:"skill_name"`
+	Path           string     `json:"path"`
+	Content        string     `json:"content"`
+	Pattern        string     `json:"pattern"`
+	Todos          []TodoItem `json:"todos"`
+
+	// memory
+	MemoryKey   string `json:"memory_key"`
+	MemoryValue string `json:"memory_value"`
+	MemoryScope string `json:"memory_scope"`
+
+	// tool
+	ToolName string            `json:"tool_name"`
+	ToolArgs map[string]string `json:"tool_args"`
+
+	// edit_file / glob
+	OldString   string `json:"old_string"`
+	NewString   string `json:"new_string"`
+	ReplaceAll  bool   `json:"replace_all"`
+	GlobPattern string `json:"glob_pattern"`
+}
+
+// TodoItem 任务清单项
+type TodoItem struct {
+	ID      string `json:"id"`
+	Content string `json:"content"`
+	Status  string `json:"status"`
+}
+
+type TaskSpec struct {
+	TaskName       string `json:"task_name"`
+	TaskPrompt     string `json:"task_prompt"`
+	TargetSelector string `json:"target_selector"`
+	TaskMaxSteps   int    `json:"task_max_steps"`
+}
+
+func (t *TodoItem) UnmarshalJSON(data []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	t.ID = stringifyTodoField(raw["id"])
+	t.Content = firstNonEmptyString(
+		stringifyTodoField(raw["content"]),
+		stringifyTodoField(raw["title"]),
+		stringifyTodoField(raw["detail"]),
+		stringifyTodoField(raw["description"]),
+	)
+	if detail := stringifyTodoField(raw["detail"]); detail != "" && t.Content != "" && detail != t.Content {
+		t.Content = t.Content + " - " + detail
+	}
+	t.Status = stringifyTodoField(raw["status"])
+	return nil
+}
+
+func stringifyTodoField(v interface{}) string {
+	switch x := v.(type) {
+	case nil:
+		return ""
+	case string:
+		return strings.TrimSpace(x)
+	case float64:
+		if x == float64(int64(x)) {
+			return fmt.Sprintf("%d", int64(x))
+		}
+		return fmt.Sprintf("%v", x)
+	case bool:
+		return fmt.Sprintf("%v", x)
+	default:
+		return strings.TrimSpace(fmt.Sprintf("%v", x))
+	}
+}
+
+func firstNonEmptyString(vals ...string) string {
+	for _, v := range vals {
+		if strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
 }
 
 // 兼容性结构体：用于解析 AI 可能返回的多种格式
 type CompatibilityResponse struct {
-	Thought     string      `json:"thought"`
-	Command     string      `json:"command"`
-	RiskLevel   string      `json:"risk_level"`
-	IsFinished  bool        `json:"is_finished"`
-	FinalReport interface{} `json:"final_report"`
-	CmdArray    []string    `json:"cmd"`
-	Explanation string      `json:"explanation"`
+	Thought        string                 `json:"thought"`
+	Command        string                 `json:"command"`
+	RiskLevel      string                 `json:"risk_level"`
+	IsFinished     bool                   `json:"is_finished"`
+	FinalReport    interface{}            `json:"final_report"`
+	Question       string                 `json:"question"`
+	Options        []string               `json:"options"`
+	CmdArray       []string               `json:"cmd"`
+	Explanation    string                 `json:"explanation"`
+	Action         string                 `json:"action"`
+	TaskName       string                 `json:"task_name"`
+	TaskPrompt     string                 `json:"task_prompt"`
+	TaskMaxSteps   int                    `json:"task_max_steps"`
+	ParallelTasks  []TaskSpec             `json:"parallel_tasks"`
+	TargetSelector string                 `json:"target_selector"`
+	TargetName     string                 `json:"target_name"`
+	TargetProtocol string                 `json:"target_protocol"`
+	TargetHost     string                 `json:"target_host"`
+	SkillName      string                 `json:"skill_name"`
+	Path           string                 `json:"path"`
+	Content        string                 `json:"content"`
+	Pattern        string                 `json:"pattern"`
+	Todos          []TodoItem             `json:"todos"`
+	MemoryKey      string                 `json:"memory_key"`
+	MemoryValue    string                 `json:"memory_value"`
+	MemoryScope    string                 `json:"memory_scope"`
+	ToolName       string                 `json:"tool_name"`
+	ToolArgs       map[string]interface{} `json:"tool_args"`
+	OldString      string                 `json:"old_string"`
+	NewString      string                 `json:"new_string"`
+	ReplaceAll     bool                   `json:"replace_all"`
+	GlobPattern    string                 `json:"glob_pattern"`
+}
+
+// StepOptions Agent 单步选项
+type StepOptions struct {
+	SysCtx         collector.SystemContext
+	History        *[]Message
+	ExtraPrompt    string
+	UseNativeTools bool
+	OnStream       func(delta string) // 非 nil 且模型支持时启用 SSE 流式输出
+	OnUsage        func(TokenUsage)   // 模型返回真实 usage 时回调
 }
 
 // RunAgentStep 执行 Agent 的单步思考
 func RunAgentStep(sysCtx collector.SystemContext, history *[]Message) (AgentResponse, error) {
-	apiKey := config.GlobalConfig.ApiKey
+	return RunAgentStepWithPrompt(sysCtx, history, "")
+}
+
+// RunAgentStepWithPrompt 支持额外 system prompt 注入（供 Deep Agent Harness 使用）
+func RunAgentStepWithPrompt(sysCtx collector.SystemContext, history *[]Message, extraPrompt string) (AgentResponse, error) {
+	return RunAgentStepWithOptions(StepOptions{
+		SysCtx:         sysCtx,
+		History:        history,
+		ExtraPrompt:    extraPrompt,
+		UseNativeTools: config.GlobalConfig.UseNativeTools,
+	})
+}
+
+// RunAgentStepWithOptions 完整单步选项
+func RunAgentStepWithOptions(opts StepOptions) (AgentResponse, error) {
+	sysCtx := opts.SysCtx
+	history := opts.History
+	extraPrompt := opts.ExtraPrompt
 
 	// 1. 获取基础 System Prompt (来自 collector)
 	basePrompt := sysCtx.GenerateSystemPrompt()
+	if extraPrompt != "" {
+		basePrompt = basePrompt + extraPrompt
+	}
 
 	// 增强 Windows 路径操作指南 & JSON 约束
 	selfProtectionPrompt := `
@@ -71,16 +232,18 @@ func RunAgentStep(sysCtx collector.SystemContext, history *[]Message) (AgentResp
 2. **路径变量**：使用 PowerShell 时可直接用 $HOME。
 
 【⚠️ JSON 严格语法】
-1. 在 JSON 字符串值中，**双引号 (") 必须转义为 (\")**。
-2. **反斜杠 (\) 必须转义为 (\\)**。
-   - 错误示例: {"command": "grep "eval" file"}
-   - 正确示例: {"command": "grep \"eval\" file"}
+1. 在 JSON 字符串值中，**双引号 (") 必须转义为 (\\")**。
+2. **反斜杠 (\\) 必须转义为 (\\\\)**。
+3. **严禁** Markdown 代码块或与 JSON 混排；说明只能放 thought 字段。
+4. 响应必须是纯 JSON 对象，以 { 开头、以 } 结尾。
 `
 	systemPrompt := basePrompt + selfProtectionPrompt
 
-	// Context 滑动窗口：防止 Token 超限
-	if len(*history) > 15 {
-		compressHistory(apiKey, history)
+	// Context 自动管理：防止 Token 超限，同时保留前情提要和最近步骤。
+	if compacted, err := ManageHistoryContext(history); err != nil {
+		TruncateHistoryFallback(history, 8)
+	} else if compacted {
+		// harness 会在调用前主动提示；这里保持兼容旧调用路径。
 	}
 
 	messages := []Message{
@@ -88,66 +251,121 @@ func RunAgentStep(sysCtx collector.SystemContext, history *[]Message) (AgentResp
 	}
 	messages = append(messages, *history...)
 
-	// 调用 LLM
-	rawResp, err := callLLM(apiKey, messages)
+	llmResult, err := CallLLMWithRetry(messages, opts.UseNativeTools, opts.OnStream)
 	if err != nil {
 		return AgentResponse{}, err
 	}
+	if opts.OnUsage != nil && llmResult.Usage.HasAny() {
+		opts.OnUsage(llmResult.Usage)
+	}
+	rawResp := llmResult.Content
+	toolCallArgs := llmResult.ToolCallArgs
 
-	// 2. 清洗 JSON
-	cleanResp := cleanJSON(rawResp)
+	if toolCallArgs != "" {
+		resp, perr := ParseToolCallResponse(toolCallArgs)
+		if perr == nil {
+			return finalizeResponse(resp), nil
+		}
+		// fallback to JSON content parse
+	}
+
+	// 2. 清洗 JSON（支持 Markdown 代码块 + 前置说明文字）
+	cleanResp, prose := cleanJSON(rawResp)
 	var compat CompatibilityResponse
 
 	// 3. 尝试标准解析
 	err = json.Unmarshal([]byte(cleanResp), &compat)
 
-	// 🟢 [核心修复] JSON 解析失败时的智能兜底 (字符级扫描)
+	// 🟢 JSON 解析失败时的智能兜底
 	if err != nil {
-		// 尝试手动补全括号（针对截断情况）
 		fixTry := cleanResp
 		if !strings.HasSuffix(strings.TrimSpace(fixTry), "}") {
 			fixTry += "}"
 		}
 
-		// 再次尝试标准解析
 		if err2 := json.Unmarshal([]byte(fixTry), &compat); err2 != nil {
-			// 🔴 启用【字符级扫描提取器】
-			// 这是最后的防线：不依赖 JSON 库，直接从字符串中从左到右扫描提取 command 的值
-			// 能完美处理转义引号 (\") 和转义反斜杠 (\\) 造成的解析错误
-			extractedCmd, found := extractCommandString(cleanResp)
-
-			if found && extractedCmd != "" {
-				compat.Command = extractedCmd
-				compat.Thought = "JSON 格式异常(转义错误)，已启用【字符级扫描】精确提取命令。"
-				compat.RiskLevel = "high" // 强制设为高危，让用户确认
-
-				// 视为成功，清除错误
-				err = nil
-			} else {
-				// 彻底失败
-				return AgentResponse{
-					Thought:     "AI 响应格式完全不可读",
-					FinalReport: fmt.Sprintf("❌ 解析失败: %v\n原始响应:\n%s", err, rawResp),
-					IsFinished:  true,
-					RiskLevel:   "low",
-				}, nil
+			// 再次从原始响应提取 JSON
+			if retry, _ := extractJSONPayload(rawResp); retry != "" && retry != cleanResp {
+				if err3 := json.Unmarshal([]byte(retry), &compat); err3 == nil {
+					err = nil
+					cleanResp = retry
+				}
 			}
 		} else {
-			// 补全括号后解析成功
 			err = nil
 		}
 	}
 
+	if err != nil {
+		extractedCmd, found := extractCommandString(cleanResp)
+		if !found {
+			extractedCmd, found = extractCommandString(rawResp)
+		}
+
+		if found && extractedCmd != "" {
+			compat.Command = decodeJSONUnicodeEscapes(extractedCmd)
+			compat.Thought = "JSON 格式异常(转义错误)，已启用【字符级扫描】精确提取命令。"
+			compat.RiskLevel = "high"
+			err = nil
+		} else {
+			if question := extractClarificationQuestion(rawResp); question != "" {
+				return AgentResponse{
+					Thought:   "需要用户补充信息后继续任务",
+					Action:    "ask_user",
+					Question:  question,
+					RiskLevel: "low",
+				}, nil
+			}
+			return AgentResponse{
+				Thought:     "AI 响应格式完全不可读",
+				FinalReport: fmt.Sprintf("❌ 解析失败: %v\n原始响应:\n%s", err, rawResp),
+				IsFinished:  true,
+				RiskLevel:   "low",
+			}, nil
+		}
+	}
+
+	if compat.Thought == "" && prose != "" {
+		compat.Thought = normalizeProseThought(prose)
+	} else if compat.Thought == "" {
+		if p := normalizeProseThought(prose); p != "" {
+			compat.Thought = p
+		}
+	}
+
 	resp := AgentResponse{
-		RiskLevel:  compat.RiskLevel,
-		IsFinished: compat.IsFinished,
+		RiskLevel:      compat.RiskLevel,
+		IsFinished:     compat.IsFinished,
+		Question:       compat.Question,
+		Options:        compat.Options,
+		Action:         compat.Action,
+		TaskName:       compat.TaskName,
+		TaskPrompt:     compat.TaskPrompt,
+		TargetSelector: compat.TargetSelector,
+		TargetName:     compat.TargetName,
+		TargetProtocol: compat.TargetProtocol,
+		TargetHost:     compat.TargetHost,
+		SkillName:      compat.SkillName,
+		Path:           compat.Path,
+		Content:        compat.Content,
+		Pattern:        compat.Pattern,
+		Todos:          compat.Todos,
+		MemoryKey:      compat.MemoryKey,
+		MemoryValue:    compat.MemoryValue,
+		MemoryScope:    compat.MemoryScope,
+		ToolName:       compat.ToolName,
+		ToolArgs:       parseToolArgs(compat.ToolArgs),
+		OldString:      compat.OldString,
+		NewString:      compat.NewString,
+		ReplaceAll:     compat.ReplaceAll,
+		GlobPattern:    compat.GlobPattern,
 	}
 
 	// 适配 Command (兼容 string 或 []string)
 	if compat.Command != "" {
-		resp.Command = compat.Command
+		resp.Command = decodeJSONUnicodeEscapes(compat.Command)
 	} else if len(compat.CmdArray) > 0 {
-		resp.Command = compat.CmdArray[len(compat.CmdArray)-1]
+		resp.Command = decodeJSONUnicodeEscapes(compat.CmdArray[len(compat.CmdArray)-1])
 	}
 
 	// 适配 Thought
@@ -172,21 +390,36 @@ func RunAgentStep(sysCtx collector.SystemContext, history *[]Message) (AgentResp
 		}
 	}
 
-	// -------------------------------------------------------------------------
-	// 🟢 [核心修复点] 强制使用 security 包进行风险检查
-	// -------------------------------------------------------------------------
-	if resp.Command != "" {
-		// 调用 security 包 (也就是你写了 CheckRisk 的那个文件)
-		realRisk, realReason := security.CheckRisk(resp.Command)
+	return finalizeResponse(resp), nil
+}
 
-		// 霸道覆盖：无论 AI 说是 high 还是 low，都以本地代码逻辑为准
+func extractClarificationQuestion(raw string) string {
+	text := strings.TrimSpace(raw)
+	if text == "" {
+		return ""
+	}
+	lower := strings.ToLower(text)
+	needles := []string{
+		"请提供", "请告诉", "需要您", "需要你", "我需要", "需要确认", "请确认",
+		"webhook", "url", "token", "地址", "选项", "选择", "？", "?",
+	}
+	for _, n := range needles {
+		if strings.Contains(text, n) || strings.Contains(lower, n) {
+			if len([]rune(text)) > 4000 {
+				return string([]rune(text)[:4000]) + "\n...(内容过长已截断)..."
+			}
+			return text
+		}
+	}
+	return ""
+}
+
+func finalizeResponse(resp AgentResponse) AgentResponse {
+	if resp.Command != "" {
+		realRisk, realReason := security.CheckRisk(resp.Command)
 		resp.RiskLevel = realRisk
 		resp.Reason = realReason
 	}
-	// -------------------------------------------------------------------------
-
-	// --- 报告内容兜底逻辑 ---
-	// 只有在 IsFinished 为 true 时才生成最终报告
 	if resp.IsFinished {
 		if strings.TrimSpace(resp.FinalReport) == "" || resp.FinalReport == "任务完成" {
 			if resp.Thought != "" {
@@ -196,25 +429,59 @@ func RunAgentStep(sysCtx collector.SystemContext, history *[]Message) (AgentResp
 			}
 		}
 	}
+	return resp
+}
 
-	return resp, nil
+const (
+	contextCompactMessageThreshold = 24
+	contextCompactCharBudget       = 60000
+	contextCompactKeepRecent       = 10
+)
+
+// ManageHistoryContext 自动压缩历史上下文，提供接近“无限上下文”的滚动体验。
+func ManageHistoryContext(history *[]Message) (bool, error) {
+	if history == nil || len(*history) == 0 {
+		return false, nil
+	}
+	if len(*history) <= contextCompactMessageThreshold && estimateHistoryChars(*history) <= contextCompactCharBudget {
+		return false, nil
+	}
+	if len(*history) <= contextCompactKeepRecent {
+		return false, nil
+	}
+	if err := compressHistory(history); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func estimateHistoryChars(history []Message) int {
+	n := 0
+	for _, m := range history {
+		n += len(m.Role) + len(m.Content) + 8
+	}
+	return n
 }
 
 // compressHistory 压缩历史记录
-func compressHistory(apiKey string, history *[]Message) error {
-	cutIndex := 10
-	if len(*history) < cutIndex {
+func compressHistory(history *[]Message) error {
+	keepRecent := contextCompactKeepRecent
+	if keepRecent < 4 {
+		keepRecent = 4
+	}
+	if len(*history) <= keepRecent {
 		return nil
 	}
+	cutIndex := len(*history) - keepRecent
 	toSummarize := (*history)[:cutIndex]
 	remaining := (*history)[cutIndex:]
 	summaryPrompt := []Message{
-		{Role: "system", Content: "你是一个专业的会议记录员。请阅读以下对话，将其压缩成一段简练的【前情提要】。保留关键的系统信息、已执行的命令和发现的线索。"},
+		{Role: "system", Content: "你是 DeepSentry 的上下文压缩器。请将以下历史压缩成可继续执行任务的【前情提要】。必须保留：用户目标、已确认配置/凭证占位说明、已执行命令、关键输出结论、已创建/修改的文件路径、未完成 TODO、失败原因、下一步。不要编造。"},
 	}
 	summaryPrompt = append(summaryPrompt, toSummarize...)
-	summaryPrompt = append(summaryPrompt, Message{Role: "user", Content: "请生成摘要。"})
+	summaryPrompt = append(summaryPrompt, Message{Role: "user", Content: "请生成紧凑但可续跑的前情提要。"})
 
-	summaryText, err := callLLM(apiKey, summaryPrompt)
+	summaryText, err := compressCallLLM(summaryPrompt)
 	if err != nil {
 		return err
 	}
@@ -239,24 +506,19 @@ func inferThoughtFromCommand(cmd string) string {
 	return fmt.Sprintf("执行: %s", cmd)
 }
 
-// cleanJSON 负责清洗和修复 JSON 字符串
-func cleanJSON(s string) string {
-	// 1. 移除 Markdown 代码块标记
-	s = strings.TrimSpace(s)
+// cleanJSON 从 LLM 响应中提取并清洗 JSON，返回 (json, 前置说明文字)
+func cleanJSON(s string) (string, string) {
+	jsonPart, prose := extractJSONPayload(s)
+	s = strings.TrimSpace(jsonPart)
 	s = strings.TrimPrefix(s, "```json")
 	s = strings.TrimPrefix(s, "```")
 	s = strings.TrimSuffix(s, "```")
 	s = strings.TrimSpace(s)
 
-	// 2. 🟢 [核心修复] 预处理 JSON 中常见的非法 Shell 转义符
-	// Shell 命令中的管道符 `|` 在 JSON 字符串中如果不转义，有时会导致解析问题（取决于上下文）
-	// 但更重要的是防止 AI 写出 "grep 'a|b'" 这种导致 JSON 结构破坏的写法
-	// 这里我们做一个防御性替换：将 `\|` 替换为 `\\|` (转义反斜杠)
 	if strings.Contains(s, `\|`) {
 		s = strings.ReplaceAll(s, `\|`, `\\|`)
 	}
-
-	return s
+	return s, prose
 }
 
 // 🟢 [核心新增] extractCommandString 手动扫描字符串，提取 "command": "..." 中的值
@@ -334,52 +596,57 @@ func extractCommandString(jsonStr string) (string, bool) {
 	return "", false
 }
 
-// callLLM 统一调用大模型接口
-func callLLM(apiKey string, messages []Message) (string, error) {
-	reqBody := ChatRequest{
-		Model:       config.GlobalConfig.ModelName,
-		Messages:    messages,
-		Stream:      false,
-		Temperature: 0.1, // Temperature 设低一点，让 AI 输出更稳定
+func decodeJSONUnicodeEscapes(s string) string {
+	if !strings.Contains(s, `\u`) && !strings.Contains(s, `\U`) {
+		return s
 	}
-	jsonData, err := json.Marshal(reqBody)
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] != '\\' || i+5 >= len(s) || (s[i+1] != 'u' && s[i+1] != 'U') {
+			b.WriteByte(s[i])
+			continue
+		}
+		hex := s[i+2 : i+6]
+		v, err := strconv.ParseInt(hex, 16, 32)
+		if err != nil {
+			b.WriteByte(s[i])
+			continue
+		}
+		b.WriteRune(rune(v))
+		i += 5
+	}
+	return b.String()
+}
+
+func compressCallLLM(messages []Message) (string, error) {
+	res, err := CallLLMWithRetry(messages, false, nil)
 	if err != nil {
 		return "", err
 	}
+	return res.Content, nil
+}
 
-	req, err := http.NewRequest("POST", config.GlobalConfig.ApiURL, bytes.NewBuffer(jsonData))
-	if err != nil {
-		return "", err
-	}
+// callLLM 兼容旧调用（摘要等）
+func callLLM(_ string, messages []Message) (string, error) {
+	return compressCallLLM(messages)
+}
 
-	req.Header.Set("Content-Type", "application/json")
-	if apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+apiKey)
+func parseToolArgs(raw map[string]interface{}) map[string]string {
+	if len(raw) == 0 {
+		return nil
 	}
-
-	client := &http.Client{Timeout: 300 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
+	out := make(map[string]string, len(raw))
+	for k, v := range raw {
+		switch val := v.(type) {
+		case string:
+			out[k] = val
+		case float64:
+			out[k] = fmt.Sprintf("%.0f", val)
+		case bool:
+			out[k] = fmt.Sprintf("%v", val)
+		default:
+			out[k] = fmt.Sprintf("%v", v)
+		}
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("API Error %d: %s", resp.StatusCode, string(body))
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-
-	var chatResp ChatResponse
-	if err := json.Unmarshal(body, &chatResp); err != nil {
-		return "", fmt.Errorf("Parse Error: %v", err)
-	}
-	if len(chatResp.Choices) > 0 {
-		return chatResp.Choices[0].Message.Content, nil
-	}
-	return "", errors.New("empty response")
+	return out
 }

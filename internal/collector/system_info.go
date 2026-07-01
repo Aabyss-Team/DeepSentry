@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"runtime"
 	"strings"
+	"time"
 )
 
 // SystemContext 存储全维度的系统指纹 (目标系统)
@@ -170,8 +171,17 @@ func (ctx SystemContext) GenerateSystemPrompt() string {
 	connectionType := "本地直连 (Local Mode)"
 	targetDesc := "当前目标即本机 (Target == Controller)"
 	if executor.Current != nil && executor.Current.IsRemote() {
-		connectionType = "SSH 远程连接 (SSH Mode)"
-		targetDesc = "你正在通过 SSH 操作远程主机 (Target)"
+		switch executor.CurrentMode() {
+		case "telnet":
+			connectionType = "Telnet 远程连接 (Telnet Mode)"
+			targetDesc = "你正在通过 Telnet 操作远程主机；可执行命令，但文件桥能力弱于 SSH/SFTP"
+		case "ftp":
+			connectionType = "FTP 远程连接 (FTP Mode)"
+			targetDesc = "你正在通过 FTP 操作远程主机；仅适合目录/文件读取、上传、下载，不支持 shell 命令执行"
+		default:
+			connectionType = "SSH 远程连接 (SSH Mode)"
+			targetDesc = "你正在通过 SSH 操作远程主机 (Target)"
+		}
 	}
 
 	// 🟢 [新增] 获取本机(控制端) 的系统信息
@@ -190,9 +200,10 @@ func (ctx SystemContext) GenerateSystemPrompt() string {
 
 	return fmt.Sprintf(`
 【系统架构感知】
-- 连接模式: %s
+- 连接模式: %s (%s)
 - 你的身份: 智能运维 Agent (运行在 控制端/Controller)
 - **控制端环境(本机)**: %s / %s %s
+- **控制端当前时间(本机)**: %s
 - **目标环境(Target)**:
   - 系统: %s (%s)
   - 用户: %s (%s)
@@ -207,13 +218,15 @@ func (ctx SystemContext) GenerateSystemPrompt() string {
 2. **本机执行 (Controller Exec)**
    - **命令格式**: 前缀 **'local_run '** (例如: 'local_run ls -la')
    - 作用域: 在 **控制端环境** 执行。注意区分本机操作系统！
+   - 禁止用裸 ssh/scp/sftp 访问已配置 targets；它们不会读取 DeepSentry 配置里的密码/私钥，可能卡在交互式密码提示。多目标/远程主机请用 fleet_exec、fleet_file 或 target_selector。
 3. **数据协同 (Data Bridge)**
    - **上传**: 'upload <本机路径> <远程路径>'
    - **下载**: 'download <远程路径> <本机路径>'
+   - FTP 模式下优先使用 file_download/file_upload/read_file/ls，不要执行 shell 命令。
 
 【AI 行为准则】
 1. **JSON 格式**: 必须严格返回 JSON，**严禁**使用 Markdown 代码块。
-2. **行动法则**: 每次响应必须包含 'command' (执行操作) 或 'is_finished': true (结束任务)。**禁止仅返回 'thought'**。
+2. **行动法则**: 使用 Deep Agent Harness 的 action 字段 (tool/read_file/execute/finish 等)，禁止仅返回 thought。
 3. **拒绝幻觉**: 严禁脑补结果。
 4. **环境意识**: 严格区分 '本机' 和 '目标'。如果用户说 "把本机的X上传"，请先确认本机是 Windows 还是 Mac/Linux，再选择正确的 local_run 命令 (dir vs ls)。
 5. **自我保护**: **严禁** 移动、删除或修改 'config.yaml', 'deepsentry.exe' 以及 'reports/' 目录。
@@ -224,13 +237,21 @@ func (ctx SystemContext) GenerateSystemPrompt() string {
      (错误: {"cmd": "grep '\' file"})
      (正确: {"cmd": "grep '\\' file"})
 8. **最终报告**: 设置 "is_finished": true 时，必须在 "final_report" 中详细总结。
+9. **时间基准**: 「控制端当前时间」为判断「近期」「今天」「最近 N 小时/天」等时效性问题的基准；分析日志与时间线时请以此为准。
 `,
-		connectionType,
+		connectionType, targetDesc,
 		localOS, localArch, localShellHint,
-		targetDesc,
+		formatLocalTime(),
 		ctx.OS, ctx.Arch,
 		ctx.Username, userRole,
 		ctx.Hostname,
 		ctx.KernelVersion,
 		ctx.MemoryStatus)
+}
+
+// formatLocalTime 控制端本机当前时间（每次生成 Prompt 时刷新）
+func formatLocalTime() string {
+	now := time.Now()
+	zone, _ := now.Zone()
+	return fmt.Sprintf("%s %s", now.Format("2006-01-02 15:04:05"), zone)
 }
