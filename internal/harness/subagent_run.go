@@ -39,7 +39,7 @@ var makeSubAgentRunner = func(parent *DeepAgent) *SubAgentRunner {
 func NewSubAgentRunner(parent *DeepAgent) *SubAgentRunner {
 	return &SubAgentRunner{
 		Middleware:  SubAgentMiddlewareStack(parent.Catalog, parent.MemoryStore),
-		State:       NewAgentState(parent.State.WorkspaceDir),
+		State:       NewAgentStateWithSession(parent.State.WorkspaceDir, parent.SessionID),
 		Catalog:     parent.Catalog,
 		MemoryStore: parent.MemoryStore,
 		UseNative:   parent.UseNativeTools,

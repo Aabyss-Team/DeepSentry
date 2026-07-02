@@ -3,6 +3,7 @@ package tui
 import (
 	"regexp"
 	"strings"
+	"unicode"
 
 	"ai-edr/internal/ui"
 
@@ -75,6 +76,9 @@ func renderMarkdownBlocks(markdown string, width int) string {
 		}
 
 		if level, text, ok := parseMarkdownHeading(trimmed); ok {
+			if len(out) > 0 && out[len(out)-1] != "" && level <= 2 {
+				out = append(out, "")
+			}
 			out = append(out, renderMarkdownHeading(level, text, width))
 			continue
 		}
@@ -111,18 +115,49 @@ func parseMarkdownHeading(line string) (int, string, bool) {
 }
 
 func renderMarkdownHeading(level int, text string, width int) string {
-	text = markdownInlinePlain(text)
+	text = normalizeMarkdownHeadingText(markdownInlinePlain(text))
 	switch {
 	case level <= 1:
-		label := runewidth.Truncate(text, max(4, width-2), "…")
-		return mdH1Style.Render("▌ " + label)
+		marker := "=="
+		label := runewidth.Truncate(text, max(4, width-runewidth.StringWidth(marker)-1), "…")
+		return mdH1Style.Render(marker + " " + label)
 	case level == 2:
-		label := runewidth.Truncate(text, max(4, width-2), "…")
-		return mdH2Style.Render("● " + label)
+		marker := "--"
+		label := runewidth.Truncate(text, max(4, width-runewidth.StringWidth(marker)-1), "…")
+		return mdH2Style.Render(marker + " " + label)
 	default:
-		label := runewidth.Truncate(text, max(4, width-2), "…")
-		return mdH3Style.Render("› " + label)
+		marker := ">"
+		label := runewidth.Truncate(text, max(4, width-runewidth.StringWidth(marker)-1), "…")
+		return mdH3Style.Render(marker + " " + label)
 	}
+}
+
+func normalizeMarkdownHeadingText(text string) string {
+	text = strings.Join(strings.Fields(strings.TrimSpace(text)), " ")
+	if text == "" {
+		return text
+	}
+	runes := []rune(text)
+	if len(runes) < 2 {
+		return text
+	}
+	if !isMarkdownIconPrefix(runes[0]) {
+		return text
+	}
+	if unicode.IsSpace(runes[1]) {
+		return text
+	}
+	return string(runes[0]) + " " + string(runes[1:])
+}
+
+func isMarkdownIconPrefix(r rune) bool {
+	if unicode.IsLetter(r) || unicode.IsDigit(r) {
+		return false
+	}
+	if unicode.IsSymbol(r) {
+		return true
+	}
+	return runewidth.RuneWidth(r) >= 2
 }
 
 func parseMarkdownList(line string) (string, string, bool) {
@@ -265,15 +300,17 @@ func renderMarkdownTable(lines []string, width int) []string {
 			rows[i] = rows[i][:cols]
 		}
 	}
-	widths := markdownTableWidths(rows, width)
+	tableW := max(20, width-2)
+	widths := markdownTableWidths(rows, tableW)
 	out := make([]string, 0, len(rows)+3)
-	out = append(out, tableBorderLine("top", widths))
-	out = append(out, tableRow(rows[0], widths, true))
-	out = append(out, tableBorderLine("mid", widths))
+	prefix := "  "
+	out = append(out, prefix+tableBorderLine("top", widths))
+	out = append(out, prefix+tableRow(rows[0], widths, true))
+	out = append(out, prefix+tableBorderLine("mid", widths))
 	for _, row := range rows[1:] {
-		out = append(out, tableRow(row, widths, false))
+		out = append(out, prefix+tableRow(row, widths, false))
 	}
-	out = append(out, tableBorderLine("bottom", widths))
+	out = append(out, prefix+tableBorderLine("bottom", widths))
 	return out
 }
 
@@ -331,9 +368,9 @@ func tableBorderLine(kind string, widths []int) string {
 	} else {
 		switch kind {
 		case "top":
-			left, mid, right = "┌", "┬", "┐"
+			left, mid, right = "╭", "┬", "╮"
 		case "bottom":
-			left, mid, right = "└", "┴", "┘"
+			left, mid, right = "╰", "┴", "╯"
 		}
 	}
 	if ui.PlainTextMode() {

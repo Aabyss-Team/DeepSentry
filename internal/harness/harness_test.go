@@ -7,6 +7,8 @@ import (
 	"ai-edr/internal/tools"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -91,6 +93,34 @@ func TestActionToJSONPreservesFields(t *testing.T) {
 	}
 	if m["path"] != "/var/log/syslog" {
 		t.Fatalf("path lost: %v", m)
+	}
+}
+
+func TestOffloadOutputIsSessionScoped(t *testing.T) {
+	dir := t.TempDir()
+	mw := &ContextMiddleware{OutputThreshold: 10}
+	outA := strings.Repeat("A", 32)
+	outB := strings.Repeat("B", 32)
+
+	msgA := mw.OffloadOutput(NewAgentStateWithSession(dir, "session_a"), "step1", outA)
+	msgB := mw.OffloadOutput(NewAgentStateWithSession(dir, "session_b"), "step1", outB)
+	if !strings.Contains(msgA, filepath.Join("sessions", "session_a", "output_step1.txt")) {
+		t.Fatalf("session_a path missing from output: %s", msgA)
+	}
+	if !strings.Contains(msgB, filepath.Join("sessions", "session_b", "output_step1.txt")) {
+		t.Fatalf("session_b path missing from output: %s", msgB)
+	}
+
+	dataA, err := os.ReadFile(filepath.Join(dir, "sessions", "session_a", "output_step1.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dataB, err := os.ReadFile(filepath.Join(dir, "sessions", "session_b", "output_step1.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(dataA) != outA || string(dataB) != outB {
+		t.Fatalf("offloaded outputs were not isolated: A=%q B=%q", string(dataA), string(dataB))
 	}
 }
 

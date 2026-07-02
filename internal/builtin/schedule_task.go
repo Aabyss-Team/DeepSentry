@@ -2,6 +2,7 @@ package builtin
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -25,6 +26,9 @@ func ScheduleTask(rt Runtime, args map[string]string) (string, error) {
 	case "add", "create":
 		plan, err := scheduler.PlanTask(schedulePlanInput(args), time.Now())
 		if err != nil {
+			return "", err
+		}
+		if err := validateScheduleCreate(plan, args); err != nil {
 			return "", err
 		}
 		if err := store.Add(plan.Task); err != nil {
@@ -97,6 +101,44 @@ func optionalBool(args map[string]string, key string) *bool {
 	b := v == "1" || v == "true" || v == "yes" || v == "y" || v == "on" || v == "是"
 	return &b
 }
+
+func validateScheduleCreate(plan scheduler.Plan, args map[string]string) error {
+	task := plan.Task
+	if task.Kind != scheduler.KindAgent {
+		return nil
+	}
+	if reason := unsafeUnattendedAgentPrompt(task.Prompt); reason != "" {
+		return fmt.Errorf("拒绝创建泛化 Agent 定时任务: %s。请改用 kind=inspection 做只读巡检，或先手动排查后再创建明确的维护任务", reason)
+	}
+	if !task.AllowBatch || !argBool(args, "confirm_unattended") {
+		return fmt.Errorf("拒绝创建泛化 Agent 定时任务: 需要同时显式提供 allow_batch=true 和 confirm_unattended=true；巡检场景请使用 kind=inspection")
+	}
+	return nil
+}
+
+func unsafeUnattendedAgentPrompt(prompt string) string {
+	text := strings.TrimSpace(prompt)
+	if text == "" {
+		return "任务内容为空"
+	}
+	lower := strings.ToLower(text)
+	ipPort := scheduleIPPortRE.MatchString(text)
+	if ipPort {
+		for _, needle := range []string{"回连", "反连", "reverse shell", "callback", "connect back"} {
+			if strings.Contains(lower, needle) || strings.Contains(text, needle) {
+				return "任务文本包含回连/反连语义和 IP:端口，像是攻击取证答案而不是授权自动化任务"
+			}
+		}
+	}
+	for _, needle := range []string{"恶意回连", "反弹 shell", "reverse shell", "木马", "后门", "持久化", "篡改系统命令"} {
+		if strings.Contains(lower, needle) || strings.Contains(text, needle) {
+			return "任务文本包含高危攻击/持久化语义"
+		}
+	}
+	return ""
+}
+
+var scheduleIPPortRE = regexp.MustCompile(`\b(?:\d{1,3}\.){3}\d{1,3}:\d{2,5}\b`)
 
 func firstNonEmptyLocal(vals ...string) string {
 	for _, v := range vals {

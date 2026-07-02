@@ -27,6 +27,15 @@ stable operating preferences even when users copy only one executable file.
 - Keep actions auditable: summarize command purpose, important output, and final evidence.
 - Avoid storing secrets in memory. Never save API keys, passwords, tokens, private keys, or webhook signing secrets.
 - For non-interactive/WebShell mode, continue with conservative defaults and clearly report skipped optional inputs.
+- Memory should be helpful, not noisy: preserve durable user preferences, repeated collaboration habits, target/project facts, and reusable investigation lessons.
+- Warm memory is allowed when it improves future collaboration, such as the user's preferred language, report style, pacing, or recurring product expectations. Keep it short, respectful, and practical.
+- Do not preserve transient emotions, private life details, raw conversation logs, or one-off wording unless the user explicitly asks.
+
+## Memory Writing Policy
+
+- Structured memory is the default place for specific lessons and facts. Use it for reusable commands, target paths, investigation conclusions, and user preferences.
+- AGENTS.md is for durable operating rules and long-lived context that should shape every future session. It does not require manual editing only; the agent may maintain it when the user explicitly asks to remember something permanently, or when a stable preference emerges across multiple turns.
+- Before writing AGENTS.md automatically, compress the point into a concise rule under a suitable section such as User Preferences, Target Environment, Collaboration Notes, or Historical Conclusions.
 
 ## Safety Defaults
 
@@ -225,6 +234,37 @@ func (s *Store) DeleteGlobal(key string) error {
 	return s.Save()
 }
 
+// Clear 删除结构化记忆。scope 支持 all/global/target(local/current)。
+func (s *Store) Clear(scope string) (int, error) {
+	scope = strings.ToLower(strings.TrimSpace(scope))
+	if scope == "" {
+		scope = "all"
+	}
+	removed := 0
+	for id, e := range s.entries {
+		remove := false
+		switch scope {
+		case "all", "*":
+			remove = true
+		case ScopeGlobal:
+			remove = e.Scope == ScopeGlobal
+		case "target", "current", "local":
+			remove = e.Scope == s.scope
+		default:
+			return 0, fmt.Errorf("未知 memory 清理范围: %s", scope)
+		}
+		if remove {
+			delete(s.entries, id)
+			removed++
+		}
+	}
+	if removed == 0 {
+		return 0, nil
+	}
+	s.dirty = true
+	return removed, s.Save()
+}
+
 // ActiveEntries 返回当前会话可见的记忆（global + 当前 scope）
 func (s *Store) ActiveEntries() []Entry {
 	var result []Entry
@@ -280,6 +320,8 @@ func (s *Store) FormatPrompt() string {
 
 何时保存: 用户偏好、常用路径、目标环境特征、排查结论、SSH 主机别名等。
 禁止保存: API Key、密码、Token 等凭证。
+有温度的记忆点: 可保存稳定的沟通偏好、协作节奏、报告风格和反复出现的产品体验要求；保持简短、尊重、可执行。
+AGENTS.md 不要求用户手动维护。AGENTS.md 用途: 长期稳定规则、跨会话协作偏好、项目/目标长期上下文；不必完全手写，用户明确要求永久记住或多轮对话形成稳定偏好时，可通过 write_file/edit_file 维护 ~/.deepsentry/AGENTS.md。
 `)
 	return b.String()
 }
@@ -317,6 +359,32 @@ func DefaultAgentsMDSources() []string {
 		"~/.deepsentry/AGENTS.md",
 		".deepsentry/AGENTS.md",
 	}
+}
+
+// ClearExternalAgentsMD 删除外部 AGENTS.md 记忆文件；内置默认 AGENTS.md 保留。
+func (s *Store) ClearExternalAgentsMD() (int, error) {
+	removed := 0
+	var errs []string
+	for _, src := range DefaultAgentsMDSources() {
+		path := expandPath(src)
+		if _, err := os.Stat(path); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			errs = append(errs, err.Error())
+			continue
+		}
+		if err := os.Remove(path); err != nil {
+			errs = append(errs, err.Error())
+			continue
+		}
+		removed++
+	}
+	s.ReloadAgentsMD()
+	if len(errs) > 0 {
+		return removed, fmt.Errorf("%s", strings.Join(errs, "; "))
+	}
+	return removed, nil
 }
 
 func stripHTMLComments(s string) string {

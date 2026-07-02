@@ -154,7 +154,6 @@ func (c *SessionController) beginRun() bool {
 			}
 		}()
 
-		c.cfg.Agent.StartStep = 0
 		c.cfg.Agent.RunLoop(harness.RunLoopConfig{
 			SysCtx:           c.cfg.SysCtx,
 			History:          c.cfg.History,
@@ -235,6 +234,53 @@ func (c *SessionController) StartNewSession(goal string) (string, bool, error) {
 	}
 	c.SetInitialGoal(goal)
 	return agent.SessionID, true, nil
+}
+
+func (c *SessionController) ResumeSession(sessionID, supplement string) (int, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return 0, fmt.Errorf("session_id 不能为空")
+	}
+	c.mu.Lock()
+	if c.running {
+		c.mu.Unlock()
+		return 0, fmt.Errorf("当前任务仍在运行")
+	}
+	c.mu.Unlock()
+
+	cp, err := harness.LoadCheckpoint(sessionID)
+	if err != nil {
+		return 0, err
+	}
+	agent, err := harness.NewDeepAgent(harness.Config{
+		BatchMode: c.cfg.BatchMode,
+		SessionID: sessionID,
+	})
+	if err != nil {
+		return 0, err
+	}
+	agent.RestoreFromCheckpoint(cp)
+	history := append([]analyzer.Message(nil), cp.History...)
+	if len(history) == 0 {
+		history = []analyzer.Message{{Role: "user", Content: "继续之前的任务"}}
+	}
+	if strings.TrimSpace(supplement) != "" {
+		history = append(history, analyzer.Message{Role: "user", Content: "用户补充：" + strings.TrimSpace(supplement)})
+	}
+
+	c.mu.Lock()
+	c.cfg.Agent = agent
+	if c.cfg.History == nil {
+		c.cfg.History = &[]analyzer.Message{}
+	}
+	*c.cfg.History = history
+	c.turn = 0
+	c.pendingInterrupt = false
+	c.stopped = false
+	c.stopCh = make(chan struct{})
+	c.mu.Unlock()
+
+	return cp.StepNum, nil
 }
 
 func trimInput(s string) string {

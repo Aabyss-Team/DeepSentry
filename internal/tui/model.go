@@ -10,6 +10,7 @@ import (
 
 	"ai-edr/internal/config"
 	"ai-edr/internal/harness"
+	"ai-edr/internal/memory"
 	"ai-edr/internal/skills"
 	"ai-edr/internal/ui"
 
@@ -27,6 +28,8 @@ type logLine struct {
 	content   string
 	raw       string
 	collapsed bool
+	group     int
+	groupHead bool
 	id        int
 	at        time.Time
 }
@@ -65,8 +68,10 @@ var slashCommands = []slashCommand{
 	{Name: "cost", Description: "显示会话轮次、消息数和估算 token"},
 	{Name: "model", Description: "显示当前模型"},
 	{Name: "compact", Description: "折叠长输出并整理上下文"},
+	{Name: "memory", Description: "Memory 管理：/memory list|clear [all|target|global]"},
+	{Name: "agents", Description: "AGENTS.md 管理：/agents status|clear"},
 	{Name: "sessions", Description: "列出可恢复 checkpoint"},
-	{Name: "resume", Description: "提示如何恢复历史会话"},
+	{Name: "resume", Description: "恢复 checkpoint：/resume <session_id> [补充说明]"},
 	{Name: "config", Description: "显示连接与模型配置"},
 	{Name: "mcp", Description: "MCP 管理：/mcp list|import|add|off|on"},
 	{Name: "skill", Description: "Skill 管理：/skill list|load|unload|add|off|on|remove"},
@@ -82,6 +87,7 @@ type userMsgEvent struct{ text string }
 type agentStartMsg struct{ followUp bool }
 type streamRefreshMsg struct{}
 type streamCollapseMsg struct{ id int }
+type cmdOutputCollapseMsg struct{ group int }
 type copyToastMsg struct {
 	chars int
 	err   string
@@ -107,23 +113,25 @@ type AgentModel struct {
 	currentTarget     string
 	maxSteps          int
 
-	lines         []logLine
-	lineID        int
-	streamIdx     int // 当前流式行索引，-1 表示无
-	streamTick    bool
-	running       bool
-	thinking      bool
-	currentStep   int
-	done          bool
-	awaitGoal     bool
-	sessionLive   bool
-	autoStart     bool // 带 history 启动时由 Init 触发首轮
-	autoScroll    bool
-	stopping      bool
-	inputHistory  []string
-	historyIdx    int
-	pendingPaste  string
-	slashSelected int
+	lines          []logLine
+	lineID         int
+	streamIdx      int // 当前流式行索引，-1 表示无
+	cmdOutputGroup int
+	activeCmdGroup int
+	streamTick     bool
+	running        bool
+	thinking       bool
+	currentStep    int
+	done           bool
+	awaitGoal      bool
+	sessionLive    bool
+	autoStart      bool // 带 history 启动时由 Init 触发首轮
+	autoScroll     bool
+	stopping       bool
+	inputHistory   []string
+	historyIdx     int
+	pendingPaste   string
+	slashSelected  int
 
 	pendingConfirm *confirmState
 	pendingAsk     *askState
@@ -245,6 +253,12 @@ func (m AgentModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					cmds = append(cmds, streamCollapseCmd(id))
 				}
 			}
+			if e.Kind == harness.EventResult && isCommandCompletionEvent(e) {
+				if group := m.activeCmdGroup; group > 0 {
+					cmds = append(cmds, cmdOutputCollapseCmd(group))
+				}
+				m.activeCmdGroup = 0
+			}
 		}
 		if m.thinking {
 			cmds = append(cmds, m.spinner.Tick)
@@ -261,6 +275,14 @@ func (m AgentModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case streamCollapseMsg:
 		m.collapseStreamLine(msg.id)
+		m.refreshViewport()
+		if m.inputFocused() {
+			m.scheduleInputCursorAnchor()
+		}
+		return m, nil
+
+	case cmdOutputCollapseMsg:
+		m.collapseCommandOutputGroup(msg.group)
 		m.refreshViewport()
 		if m.inputFocused() {
 			m.scheduleInputCursorAnchor()
@@ -867,6 +889,18 @@ func streamCollapseCmd(id int) tea.Cmd {
 	return tea.Tick(2*time.Second, func(time.Time) tea.Msg { return streamCollapseMsg{id: id} })
 }
 
+func cmdOutputCollapseCmd(group int) tea.Cmd {
+	return tea.Tick(12*time.Second, func(time.Time) tea.Msg { return cmdOutputCollapseMsg{group: group} })
+}
+
+func isCommandCompletionEvent(e harness.UIEvent) bool {
+	if e.Kind != harness.EventResult {
+		return false
+	}
+	msg := strings.TrimSpace(e.Message)
+	return msg == "命令执行完成" || msg == "命令执行完成（无输出）"
+}
+
 func (m *AgentModel) recallInputHistory(delta int) {
 	if len(m.inputHistory) == 0 {
 		return
@@ -913,10 +947,14 @@ func (m *AgentModel) handleSlashCommand(text string) tea.Cmd {
 	case cmd == "compact":
 		m.appendLine("info", "已折叠最近的长输出/思考块；完整上下文仍保留在会话历史中。", "compact")
 		for i := range m.lines {
-			if m.lines[i].kind == "subagent_result" || m.lines[i].kind == "stream" {
+			if m.lines[i].kind == "subagent_result" || m.lines[i].kind == "stream" || m.lines[i].kind == "cmdout" {
 				m.lines[i].collapsed = true
 			}
 		}
+	case cmd == "memory":
+		m.handleMemorySlash(arg)
+	case cmd == "agents" || cmd == "agents.md" || cmd == "agent":
+		m.handleAgentsSlash(arg)
 	case cmd == "sessions":
 		summaries, err := harness.ListSessionSummaries()
 		if err != nil {
@@ -932,8 +970,8 @@ func (m *AgentModel) handleSlashCommand(text string) tea.Cmd {
 			b.WriteString(fmt.Sprintf("%s · step %d · %s\n", s.ID, s.StepNum, s.SavedAt.Format("01-02 15:04")))
 		}
 		m.appendLine("result", strings.TrimSpace(b.String()), b.String())
-	case strings.HasPrefix(cmd, "resume"):
-		m.appendLine("info", "请退出后使用 deepsentry --resume <session_id>，或从启动选择器恢复会话。", text)
+	case cmd == "resume":
+		return m.resumeSessionSlash(arg)
 	case cmd == "config":
 		m.appendLine("info", fmt.Sprintf("连接: %s · 模型: %s · 最大步数: %d", m.statusLine, m.title, m.maxSteps), text)
 	case cmd == "mcp":
@@ -947,6 +985,147 @@ func (m *AgentModel) handleSlashCommand(text string) tea.Cmd {
 	default:
 		m.appendLine("error", "未知命令: /"+cmd+"（可用 "+slashCommandNames()+"）", text)
 	}
+	m.refreshViewport()
+	return nil
+}
+
+func (m *AgentModel) handleMemorySlash(arg string) {
+	store := m.currentMemoryStore()
+	if store == nil {
+		m.appendLine("error", "当前 Agent 没有可用 MemoryStore", arg)
+		return
+	}
+	fields := strings.Fields(arg)
+	action := "list"
+	if len(fields) > 0 {
+		action = strings.ToLower(fields[0])
+	}
+	switch action {
+	case "list", "status", "ls":
+		entries := store.ActiveEntries()
+		if len(entries) == 0 {
+			m.appendLine("info", "结构化 Memory 为空", arg)
+			return
+		}
+		var b strings.Builder
+		for _, e := range entries {
+			b.WriteString(fmt.Sprintf("[%s] %s = %s\n", e.Scope, e.Key, truncateStr(e.Value, 160)))
+		}
+		m.appendLine("result", strings.TrimSpace(b.String()), b.String())
+	case "clear", "reset", "init":
+		scope := "all"
+		if len(fields) > 1 {
+			scope = fields[1]
+		}
+		n, err := store.Clear(scope)
+		if err != nil {
+			m.appendLine("error", "清空 Memory 失败: "+err.Error(), err.Error())
+			return
+		}
+		m.appendLine("result", fmt.Sprintf("已清空结构化 Memory（范围: %s，删除 %d 条）", scope, n), arg)
+	default:
+		m.appendLine("info", "用法: /memory list | /memory clear [all|target|global]", arg)
+	}
+}
+
+func (m *AgentModel) handleAgentsSlash(arg string) {
+	store := m.currentMemoryStore()
+	if store == nil {
+		m.appendLine("error", "当前 Agent 没有可用 MemoryStore", arg)
+		return
+	}
+	fields := strings.Fields(arg)
+	action := "status"
+	if len(fields) > 0 {
+		action = strings.ToLower(fields[0])
+	}
+	switch action {
+	case "status", "list", "ls":
+		m.appendLine("info", fmt.Sprintf("AGENTS.md 已加载 %d 个来源（包含内置默认）。可手动编辑 ~/.deepsentry/AGENTS.md；Agent 也会在用户明确要求永久记住或多轮形成稳定偏好时智能归纳维护。用 /agents clear 清空外部 AGENTS.md。", store.AgentsMDCount()), arg)
+	case "clear", "reset", "init":
+		n, err := store.ClearExternalAgentsMD()
+		if err != nil {
+			m.appendLine("error", "清空 AGENTS.md 失败: "+err.Error(), err.Error())
+			return
+		}
+		m.appendLine("result", fmt.Sprintf("已清空外部 AGENTS.md（删除 %d 个文件，内置默认保留）", n), arg)
+	default:
+		m.appendLine("info", "用法: /agents status | /agents clear", arg)
+	}
+}
+
+func (m *AgentModel) currentMemoryStore() *memory.Store {
+	if m.ctrl == nil || m.ctrl.cfg.Agent == nil {
+		return nil
+	}
+	return m.ctrl.cfg.Agent.MemoryStore
+}
+
+func (m *AgentModel) resumeSessionSlash(arg string) tea.Cmd {
+	if m.ctrl == nil {
+		m.appendLine("error", "当前界面没有可用控制器", arg)
+		m.refreshViewport()
+		return nil
+	}
+	if m.running {
+		m.appendLine("error", "当前任务仍在运行；请先 Esc 停止后再 /resume。", arg)
+		m.refreshViewport()
+		return nil
+	}
+	fields := strings.Fields(arg)
+	if len(fields) == 0 {
+		m.appendLine("info", "用法: /resume <session_id> [补充说明]；可先用 /sessions 查看可恢复会话。", arg)
+		m.refreshViewport()
+		return nil
+	}
+	sessionID := fields[0]
+	supplement := strings.TrimSpace(strings.TrimPrefix(arg, sessionID))
+	step, err := m.ctrl.ResumeSession(sessionID, supplement)
+	if err != nil {
+		m.appendLine("error", "恢复会话失败: "+err.Error(), err.Error())
+		m.refreshViewport()
+		return nil
+	}
+
+	m.lines = []logLine{}
+	m.lineID = 0
+	m.streamIdx = -1
+	m.streamTick = false
+	m.cmdOutputGroup = 0
+	m.activeCmdGroup = 0
+	m.running = false
+	m.thinking = false
+	m.currentStep = step
+	m.done = false
+	m.awaitGoal = false
+	m.sessionLive = true
+	m.autoStart = false
+	m.autoScroll = true
+	m.stopping = false
+	m.pendingConfirm = nil
+	m.pendingAsk = nil
+	m.historyIdx = -1
+	m.currentTarget = ""
+	m.copyToast = ""
+	m.tokenUsage = tokenStats{}
+	m.startupInfo.SessionID = sessionID
+	m.startupInfo.AwaitGoal = false
+	m.startupInfo.StartedAt = time.Now().Format("2006-01-02 15:04:05")
+	m.bannerCache = ""
+	m.bannerCacheW = 0
+	m.clearInputDraft()
+	cancelInputCursorAnchor()
+
+	m.input.Blur()
+	m.appendLine("info", fmt.Sprintf("已恢复会话 %s (step %d)，开始继续执行。", shortSessionID(sessionID), step), sessionID)
+	if supplement != "" {
+		m.appendLine("user", "用户补充: "+summarizeIfNeeded(supplement), supplement)
+	}
+	m.refreshViewport()
+	if m.ctrl.beginRun() {
+		return agentStartCmd(true)
+	}
+	m.appendLine("error", "Agent 仍在运行，请稍候", "busy")
 	m.refreshViewport()
 	return nil
 }
@@ -1139,6 +1318,8 @@ func (m *AgentModel) startNewSession(goal string) tea.Cmd {
 	m.lineID = 0
 	m.streamIdx = -1
 	m.streamTick = false
+	m.cmdOutputGroup = 0
+	m.activeCmdGroup = 0
 	m.running = false
 	m.thinking = false
 	m.currentStep = 0
@@ -1186,6 +1367,8 @@ func (m *AgentModel) clearView() {
 	m.lines = []logLine{}
 	m.lineID = 0
 	m.streamIdx = -1
+	m.cmdOutputGroup = 0
+	m.activeCmdGroup = 0
 	m.appendLine("info", "已清空当前视图", "clear")
 	m.refreshViewport()
 }
@@ -1204,6 +1387,7 @@ func (m AgentModel) currentInputValue() string {
 func (m *AgentModel) clearInputDraft() {
 	m.pendingPaste = ""
 	m.input.SetValue("")
+	m.input.SetCursor(0)
 	m.slashSelected = 0
 }
 
@@ -1212,25 +1396,41 @@ func (m *AgentModel) acceptPaste(text string) {
 		return
 	}
 	base := m.input.Value()
+	cursor := m.input.Position()
 	if m.pendingPaste != "" {
 		base = m.pendingPaste
+		cursor = len([]rune(base))
 	}
-	full := base + text
+	baseRunes := []rune(base)
+	if cursor < 0 {
+		cursor = 0
+	}
+	if cursor > len(baseRunes) {
+		cursor = len(baseRunes)
+	}
+	textRunes := []rune(text)
+	full := string(baseRunes[:cursor]) + text + string(baseRunes[cursor:])
+	nextCursor := cursor + len(textRunes)
 	if isLargePaste(full) {
 		m.pendingPaste = full
-		m.input.SetValue(pasteSummary(full))
+		summary := pasteSummary(full)
+		m.input.SetValue(summary)
+		m.input.SetCursor(len([]rune(summary)))
 		m.slashSelected = 0
 		return
 	}
 	m.pendingPaste = ""
 	m.input.SetValue(full)
+	m.input.SetCursor(nextCursor)
 	m.clampSlashSelection()
 }
 
 func (m *AgentModel) appendInputNewline() {
 	base := m.currentInputValue()
 	m.pendingPaste = base + "\n"
-	m.input.SetValue(pasteSummary(m.pendingPaste))
+	summary := pasteSummary(m.pendingPaste)
+	m.input.SetValue(summary)
+	m.input.SetCursor(len([]rune(summary)))
 	m.slashSelected = 0
 }
 
@@ -1244,6 +1444,10 @@ func (m AgentModel) pendingConfirmActive() bool {
 
 func (m *AgentModel) toggleLastCollapsible() {
 	for i := len(m.lines) - 1; i >= 0; i-- {
+		if m.lines[i].kind == "cmdout" && m.lines[i].group > 0 {
+			m.toggleCommandOutputGroup(m.lines[i].group)
+			return
+		}
 		if m.lines[i].kind == "subagent_result" || m.lines[i].kind == "stream" {
 			m.lines[i].collapsed = !m.lines[i].collapsed
 			return
@@ -1258,6 +1462,61 @@ func (m *AgentModel) lastStreamLineID() int {
 		}
 	}
 	return 0
+}
+
+func (m *AgentModel) collapseCommandOutputGroup(group int) {
+	if group <= 0 {
+		return
+	}
+	headSet := false
+	for i := range m.lines {
+		if m.lines[i].kind == "cmdout" && m.lines[i].group == group {
+			m.lines[i].collapsed = true
+			if !headSet {
+				m.lines[i].groupHead = true
+				headSet = true
+			} else {
+				m.lines[i].groupHead = false
+			}
+		}
+	}
+}
+
+func (m *AgentModel) toggleCommandOutputGroup(group int) {
+	if group <= 0 {
+		return
+	}
+	collapsed := false
+	found := false
+	for _, line := range m.lines {
+		if line.kind == "cmdout" && line.group == group {
+			collapsed = line.collapsed
+			found = true
+			break
+		}
+	}
+	if !found {
+		return
+	}
+	for i := range m.lines {
+		if m.lines[i].kind == "cmdout" && m.lines[i].group == group {
+			m.lines[i].collapsed = !collapsed
+		}
+	}
+}
+
+func (m *AgentModel) commandOutputGroupStats(group int) (lines, chars int, first string) {
+	for _, line := range m.lines {
+		if line.kind != "cmdout" || line.group != group {
+			continue
+		}
+		lines++
+		chars += len(line.raw)
+		if first == "" {
+			first = strings.TrimSpace(line.content)
+		}
+	}
+	return lines, chars, first
 }
 
 func (m *AgentModel) applyEvent(e harness.UIEvent) {
@@ -1283,6 +1542,9 @@ func (m *AgentModel) applyEvent(e harness.UIEvent) {
 			line := harness.FormatTodoList(e.Action.Todos)
 			m.appendLine("todo", line, line)
 			break
+		}
+		if e.Action != nil && e.Action.Type == harness.ActionExecute {
+			m.startCommandOutputGroup()
 		}
 		kind := "tool"
 		line := FormatActionLine(e.Action)
@@ -1350,7 +1612,7 @@ func (m *AgentModel) applyEvent(e harness.UIEvent) {
 		}
 	case harness.EventCommandOutput:
 		if strings.TrimSpace(e.Message) != "" {
-			m.appendLine("result", strings.TrimRight(e.Message, "\r\n"), e.Message)
+			m.appendCommandOutputLine(strings.TrimRight(e.Message, "\r\n"), e.Message)
 		}
 	case harness.EventError, harness.EventCheckpoint:
 		m.appendLine("error", e.Message, e.Message)
@@ -1574,6 +1836,34 @@ func (m *AgentModel) appendLine(kind, display, raw string) {
 	}
 }
 
+func (m *AgentModel) startCommandOutputGroup() {
+	m.cmdOutputGroup++
+	m.activeCmdGroup = m.cmdOutputGroup
+}
+
+func (m *AgentModel) appendCommandOutputLine(display, raw string) {
+	if m.activeCmdGroup <= 0 {
+		m.startCommandOutputGroup()
+	}
+	group := m.activeCmdGroup
+	head := true
+	for i := len(m.lines) - 1; i >= 0; i-- {
+		if m.lines[i].kind == "cmdout" && m.lines[i].group == group {
+			head = false
+			break
+		}
+		if m.lines[i].kind == "tool" || m.lines[i].kind == "step" {
+			break
+		}
+	}
+	m.lineID++
+	m.lines = append(m.lines, logLine{kind: "cmdout", content: display, raw: raw, id: m.lineID, group: group, groupHead: head, at: time.Now()})
+	if len(m.lines) > 500 {
+		m.lines = m.lines[len(m.lines)-500:]
+		m.streamIdx = -1
+	}
+}
+
 func (m *AgentModel) appendAskLine(prompt string, options []string) {
 	prompt = strings.TrimSpace(prompt)
 	if prompt == "" {
@@ -1646,6 +1936,20 @@ func (m *AgentModel) refreshViewport() {
 			b.WriteString(renderWrapped(styleSubAgentResult, ts+"📦 "+truncateLines(body, 12), contentW) + "\n\n")
 		case "result":
 			b.WriteString(renderWrapped(styleResult, ts+"└ "+truncateLines(ln.content, 8), contentW) + "\n\n")
+		case "cmdout":
+			if ln.collapsed {
+				if !ln.groupHead {
+					continue
+				}
+				lines, chars, first := m.commandOutputGroupStats(ln.group)
+				summary := fmt.Sprintf("命令输出已折叠：%d 行 / %d 字符", lines, chars)
+				if first != "" {
+					summary += " · " + truncateStr(first, min(80, contentW/2))
+				}
+				b.WriteString(renderWrapped(styleResult, ts+"└ "+summary+"  [e 展开]", contentW) + "\n\n")
+			} else {
+				b.WriteString(renderWrapped(styleResult, ts+"└ "+ln.content, contentW) + "\n")
+			}
 		case "ask":
 			b.WriteString(renderWrapped(styleToolBox, ts+"? "+ln.content, contentW) + "\n\n")
 		case "error":
@@ -1898,8 +2202,9 @@ func (m *AgentModel) recalcLayout() {
 	if h <= 0 {
 		h = 24
 	}
-	// header(1) + status(1) + input(3) + help(1) + optional slash suggestions.
-	chromeLines := 6 + m.slashSuggestionLineCount()
+	// header(1) + status(1) + input box(content rows + 2) + help(1) + optional slash suggestions.
+	inputRows := m.inputContentRowCount(ChromeContentWidth(w) - 2)
+	chromeLines := inputRows + 5 + m.slashSuggestionLineCount()
 	m.viewport.Width = max(0, w-2)
 	m.viewport.Height = max(4, h-chromeLines)
 	m.input.Width = ChromeContentWidth(w) - 2
@@ -1966,10 +2271,10 @@ func (m AgentModel) renderInputLine() string {
 	m.input.Width = innerW
 	m.input.Placeholder = m.inputPlaceholderText()
 
-	var content string
+	rows := []string{}
 	switch {
 	case m.inputFocused():
-		content = m.renderFocusedInputContent(innerW)
+		rows, _, _ = m.focusedInputRows(innerW)
 	case m.running && !m.awaitGoal:
 		hint := "Agent 执行中..."
 		if m.pendingConfirm != nil {
@@ -1977,16 +2282,21 @@ func (m AgentModel) renderInputLine() string {
 		} else if m.pendingAsk != nil {
 			hint = "等待补充信息 · Tab 输入"
 		}
-		content = styleInfo.Render(runewidth.Truncate(hint, innerW, "..."))
+		rows = []string{styleInfo.Render(runewidth.Truncate(hint, innerW, "..."))}
 	default:
 		if m.input.Value() == "" {
-			content = styleInfo.Render(runewidth.Truncate(m.inputHintText(), innerW, "..."))
+			rows = []string{styleInfo.Render(runewidth.Truncate(m.inputHintText(), innerW, "..."))}
 		} else {
-			content = m.input.View()
+			rows = []string{m.input.View()}
 		}
 	}
-	row := fitStyledLine(content, innerW)
-	return renderChromeBox([]string{row}, w, border)
+	if len(rows) == 0 {
+		rows = []string{""}
+	}
+	for i := range rows {
+		rows[i] = fitStyledLine(rows[i], innerW)
+	}
+	return renderChromeBox(rows, w, border)
 }
 
 func (m AgentModel) visibleSlashSuggestions() []slashCommand {
@@ -2041,12 +2351,34 @@ func (m AgentModel) renderSlashSuggestions() string {
 }
 
 func (m AgentModel) renderFocusedInputContent(width int) string {
+	rows, _, _ := m.focusedInputRows(width)
+	return strings.Join(rows, "\n")
+}
+
+func (m AgentModel) inputContentRowCount(width int) int {
+	if !m.inputFocused() {
+		return 1
+	}
+	rows, _, _ := m.focusedInputRows(width)
+	return max(1, len(rows))
+}
+
+func (m AgentModel) maxInputContentRows() int {
+	if m.height > 0 {
+		return max(2, min(5, max(1, m.height/4)))
+	}
+	return 5
+}
+
+func (m AgentModel) focusedInputRows(width int) ([]string, int, int) {
 	if width <= 0 {
-		return ""
+		return []string{""}, 0, 0
 	}
 	value := m.input.Value()
+	placeholder := false
 	if value == "" {
 		value = m.inputPlaceholderText()
+		placeholder = true
 	}
 	pos := m.input.Position()
 	runes := []rune(value)
@@ -2056,28 +2388,78 @@ func (m AgentModel) renderFocusedInputContent(width int) string {
 	if pos > len(runes) {
 		pos = len(runes)
 	}
-	prefix := string(runes[:pos])
-	cursor := " "
-	suffix := ""
-	if pos < len(runes) {
-		cursor = string(runes[pos])
-		suffix = string(runes[pos+1:])
-	}
-
-	for runewidth.StringWidth(prefix)+runewidth.StringWidth(cursor) > width && len([]rune(prefix)) > 0 {
-		prefix = string([]rune(prefix)[1:])
-	}
-	remaining := width - runewidth.StringWidth(prefix) - runewidth.StringWidth(cursor)
-	if remaining < 0 {
-		remaining = 0
-	}
-	suffix = runewidth.Truncate(suffix, remaining, "")
 
 	textStyle := styleInputLine
-	if m.input.Value() == "" {
+	if placeholder {
 		textStyle = styleInfo.Background(colorSurface)
 	}
-	return textStyle.Render(prefix) + styleInputCursor.Render(cursor) + textStyle.Render(suffix)
+
+	type unit struct {
+		text   string
+		width  int
+		cursor bool
+	}
+	units := make([]unit, 0, len(runes)+1)
+	for i := 0; i <= len(runes); i++ {
+		if i == pos {
+			cursorText := " "
+			if i < len(runes) {
+				cursorText = string(runes[i])
+			}
+			units = append(units, unit{text: cursorText, width: max(1, runewidth.StringWidth(cursorText)), cursor: true})
+			if i < len(runes) {
+				continue
+			}
+		}
+		if i >= len(runes) {
+			continue
+		}
+		r := runes[i]
+		if r == '\n' || r == '\r' {
+			units = append(units, unit{text: "\n", width: 0})
+			continue
+		}
+		units = append(units, unit{text: string(r), width: max(1, runewidth.RuneWidth(r))})
+	}
+
+	rows := []string{""}
+	rowWidths := []int{0}
+	cursorRow, cursorCol := 0, 0
+	for _, u := range units {
+		if u.text == "\n" {
+			rows = append(rows, "")
+			rowWidths = append(rowWidths, 0)
+			continue
+		}
+		last := len(rows) - 1
+		if rowWidths[last] > 0 && rowWidths[last]+u.width > width {
+			rows = append(rows, "")
+			rowWidths = append(rowWidths, 0)
+			last++
+		}
+		if u.cursor {
+			cursorRow = last
+			cursorCol = rowWidths[last]
+			rows[last] += styleInputCursor.Render(u.text)
+		} else {
+			rows[last] += textStyle.Render(u.text)
+		}
+		rowWidths[last] += u.width
+	}
+
+	maxRows := m.maxInputContentRows()
+	if len(rows) > maxRows {
+		start := cursorRow - maxRows + 1
+		if start < 0 {
+			start = 0
+		}
+		if start > len(rows)-maxRows {
+			start = len(rows) - maxRows
+		}
+		rows = rows[start : start+maxRows]
+		cursorRow -= start
+	}
+	return rows, cursorRow, cursorCol
 }
 
 func (m AgentModel) inputCursorAnchor() (row, col int, ok bool) {
@@ -2096,25 +2478,17 @@ func (m AgentModel) inputCursorAnchor() (row, col int, ok bool) {
 		bodyH = max(4, h-6)
 	}
 	innerW := ChromeContentWidth(w) - 2
-	value := m.input.Value()
-	pos := m.input.Position()
-	if pos < 0 {
-		pos = 0
-	}
-	runes := []rune(value)
-	if pos > len(runes) {
-		pos = len(runes)
-	}
-	prefix := string(runes[:pos])
-	cursorCol := runewidth.StringWidth(prefix)
+	_, cursorRow, cursorCol := m.focusedInputRows(innerW)
 	if cursorCol >= innerW {
 		cursorCol = innerW - 1
 	}
 	if cursorCol < 0 {
 		cursorCol = 0
 	}
-	// 1-based terminal coordinates: header + viewport + status + input top border + content row.
-	return 1 + bodyH + 1 + 1 + 1, 1 + 1 + cursorCol + 1, true
+	// 1-based terminal coordinates: header + viewport + suggestions + status + input top border + content row.
+	row = 1 + bodyH + m.slashSuggestionLineCount() + 1 + 1 + cursorRow + 1
+	col = 1 + 1 + cursorCol + 1
+	return row, col, true
 }
 
 func (m AgentModel) scheduleInputCursorAnchor() {

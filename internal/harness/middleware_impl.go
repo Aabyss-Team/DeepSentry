@@ -837,18 +837,55 @@ func (m *ContextMiddleware) OffloadOutput(state *AgentState, label, output strin
 		return output[:m.OutputThreshold] + "\n...(输出过长已截断)..."
 	}
 
-	_ = os.MkdirAll(state.WorkspaceDir, 0755)
+	outputDir := sessionOutputDir(state)
+	_ = os.MkdirAll(outputDir, 0755)
 	filename := fmt.Sprintf("output_%s.txt", label)
-	fullPath := filepath.Join(state.WorkspaceDir, filename)
+	fullPath := filepath.Join(outputDir, filename)
 
 	if err := os.WriteFile(fullPath, []byte(output), 0644); err != nil {
 		return output[:m.OutputThreshold] + "\n...(输出过长已截断)..."
 	}
 
-	preview := output[:500]
+	previewLen := 500
+	if len(output) < previewLen {
+		previewLen = len(output)
+	}
+	preview := output[:previewLen]
 	absPath, _ := filepath.Abs(fullPath)
 	return fmt.Sprintf("%s\n\n...(完整输出 %d 字节已保存至 %s，可用 read_file 查看)...",
 		preview, len(output), absPath)
+}
+
+func sessionOutputDir(state *AgentState) string {
+	if state == nil || strings.TrimSpace(state.WorkspaceDir) == "" {
+		return ""
+	}
+	sessionID := sanitizeSessionID(state.SessionID)
+	if sessionID == "" {
+		return state.WorkspaceDir
+	}
+	return filepath.Join(state.WorkspaceDir, "sessions", sessionID)
+}
+
+func sanitizeSessionID(id string) string {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return ""
+	}
+	return strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z':
+			return r
+		case r >= 'A' && r <= 'Z':
+			return r
+		case r >= '0' && r <= '9':
+			return r
+		case r == '_' || r == '-' || r == '.':
+			return r
+		default:
+			return '_'
+		}
+	}, id)
 }
 
 func isProtectedPath(path string) bool {

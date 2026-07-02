@@ -127,6 +127,53 @@ func TestFormatActionLineShowsIncompleteSubAgentTask(t *testing.T) {
 	}
 }
 
+func TestCommandOutputGroupCollapsesAndExpands(t *testing.T) {
+	m := NewAgentModel(nil, "model", "local", 30, false, false, StartupInfo{})
+	m.width = 100
+	m.height = 24
+	m.recalcLayout()
+
+	m.applyEvent(harness.UIEvent{Kind: harness.EventAction, Action: &harness.AgentAction{Type: harness.ActionExecute, Command: "cat /etc/passwd"}})
+	m.applyEvent(harness.UIEvent{Kind: harness.EventCommandOutput, Message: "root:x:0:0:root:/root:/bin/bash\n"})
+	m.applyEvent(harness.UIEvent{Kind: harness.EventCommandOutput, Message: "daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n"})
+	group := m.activeCmdGroup
+	if group <= 0 {
+		t.Fatal("expected active command output group")
+	}
+
+	m.collapseCommandOutputGroup(group)
+	m.refreshViewport()
+	view := stripANSIForTest(m.viewport.View())
+	if !strings.Contains(view, "命令输出已折叠") || !strings.Contains(view, "[e 展开]") {
+		t.Fatalf("collapsed command output summary missing:\n%s", view)
+	}
+	if strings.Contains(view, "daemon:x") {
+		t.Fatalf("collapsed command output should hide later lines:\n%s", view)
+	}
+
+	m.toggleLastCollapsible()
+	m.refreshViewport()
+	view = stripANSIForTest(m.viewport.View())
+	if !strings.Contains(view, "root:x") || !strings.Contains(view, "daemon:x") {
+		t.Fatalf("expanded command output should show original lines:\n%s", view)
+	}
+}
+
+func TestCommandCompletionSchedulesCollapse(t *testing.T) {
+	m := NewAgentModel(nil, "model", "local", 30, false, false, StartupInfo{})
+	m.applyEvent(harness.UIEvent{Kind: harness.EventAction, Action: &harness.AgentAction{Type: harness.ActionExecute, Command: "seq 3"}})
+	m.applyEvent(harness.UIEvent{Kind: harness.EventCommandOutput, Message: "1\n"})
+
+	updated, cmd := m.Update(uiEventMsg(harness.UIEvent{Kind: harness.EventResult, Message: "命令执行完成"}))
+	model := updated.(AgentModel)
+	if cmd == nil {
+		t.Fatal("expected command output collapse timer")
+	}
+	if model.activeCmdGroup != 0 {
+		t.Fatalf("active command group should reset after command completion, got %d", model.activeCmdGroup)
+	}
+}
+
 func TestStatusContextAvoidsNoActivityPlaceholder(t *testing.T) {
 	m := NewAgentModel(nil, "model", "SSH -> 1.2.3.4:22", 30, true, false, StartupInfo{})
 	if got := m.statusContextText(); got != "就绪/等待任务" {
@@ -234,6 +281,62 @@ func TestFocusedInputCursorAnchorUsesDisplayColumns(t *testing.T) {
 	content := m.renderFocusedInputContent(20)
 	if !strings.Contains(stripANSIForTest(content), "你好abc") {
 		t.Fatalf("focused input should preserve text, got %q", stripANSIForTest(content))
+	}
+}
+
+func TestFocusedInputWrapsAndGrowsWithLongText(t *testing.T) {
+	m := NewAgentModel(nil, "model", "local", 30, true, false, StartupInfo{})
+	m.width = 36
+	m.height = 24
+	m.recalcLayout()
+	longText := strings.Repeat("你好世界", 8)
+	m.input.SetValue(longText)
+	m.input.SetCursor(len([]rune(longText)))
+	m.recalcLayout()
+
+	rows, cursorRow, _ := m.focusedInputRows(ChromeContentWidth(m.width) - 2)
+	if len(rows) < 2 {
+		t.Fatalf("expected long focused input to wrap into multiple rows, got %d: %q", len(rows), stripANSIForTest(strings.Join(rows, "\n")))
+	}
+	if cursorRow != len(rows)-1 {
+		t.Fatalf("cursor should stay on visible tail row, cursorRow=%d rows=%d", cursorRow, len(rows))
+	}
+
+	view := stripANSIForTest(m.View())
+	if !strings.Contains(view, "你好世界") {
+		t.Fatalf("wrapped input should render original text, got:\n%s", view)
+	}
+}
+
+func TestLargePasteStillUsesSummaryInsteadOfExpandingInput(t *testing.T) {
+	m := NewAgentModel(nil, "model", "local", 30, true, false, StartupInfo{})
+	m.width = 80
+	m.height = 24
+	m.recalcLayout()
+	m.acceptPaste(strings.Repeat("line\n", 30))
+	m.recalcLayout()
+
+	rows, _, _ := m.focusedInputRows(ChromeContentWidth(m.width) - 2)
+	if len(rows) > 2 {
+		t.Fatalf("large paste summary should stay compact, rows=%d text=%q", len(rows), stripANSIForTest(strings.Join(rows, "\n")))
+	}
+	if !strings.Contains(m.input.Value(), "已粘贴") {
+		t.Fatalf("large paste should keep summary, got %q", m.input.Value())
+	}
+}
+
+func TestPasteInsertsAtCursorAndMovesCursorToEndOfPaste(t *testing.T) {
+	m := NewAgentModel(nil, "model", "local", 30, true, false, StartupInfo{})
+	m.input.SetValue("hello world")
+	m.input.SetCursor(6)
+
+	m.acceptPaste("dear ")
+
+	if got, want := m.input.Value(), "hello dear world"; got != want {
+		t.Fatalf("paste should insert at cursor, got %q want %q", got, want)
+	}
+	if got, want := m.input.Position(), len([]rune("hello dear ")); got != want {
+		t.Fatalf("cursor should move after pasted text, got %d want %d", got, want)
 	}
 }
 

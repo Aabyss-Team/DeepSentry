@@ -26,7 +26,10 @@ var bannerTips = []string{
 	"/model 查看当前 LLM 提供商与模型名",
 	"/config 查看配置文件摘要",
 	"/sessions 列出可恢复的 checkpoint 会话",
-	"/resume 查看恢复会话的命令示例",
+	"/resume <session_id> 在当前 TUI 直接恢复 checkpoint",
+	"/memory list 查看已注入的结构化记忆",
+	"/memory clear 一键清空结构化 Memory",
+	"/agents clear 清空外部 AGENTS.md（内置默认保留）",
 	"/compact 记录上下文整理提示",
 
 	// 多轮与会话
@@ -80,6 +83,7 @@ var bannerTips = []string{
 	// Skills 与 Memory
 	"Agent 可按场景加载 Skills（日志分析、取证、漏洞扫描等）",
 	"跨会话 Memory 会在有历史时自动注入上下文",
+	"说“记一下/记住这个步骤”会触发 Agent 总结并保存 Memory",
 	"内置 AGENTS.md 随单二进制注入，外部 AGENTS.md 可选扩展",
 
 	// 确认与安全

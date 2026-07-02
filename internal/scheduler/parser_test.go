@@ -82,6 +82,24 @@ func TestLooksLikeScheduleIntent(t *testing.T) {
 	if LooksLikeSchedule("检查 crontab 计划任务后门") {
 		t.Fatal("crontab audit should not be treated as creating a schedule")
 	}
+	if LooksLikeSchedule("攻击者似乎篡改了系统命令，导致该命令一旦运行就会执行恶意回连的动作。提交回连的IP和端口，例如：1.1.1.1:1111") {
+		t.Fatal("callback answer prompt should not be treated as creating a schedule")
+	}
+}
+
+func TestPlanTaskDoesNotParseIPPortAsClock(t *testing.T) {
+	loc, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 2, 17, 25, 0, 0, loc)
+	_, err = PlanTask(PlanInput{
+		Text:     "攻击者似乎篡改了系统命令，导致该命令一旦运行就会执行恶意回连的动作。提交回连的IP和端口，例如：1.1.1.1:1111",
+		Timezone: "Asia/Shanghai",
+	}, now)
+	if err == nil {
+		t.Fatal("expected IP:port prompt to fail time parsing")
+	}
 }
 
 func TestStoreAddRemove(t *testing.T) {

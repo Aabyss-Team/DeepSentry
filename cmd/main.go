@@ -341,8 +341,7 @@ func main() {
 				runSSHWizard(false)
 				continue
 			} else if strings.Contains(choice, "切换为 本地模式") {
-				config.GlobalConfig.SSHHost = ""
-				viper.Set("ssh_host", "")
+				switchToLocalMode()
 				continue
 			} else {
 				ui.Exit(1)
@@ -813,7 +812,9 @@ func runSSHWizard(skipHostName bool) {
 			Message: "SSH 主机 (IP:Port):",
 			Default: config.GlobalConfig.SSHHost,
 		}, &host)
+		viper.Set("target_protocol", "ssh")
 		viper.Set("ssh_host", host)
+		config.GlobalConfig.TargetProtocol = "ssh"
 		config.GlobalConfig.SSHHost = host // 立即更新内存变量
 	}
 
@@ -852,14 +853,56 @@ func runSSHWizard(skipHostName bool) {
 	}
 
 	// 保存并刷新配置
-	if err := config.SaveConfig(); err != nil {
+	if err := saveCurrentConfig(); err != nil {
 		fmt.Printf("%s配置保存失败: %v\n", ui.Prefix("⚠️", "[WARN]"), err)
 	}
 	// 刷新全局变量
+	config.GlobalConfig.TargetProtocol = viper.GetString("target_protocol")
 	config.GlobalConfig.SSHUser = viper.GetString("ssh_user")
 	config.GlobalConfig.SSHPassword = viper.GetString("ssh_password")
 	config.GlobalConfig.SSHKeyPath = viper.GetString("ssh_key_path")
 	ui.ResetTerminalState()
+}
+
+func switchToLocalMode() {
+	viper.Set("target_protocol", "local")
+	viper.Set("ssh_host", "")
+	viper.Set("ssh_user", "")
+	viper.Set("ssh_password", "")
+	viper.Set("ssh_key_path", "")
+	viper.Set("telnet_host", "")
+	viper.Set("telnet_user", "")
+	viper.Set("telnet_password", "")
+	viper.Set("telnet_prompt", "")
+	viper.Set("ftp_host", "")
+	viper.Set("ftp_user", "")
+	viper.Set("ftp_password", "")
+
+	config.GlobalConfig.TargetProtocol = "local"
+	config.GlobalConfig.SSHHost = ""
+	config.GlobalConfig.SSHUser = ""
+	config.GlobalConfig.SSHPassword = ""
+	config.GlobalConfig.SSHKeyPath = ""
+	config.GlobalConfig.TelnetHost = ""
+	config.GlobalConfig.TelnetUser = ""
+	config.GlobalConfig.TelnetPassword = ""
+	config.GlobalConfig.TelnetPrompt = ""
+	config.GlobalConfig.FTPHost = ""
+	config.GlobalConfig.FTPUser = ""
+	config.GlobalConfig.FTPPassword = ""
+
+	if err := saveCurrentConfig(); err != nil {
+		fmt.Printf("%s已切换为本地模式，但配置保存失败: %v\n", ui.Prefix("⚠️", "[WARN]"), err)
+		return
+	}
+	fmt.Println(ui.Prefix("✅", "[OK]") + "已切换为本地模式并清除单目标远程配置")
+}
+
+func saveCurrentConfig() error {
+	if path := strings.TrimSpace(viper.ConfigFileUsed()); path != "" {
+		return viper.WriteConfigAs(path)
+	}
+	return config.SaveConfig()
 }
 
 func runSingleTargetWizard() config.TargetConfig {

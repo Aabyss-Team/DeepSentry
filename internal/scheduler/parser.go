@@ -18,6 +18,7 @@ var (
 	ymdRE           = regexp.MustCompile(`(\d{4})[-/年](\d{1,2})[-/月](\d{1,2})日?`)
 	mdRE            = regexp.MustCompile(`(\d{1,2})月(\d{1,2})[日号]?`)
 	intervalRE      = regexp.MustCompile(`每(?:隔)?\s*(\d+)\s*(分钟|分|小时|时|天|日)`)
+	ipPortRE        = regexp.MustCompile(`\b(?:\d{1,3}\.){3}\d{1,3}:\d{2,5}\b`)
 )
 
 func PlanTask(input PlanInput, now time.Time) (Plan, error) {
@@ -121,6 +122,9 @@ func LooksLikeSchedule(text string) bool {
 	if text == "" {
 		return false
 	}
+	if looksLikeAnswerOrMaliciousArtifact(text) {
+		return false
+	}
 	hasTime := false
 	for _, n := range []string{"明天", "后天", "今天", "每天", "每日", "每周", "每星期", "每礼拜", "每隔", "分钟后", "小时后", "天后"} {
 		if strings.Contains(text, n) {
@@ -129,7 +133,7 @@ func LooksLikeSchedule(text string) bool {
 		}
 	}
 	if !hasTime {
-		hasTime = clockRE.MatchString(text)
+		_, _, hasTime = extractClock(text)
 	}
 	if !hasTime {
 		return false
@@ -137,6 +141,18 @@ func LooksLikeSchedule(text string) bool {
 	for _, n := range []string{"帮我", "提醒", "巡检", "检查", "执行", "运行", "跑", "生成", "报告", "通知", "发送", "发钉钉", "钉钉", "飞书", "邮件", "邮箱", "email", "mail"} {
 		if strings.Contains(text, n) {
 			return true
+		}
+	}
+	return false
+}
+
+func looksLikeAnswerOrMaliciousArtifact(text string) bool {
+	lower := strings.ToLower(text)
+	if ipPortRE.MatchString(text) {
+		for _, needle := range []string{"回连", "反连", "reverse shell", "callback", "connect back", "提交", "答案", "flag"} {
+			if strings.Contains(lower, needle) || strings.Contains(text, needle) {
+				return true
+			}
 		}
 	}
 	return false
@@ -227,17 +243,34 @@ func dateFromWords(raw string, now time.Time) time.Time {
 }
 
 func extractClock(raw string) (int, int, bool) {
-	matches := clockRE.FindAllStringSubmatch(raw, -1)
-	matches = append(matches, markerClockRE.FindAllStringSubmatch(raw, -1)...)
+	type clockMatch struct {
+		parts []string
+		start int
+		end   int
+	}
+	matches := []clockMatch{}
+	for _, idx := range clockRE.FindAllStringSubmatchIndex(raw, -1) {
+		if len(idx) >= 2 {
+			matches = append(matches, clockMatch{parts: clockRE.FindStringSubmatch(raw[idx[0]:idx[1]]), start: idx[0], end: idx[1]})
+		}
+	}
+	for _, idx := range markerClockRE.FindAllStringSubmatchIndex(raw, -1) {
+		if len(idx) >= 2 {
+			matches = append(matches, clockMatch{parts: markerClockRE.FindStringSubmatch(raw[idx[0]:idx[1]]), start: idx[0], end: idx[1]})
+		}
+	}
 	for _, m := range matches {
-		if len(m) < 3 {
+		if clockMatchIsEmbedded(raw, m.start, m.end) {
 			continue
 		}
-		marker := strings.TrimSpace(m[1])
-		hour, _ := strconv.Atoi(m[2])
+		if len(m.parts) < 3 {
+			continue
+		}
+		marker := strings.TrimSpace(m.parts[1])
+		hour, _ := strconv.Atoi(m.parts[2])
 		minute := 0
-		if len(m) > 3 && strings.TrimSpace(m[3]) != "" {
-			minute, _ = strconv.Atoi(m[3])
+		if len(m.parts) > 3 && strings.TrimSpace(m.parts[3]) != "" {
+			minute, _ = strconv.Atoi(m.parts[3])
 		}
 		if hour > 23 || minute > 59 {
 			continue
@@ -255,6 +288,22 @@ func extractClock(raw string) (int, int, bool) {
 		return hour, minute, true
 	}
 	return 0, 0, false
+}
+
+func clockMatchIsEmbedded(raw string, start, end int) bool {
+	if start > 0 {
+		prev := raw[start-1]
+		if (prev >= '0' && prev <= '9') || prev == '.' || prev == ':' {
+			return true
+		}
+	}
+	if end < len(raw) {
+		next := raw[end]
+		if (next >= '0' && next <= '9') || next == '.' || next == ':' {
+			return true
+		}
+	}
+	return false
 }
 
 func inferRepeat(text string) (string, int, int) {
