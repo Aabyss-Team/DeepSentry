@@ -116,6 +116,8 @@ type Config struct {
 	DisabledTools        []string          `mapstructure:"disabled_tools"`
 	SkillSources         []string          `mapstructure:"skill_sources"`
 	DisabledSkillSources []string          `mapstructure:"disabled_skill_sources"`
+	DisabledSkills       []string          `mapstructure:"disabled_skills"`
+	SkillsDisabled       bool              `mapstructure:"skills_disabled"`
 	MCPServers           []string          `mapstructure:"mcp_servers"`
 	MCPServerConfigs     []MCPServerConfig `mapstructure:"mcp_server_configs"`
 
@@ -148,6 +150,16 @@ type Config struct {
 	BenchmarkToken   string `mapstructure:"benchmark_token"`
 }
 
+// EffectiveDisabledSkills returns the name denylist consumed by the live
+// catalog. "*" is an internal sentinel for the global /skill off switch.
+func (c Config) EffectiveDisabledSkills() []string {
+	out := append([]string(nil), c.DisabledSkills...)
+	if c.SkillsDisabled {
+		out = append(out, "*")
+	}
+	return out
+}
+
 type TargetConfig struct {
 	Name     string   `mapstructure:"name" json:"name"`
 	Protocol string   `mapstructure:"protocol" json:"protocol"` // ssh|telnet|ftp
@@ -160,14 +172,21 @@ type TargetConfig struct {
 }
 
 type MCPServerConfig struct {
-	Name     string            `mapstructure:"name" json:"name" yaml:"name"`
-	Type     string            `mapstructure:"type" json:"type" yaml:"type"` // 当前仅支持 stdio
-	Command  string            `mapstructure:"command" json:"command" yaml:"command"`
-	Args     []string          `mapstructure:"args" json:"args" yaml:"args"`
-	Env      map[string]string `mapstructure:"env" json:"env" yaml:"env"`
-	CWD      string            `mapstructure:"cwd" json:"cwd" yaml:"cwd"`
-	URL      string            `mapstructure:"url" json:"url" yaml:"url"`
-	Disabled bool              `mapstructure:"disabled" json:"disabled" yaml:"disabled"`
+	Name              string            `mapstructure:"name" json:"name" yaml:"name"`
+	Type              string            `mapstructure:"type" json:"type" yaml:"type"`
+	Command           string            `mapstructure:"command" json:"command" yaml:"command"`
+	Args              []string          `mapstructure:"args" json:"args" yaml:"args"`
+	Env               map[string]string `mapstructure:"env" json:"env" yaml:"env"`
+	CWD               string            `mapstructure:"cwd" json:"cwd" yaml:"cwd"`
+	URL               string            `mapstructure:"url" json:"url" yaml:"url"`
+	Headers           map[string]string `mapstructure:"headers" json:"headers" yaml:"headers"`
+	BearerTokenEnvVar string            `mapstructure:"bearer_token_env_var" json:"bearer_token_env_var" yaml:"bearer_token_env_var"`
+	EnabledTools      []string          `mapstructure:"enabled_tools" json:"enabled_tools" yaml:"enabled_tools"`
+	DisabledTools     []string          `mapstructure:"disabled_tools" json:"disabled_tools" yaml:"disabled_tools"`
+	StartupTimeoutSec int               `mapstructure:"startup_timeout_sec" json:"startup_timeout_sec" yaml:"startup_timeout_sec"`
+	ToolTimeoutSec    int               `mapstructure:"tool_timeout_sec" json:"tool_timeout_sec" yaml:"tool_timeout_sec"`
+	Required          bool              `mapstructure:"required" json:"required" yaml:"required"`
+	Disabled          bool              `mapstructure:"disabled" json:"disabled" yaml:"disabled"`
 }
 
 // InitConfig 初始化配置 (核心加载逻辑)

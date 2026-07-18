@@ -131,19 +131,24 @@ func recoverPlainTextResponse(raw string) (AgentResponse, bool) {
 		}, true
 	}
 
-	if looksLikeExecutionIntent(text) {
-		if command := extractMarkdownShellCommand(text); command != "" {
-			thought := normalizeProseThought(textBeforeFirstFence(text))
-			if thought == "" {
-				thought = "模型返回了自然语言步骤，已从代码块恢复待执行命令。"
-			}
-			return finalizeResponse(AgentResponse{
-				Thought:   thought,
-				Action:    "execute",
-				Command:   command,
-				RiskLevel: "low",
-			}), true
+	// A complete shell fence is actionable even when its prose introduction is
+	// informal. Detect it directly so broad words such as “让我/下一步” are not
+	// needed as execution signals (those words also appear frequently in final
+	// summaries and reflective answers).
+	if command := extractMarkdownShellCommand(text); command != "" {
+		thought := normalizeProseThought(textBeforeFirstFence(text))
+		if thought == "" {
+			thought = "模型返回了自然语言步骤，已从代码块恢复待执行命令。"
 		}
+		return finalizeResponse(AgentResponse{
+			Thought:   thought,
+			Action:    "execute",
+			Command:   command,
+			RiskLevel: "low",
+		}), true
+	}
+
+	if looksLikeExecutionIntent(text) {
 		// The model announced another step but omitted the machine-readable
 		// action. Ask it to continue rather than presenting an unfinished plan
 		// as a final report.
@@ -174,9 +179,9 @@ func looksLikeJSONEnvelope(text string) bool {
 func looksLikeExecutionIntent(text string) bool {
 	lower := strings.ToLower(text)
 	for _, marker := range []string{
-		"让我", "我来", "我先", "接下来", "下一步", "先从", "重新来", "开始排查",
-		"开始检查", "准备执行", "执行下面", "运行下面", "运行以下", "用下面",
-		"let me", "i'll run", "i will run", "next,", "next step", "starting with",
+		"接下来执行", "下一步执行", "我将执行", "我会执行", "先执行", "先读取", "先检查", "开始排查",
+		"开始检查", "准备执行", "执行下面", "执行以下", "运行下面", "运行以下", "用下面命令",
+		"i'll run", "i will run", "i will execute", "next command", "next step is to run", "starting the check",
 	} {
 		if strings.Contains(lower, marker) {
 			return true

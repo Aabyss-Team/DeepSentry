@@ -36,9 +36,9 @@ func TestValidateRuntimeConfigRejectsUnsafeOrAmbiguousState(t *testing.T) {
 		{"duplicate target", func(c *Config) {
 			c.Targets = []TargetConfig{{Name: "prod", Protocol: "ssh", Host: "a"}, {Name: "prod", Protocol: "ssh", Host: "b"}}
 		}, "重复目标"},
-		{"unsupported mcp", func(c *Config) {
-			c.MCPServerConfigs = []MCPServerConfig{{Name: "remote", Type: "http", URL: "https://example.test/mcp"}}
-		}, "仅支持 stdio"},
+		{"insecure remote mcp", func(c *Config) {
+			c.MCPServerConfigs = []MCPServerConfig{{Name: "remote", Type: "http", URL: "http://example.test/mcp"}}
+		}, "必须使用 HTTPS"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

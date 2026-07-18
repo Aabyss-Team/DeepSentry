@@ -37,7 +37,11 @@ func HeadlessBrowser(rt Runtime, rawURL, mode string, waitMs, maxText int, selec
 
 	bin, why := findBrowserBinary()
 	if bin == "" {
-		return staticBrowserFallback(rt, u, mode, why, maxText)
+		out, fallbackErr := staticBrowserFallback(rt, u, mode, why, maxText)
+		if fallbackErr != nil {
+			return "", fallbackErr
+		}
+		return out + "\n\n" + browserInstallGuide(), nil
 	}
 
 	dom, runErr := dumpRenderedDOM(bin, u, waitMs, maxText)

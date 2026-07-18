@@ -1,0 +1,7 @@
+interface:
+  display_name: "Find Skills"
+  short_description: "跨 ClawHub 与 skills.sh 安全发现和安装 Agent Skill"
+  default_prompt: "搜索与当前任务匹配的 Skill，先比较和检查候选，不要未经明确授权安装。"
+
+policy:
+  allow_implicit_invocation: true

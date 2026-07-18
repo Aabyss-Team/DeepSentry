@@ -8,9 +8,12 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"ai-edr/internal/config"
 	"ai-edr/internal/harness"
+	"ai-edr/internal/mcp"
 	"ai-edr/internal/memory"
 	"ai-edr/internal/skills"
 	"ai-edr/internal/ui"
@@ -64,6 +67,10 @@ type tokenStats struct {
 	Calls            int
 }
 
+// bubbles/textinput is single-line and rewrites newlines to spaces. A private
+// one-rune sentinel preserves real multiline drafts and stable cursor indexes.
+const inputLineBreak = '\uE000'
+
 var slashCommands = []slashCommand{
 	{Name: "help", Description: "显示快捷键和斜杠命令"},
 	{Name: "new", Description: "开启全新任务/会话；可直接 /new 任务"},
@@ -80,8 +87,8 @@ var slashCommands = []slashCommand{
 	{Name: "tsecbench", Description: "进入 TSecBench 跑分模式；可追加题目或目标说明"},
 	{Name: "config", Description: "显示连接与模型配置"},
 	{Name: "sudo", Description: "由系统安全验证/刷新本机 sudo 授权（密码不进入程序）"},
-	{Name: "mcp", Description: "MCP 管理：/mcp list|import|add|off|on"},
-	{Name: "skill", Description: "Skill 管理：/skill list|load|unload|add|off|on|remove"},
+	{Name: "mcp", Description: "MCP 管理：/mcp status|add|import|resources|prompts"},
+	{Name: "skill", Description: "Skill 管理：list 查看；on/off [name] 启停；only <name> 仅启用一个"},
 	{Name: "exit", Description: "退出 TUI"},
 	{Name: "quit", Description: "退出 TUI"},
 }
@@ -110,6 +117,21 @@ type copyToastMsg struct {
 	err   string
 }
 type copyToastClearMsg struct{}
+type skillMarketResultMsg struct {
+	action string
+	out    string
+	err    error
+}
+type mcpResultMsg struct {
+	action string
+	out    string
+	err    error
+}
+
+type inputDraftPart struct {
+	text   string
+	pasted bool
+}
 
 // AgentModel 主 Agent TUI（多轮对话 + 子 Agent 面板）
 type AgentModel struct {
@@ -142,8 +164,10 @@ type AgentModel struct {
 	stopping       bool
 	inputHistory   []string
 	historyIdx     int
-	pendingPaste   string
+	draftParts     []inputDraftPart
 	slashSelected  int
+	cursorAnchor   *inputCursorAnchorState
+	footerVersion  uint64
 
 	pendingConfirm *confirmState
 	pendingAsk     *askState
@@ -189,26 +213,29 @@ func NewAgentModel(ctrl *SessionController, title, status string, maxSteps int, 
 		startup.StartedAt = time.Now().Format("2006-01-02 15:04:05")
 	}
 	return AgentModel{
-		ctrl:        ctrl,
-		title:       title,
-		statusLine:  status,
-		maxSteps:    maxSteps,
-		awaitGoal:   awaitGoal,
-		autoStart:   autoStart,
-		spinner:     sp,
-		viewport:    vp,
-		input:       ti,
-		lines:       []logLine{},
-		lineID:      0,
-		streamIdx:   -1,
-		autoScroll:  true,
-		historyIdx:  -1,
-		startupInfo: startup,
+		ctrl:         ctrl,
+		title:        title,
+		statusLine:   status,
+		maxSteps:     maxSteps,
+		awaitGoal:    awaitGoal,
+		autoStart:    autoStart,
+		spinner:      sp,
+		viewport:     vp,
+		input:        ti,
+		cursorAnchor: newInputCursorAnchorState(),
+		lines:        []logLine{},
+		lineID:       0,
+		streamIdx:    -1,
+		autoScroll:   true,
+		historyIdx:   -1,
+		startupInfo:  startup,
 	}
 }
 
 func (m AgentModel) Init() tea.Cmd {
-	cmds := []tea.Cmd{m.spinner.Tick}
+	// Explicitly restore paste framing even if a previous child process left
+	// the terminal mode altered.
+	cmds := []tea.Cmd{m.spinner.Tick, tea.EnableBracketedPaste}
 	m.scheduleInputCursorAnchor()
 	if m.autoStart && m.ctrl != nil && m.ctrl.beginRun() {
 		cmds = append(cmds, agentStartCmd(false))
@@ -336,6 +363,35 @@ func (m AgentModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.copyToast = ""
 		return m, nil
 
+	case skillMarketResultMsg:
+		if msg.err != nil {
+			m.appendLine("error", "Skill 市场操作失败: "+msg.err.Error(), msg.err.Error())
+		} else {
+			m.appendLine("result", msg.out, msg.out)
+			if msg.action == "install" || msg.action == "update" || msg.action == "uninstall" || msg.action == "rollback" {
+				m.reloadSkillCatalog()
+			}
+		}
+		m.recalcLayout()
+		m.refreshViewport()
+		if m.inputFocused() {
+			m.scheduleInputCursorAnchor()
+		}
+		return m, nil
+
+	case mcpResultMsg:
+		if msg.err != nil {
+			m.appendLine("error", "MCP "+msg.action+" 失败: "+msg.err.Error(), msg.err.Error())
+		} else {
+			m.appendLine("result", msg.out, msg.out)
+		}
+		m.recalcLayout()
+		m.refreshViewport()
+		if m.inputFocused() {
+			m.scheduleInputCursorAnchor()
+		}
+		return m, nil
+
 	case confirmMsg:
 		restoreInput := m.inputFocused()
 		m.pendingConfirm = &confirmState{action: msg.action, prompt: msg.prompt, respCh: msg.respCh, restoreInput: restoreInput}
@@ -350,7 +406,7 @@ func (m AgentModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.pendingAsk = &askState{action: msg.action, prompt: msg.prompt, options: msg.options, respCh: msg.respCh}
 		m.input.Focus()
 		m.input.SetValue("")
-		m.pendingPaste = ""
+		m.draftParts = nil
 		m.appendAskLine(msg.prompt, msg.options)
 		m.recalcLayout()
 		m.refreshViewport()
@@ -360,6 +416,7 @@ func (m AgentModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case sudoAuthMsg:
 		m.appendLine("info", "sudo 需要本机管理员授权：即将暂时退出全屏，由系统 sudo 隐藏读取密码；DeepSentry 不会接收或记录密码。", "sudo system validation")
 		m.refreshViewport()
+		m.cursorAnchor.release()
 		return m, sudoValidationCmd(msg.respCh)
 
 	case sudoAuthResultMsg:
@@ -383,9 +440,7 @@ func (m AgentModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.respCh != nil {
 			msg.respCh <- msg.ok
 		}
-		if m.inputFocused() {
-			m.scheduleInputCursorAnchor()
-		}
+		m.syncInputCursorAnchor()
 		return m, nil
 
 	case agentDoneMsg:
@@ -398,7 +453,7 @@ func (m AgentModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.pendingConfirm = nil
 		m.pendingAsk = nil
 		m.input.SetValue("")
-		m.pendingPaste = ""
+		m.draftParts = nil
 		m.input.Width = ChromeContentWidth(m.width) - 2
 		m.input.Focus()
 		m.recalcLayout()
@@ -407,6 +462,7 @@ func (m AgentModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case userMsgEvent:
+		m.returnToLiveTail()
 		m.appendLine("user", "You: "+msg.text, msg.text)
 		m.refreshViewport()
 		return m, nil
@@ -469,12 +525,14 @@ func (m AgentModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case tea.MouseButtonWheelUp:
 			m.autoScroll = false
 			m.viewport.LineUp(3)
+			m.invalidateFooter()
 			return m, nil
 		case tea.MouseButtonWheelDown:
 			m.viewport.LineDown(3)
 			if m.viewport.AtBottom() {
 				m.autoScroll = true
 			}
+			m.invalidateFooter()
 			return m, nil
 		}
 
@@ -592,6 +650,7 @@ func (m AgentModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		if m.inputFocused() && msg.Paste {
 			m.acceptPaste(string(msg.Runes))
+			m.recalcLayout()
 			m.refreshViewport()
 			m.scheduleInputCursorAnchor()
 			return m, nil
@@ -620,6 +679,7 @@ func (m AgentModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			switch key {
 			case "alt+enter", "shift+enter", "ctrl+j":
 				m.appendInputNewline()
+				m.recalcLayout()
 				m.scheduleInputCursorAnchor()
 				return m, nil
 			case "ctrl+l":
@@ -632,8 +692,10 @@ func (m AgentModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.scheduleInputCursorAnchor()
 				return m, nil
 			case "backspace", "delete":
-				if m.pendingPaste != "" {
-					m.clearInputDraft()
+				if len(m.draftParts) > 0 && m.input.Value() == "" {
+					if key == "backspace" {
+						m.removeLastDraftPart()
+					}
 					m.recalcLayout()
 					m.scheduleInputCursorAnchor()
 					return m, nil
@@ -644,12 +706,20 @@ func (m AgentModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.scheduleInputCursorAnchor()
 					return m, nil
 				}
+				if m.moveInputCursorLine(-1) {
+					m.scheduleInputCursorAnchor()
+					return m, nil
+				}
 				m.recallInputHistory(-1)
 				m.scheduleInputCursorAnchor()
 				return m, nil
 			case "down":
 				if m.hasSlashSuggestions() {
 					m.moveSlashSelection(1)
+					m.scheduleInputCursorAnchor()
+					return m, nil
+				}
+				if m.moveInputCursorLine(1) {
 					m.scheduleInputCursorAnchor()
 					return m, nil
 				}
@@ -665,6 +735,7 @@ func (m AgentModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "pgup":
 				m.autoScroll = false
 				m.viewport.ViewUp()
+				m.invalidateFooter()
 				m.scheduleInputCursorAnchor()
 				return m, nil
 			case "pgdown":
@@ -672,24 +743,19 @@ func (m AgentModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.viewport.AtBottom() {
 					m.autoScroll = true
 				}
+				m.invalidateFooter()
 				m.scheduleInputCursorAnchor()
 				return m, nil
 			case "ctrl+home":
 				m.autoScroll = false
 				m.viewport.GotoTop()
+				m.invalidateFooter()
 				return m, nil
 			case "ctrl+end":
 				m.autoScroll = true
 				m.viewport.GotoBottom()
+				m.invalidateFooter()
 				return m, nil
-			}
-			if m.pendingPaste != "" {
-				if msg.Type == tea.KeyRunes {
-					m.pendingPaste += string(msg.Runes)
-					m.input.SetValue(pasteSummary(m.pendingPaste))
-					m.scheduleInputCursorAnchor()
-					return m, nil
-				}
 			}
 			var cmd tea.Cmd
 			m.input, cmd = m.input.Update(msg)
@@ -731,8 +797,17 @@ func (m AgentModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Quit
 			}
 		case "e":
-			m.toggleAllCollapsible()
+			oldOffset := m.viewport.YOffset
+			_, collapsed := m.toggleAllCollapsible()
+			// Expansion is a reading action. Keeping the live-tail lock would
+			// jump straight to </html> and make the preceding paste look lost.
+			if !collapsed {
+				m.autoScroll = false
+			}
 			m.refreshViewport()
+			if !collapsed {
+				m.viewport.SetYOffset(oldOffset)
+			}
 			return m, nil
 		case "up", "k", "pgup":
 			m.autoScroll = false
@@ -741,6 +816,7 @@ func (m AgentModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else {
 				m.viewport.LineUp(1)
 			}
+			m.invalidateFooter()
 			return m, nil
 		case "down", "j", "pgdown":
 			if key == "pgdown" {
@@ -751,14 +827,17 @@ func (m AgentModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.viewport.AtBottom() {
 				m.autoScroll = true
 			}
+			m.invalidateFooter()
 			return m, nil
 		case "G":
 			m.autoScroll = true
 			m.viewport.GotoBottom()
+			m.invalidateFooter()
 			return m, nil
 		case "g", "home", "ctrl+home":
 			m.autoScroll = false
 			m.viewport.GotoTop()
+			m.invalidateFooter()
 			return m, nil
 		case "tab":
 			if m.done || m.awaitGoal || m.sessionLive {
@@ -785,6 +864,8 @@ func (m *AgentModel) submitAskResponse() tea.Cmd {
 	if m.pendingAsk == nil {
 		return nil
 	}
+	pasted := m.hasPasteBlocks()
+	draftSummary := m.submittedDraftSummary()
 	text := strings.TrimSpace(m.currentInputValue())
 	if text == "" {
 		return nil
@@ -798,7 +879,8 @@ func (m *AgentModel) submitAskResponse() tea.Cmd {
 	m.clearInputDraft()
 	m.input.Blur()
 	cancelInputCursorAnchor()
-	m.appendLine("user", "You: "+summarizeIfNeeded(text), text)
+	m.returnToLiveTail()
+	m.appendSubmittedUserLine(text, pasted, draftSummary)
 	m.recalcLayout()
 	m.refreshViewport()
 	if ch != nil {
@@ -808,6 +890,8 @@ func (m *AgentModel) submitAskResponse() tea.Cmd {
 }
 
 func (m *AgentModel) tryInterruptSubmit() tea.Cmd {
+	pasted := m.hasPasteBlocks()
+	draftSummary := m.submittedDraftSummary()
 	text := strings.TrimSpace(m.currentInputValue())
 	if text == "" || m.ctrl == nil {
 		return nil
@@ -821,7 +905,8 @@ func (m *AgentModel) tryInterruptSubmit() tea.Cmd {
 	m.clearInputDraft()
 	m.input.Blur()
 	cancelInputCursorAnchor()
-	m.appendLine("user", "You: "+summarizeIfNeeded(text), text)
+	m.returnToLiveTail()
+	m.appendSubmittedUserLine(text, pasted, draftSummary)
 	m.appendLine("info", "↳ 已注入新指令，当前轮停止后会按最新目标继续。", text)
 	m.recalcLayout()
 	m.refreshViewport()
@@ -834,6 +919,19 @@ func summarizeIfNeeded(text string) string {
 		return summarizeUserText(text)
 	}
 	return text
+}
+
+func (m *AgentModel) appendSubmittedUserLine(text string, pasted bool, draftSummary string) {
+	text = normalizeInputNewlines(text)
+	draftSummary = normalizeInputNewlines(draftSummary)
+	content := "You: " + summarizeIfNeeded(text)
+	if pasted {
+		content = "You:\n" + strings.TrimSpace(draftSummary)
+	}
+	m.appendLine("user", content, text)
+	if pasted && len(m.lines) > 0 {
+		m.lines[len(m.lines)-1].collapsed = true
+	}
 }
 
 func normalizeAskAnswer(text string, options []string) string {
@@ -868,7 +966,7 @@ func splitSlashCommand(text string) (string, string) {
 }
 
 func (m AgentModel) slashQuery() (string, bool) {
-	if !m.inputFocused() || m.pendingPaste != "" || m.pendingAsk != nil {
+	if !m.inputFocused() || m.hasPasteBlocks() || m.pendingAsk != nil {
 		return "", false
 	}
 	value := strings.TrimSpace(m.input.Value())
@@ -939,7 +1037,11 @@ func (m *AgentModel) acceptSlashSuggestion() bool {
 }
 
 func (m *AgentModel) trySubmit() tea.Cmd {
-	pasted := m.pendingPaste != ""
+	pasted := m.hasPasteBlocks()
+	draftSummary := m.submittedDraftSummary()
+	savedParts := append([]inputDraftPart(nil), m.draftParts...)
+	savedInput := m.input.Value()
+	savedCursor := m.input.Position()
 	text := strings.TrimSpace(m.currentInputValue())
 	if text == "" {
 		return nil
@@ -961,12 +1063,9 @@ func (m *AgentModel) trySubmit() tea.Cmd {
 	m.awaitGoal = false
 	m.done = false
 	m.sessionLive = true
+	m.returnToLiveTail()
 	m.recalcLayout()
-	displayText := text
-	if pasted || strings.Count(text, "\n") >= 3 || runewidth.StringWidth(text) > 400 {
-		displayText = summarizeUserText(text)
-	}
-	m.appendLine("user", "You: "+displayText, text)
+	m.appendSubmittedUserLine(text, pasted, draftSummary)
 	m.refreshViewport()
 
 	var ok bool
@@ -988,10 +1087,9 @@ func (m *AgentModel) trySubmit() tea.Cmd {
 			m.sessionLive = false
 		}
 		m.input.Focus()
-		if pasted {
-			m.pendingPaste = text
-			m.input.SetValue(pasteSummary(text))
-		}
+		m.draftParts = savedParts
+		m.input.SetValue(savedInput)
+		m.input.SetCursor(savedCursor)
 		m.appendLine("error", "Agent 仍在运行，请稍候", "busy")
 		m.recalcLayout()
 		m.refreshViewport()
@@ -1047,13 +1145,17 @@ func (m *AgentModel) recallInputHistory(delta int) {
 			return
 		}
 	}
-	m.input.SetValue(m.inputHistory[m.historyIdx])
-	m.pendingPaste = ""
+	m.input.SetValue(encodeInputValue(m.inputHistory[m.historyIdx]))
+	m.draftParts = nil
 }
 
 func (m *AgentModel) handleSlashCommand(text string) tea.Cmd {
 	cmd, arg := splitSlashCommand(text)
 	m.clearInputDraft()
+	// Slash commands are submissions too. When the user invokes one while
+	// reading older output, keep the result visible instead of silently
+	// appending it below the current scroll position.
+	m.returnToLiveTail()
 	m.recalcLayout()
 	switch {
 	case cmd == "clear":
@@ -1112,11 +1214,16 @@ func (m *AgentModel) handleSlashCommand(text string) tea.Cmd {
 	case cmd == "sudo":
 		m.appendLine("info", "即将由系统 sudo 验证本机管理员权限；输入内容不会进入 DeepSentry。", "manual sudo validation")
 		m.refreshViewport()
+		m.cursorAnchor.release()
 		return sudoValidationCmd(nil)
 	case cmd == "mcp":
-		m.handleMCPSlash(arg)
+		result := m.handleMCPSlash(arg)
+		m.refreshViewport()
+		return result
 	case cmd == "skill":
-		m.handleSkillSlash(arg)
+		result := m.handleSkillSlash(arg)
+		m.refreshViewport()
+		return result
 	case cmd == "exit" || cmd == "quit":
 		m.quitting = true
 		cancelInputCursorAnchor()
@@ -1138,6 +1245,7 @@ func restoreTerminalAfterSudoCmd(respCh chan bool, ok bool) tea.Cmd {
 	return tea.Sequence(
 		tea.EnterAltScreen,
 		tea.EnableMouseAllMotion,
+		tea.EnableBracketedPaste,
 		tea.ClearScreen,
 		func() tea.Msg { return sudoTerminalRestoredMsg{respCh: respCh, ok: ok} },
 	)
@@ -1179,7 +1287,8 @@ func (m *AgentModel) handleMemorySlash(arg string) {
 		}
 		if len(fields) > 1 && strings.EqualFold(fields[1], "clear") {
 			state.ReplaceCoreClues(nil)
-			m.appendLine("result", "已清空当前会话核心线索板（不会删除跨会话 Memory）", arg)
+			message := "已清空当前会话核心线索板（不会删除跨会话 Memory）"
+			m.appendResultLine(message, message)
 			return
 		}
 		prompt := strings.TrimSpace(state.CoreCluesPrompt(12000))
@@ -1217,7 +1326,8 @@ func (m *AgentModel) handleMemorySlash(arg string) {
 			m.appendLine("error", "清空 Memory 失败: "+err.Error(), err.Error())
 			return
 		}
-		m.appendLine("result", fmt.Sprintf("已清空结构化 Memory（范围: %s，删除 %d 条）", scope, n), arg)
+		message := fmt.Sprintf("已清空结构化 Memory（范围: %s，删除 %d 条）", scope, n)
+		m.appendResultLine(message, message)
 	default:
 		m.appendLine("info", "用法: /memory list | /memory clues [clear] | /memory clear [all|target|global]", arg)
 	}
@@ -1243,7 +1353,8 @@ func (m *AgentModel) handleAgentsSlash(arg string) {
 			m.appendLine("error", "清空 AGENTS.md 失败: "+err.Error(), err.Error())
 			return
 		}
-		m.appendLine("result", fmt.Sprintf("已清空外部 AGENTS.md（删除 %d 个文件，内置默认保留）", n), arg)
+		message := fmt.Sprintf("已清空外部 AGENTS.md（删除 %d 个文件，内置默认保留）", n)
+		m.appendResultLine(message, message)
 	default:
 		m.appendLine("info", "用法: /agents status | /agents clear", arg)
 	}
@@ -1333,7 +1444,7 @@ func (m *AgentModel) resumeSessionSlash(arg string) tea.Cmd {
 	return nil
 }
 
-func (m *AgentModel) handleMCPSlash(arg string) {
+func (m *AgentModel) handleMCPSlash(arg string) tea.Cmd {
 	fields := strings.Fields(arg)
 	action := "status"
 	args := map[string]string{"action": "status"}
@@ -1341,127 +1452,559 @@ func (m *AgentModel) handleMCPSlash(arg string) {
 		switch fields[0] {
 		case "list", "status":
 			args["action"] = "status"
+			out, err := config.ManageConfig(args)
+			if err != nil {
+				m.appendLine("error", "MCP status 失败: "+err.Error(), err.Error())
+				return nil
+			}
+			message := out + "\n\n实时连接:\n" + mcp.FormatServerStatus()
+			m.appendResultLine(message, message)
+			return nil
 		case "import":
 			if len(fields) < 2 {
 				m.appendLine("error", "用法: /mcp import /path/to/claude_desktop_config.json", arg)
-				return
+				return nil
 			}
 			args = map[string]string{"action": "import_claude_mcp", "import_path": strings.TrimSpace(strings.TrimPrefix(arg, "import"))}
 			action = "import"
-		case "add":
+		case "add", "add-http":
 			if len(fields) < 3 {
-				m.appendLine("error", "用法: /mcp add <name> <command> [arg1,arg2] [cwd=/path] [env=A=B,C=D]", arg)
-				return
+				m.appendLine("error", "用法: /mcp add <name> <command|https://url> [args] [token_env=ENV] [enabled_tools=a,b]", arg)
+				return nil
 			}
-			args = map[string]string{"action": "add_mcp_server", "name": fields[1], "command": fields[2]}
-			if len(fields) >= 4 {
+			args = map[string]string{"action": "add_mcp_server", "name": fields[1], "structured": "true"}
+			isHTTP := fields[0] == "add-http" || strings.HasPrefix(fields[2], "http://") || strings.HasPrefix(fields[2], "https://")
+			if isHTTP {
+				args["type"] = "streamable_http"
+				args["url"] = fields[2]
+			} else {
+				args["type"] = "stdio"
+				args["command"] = fields[2]
+			}
+			optionStart := 3
+			if !isHTTP && len(fields) >= 4 && !strings.Contains(fields[3], "=") {
 				args["args"] = fields[3]
+				optionStart = 4
 			}
-			for _, field := range fields[4:] {
+			for _, field := range fields[optionStart:] {
 				if k, v, ok := strings.Cut(field, "="); ok {
+					if k == "token_env" {
+						k = "bearer_token_env_var"
+					}
 					args[k] = v
 				}
 			}
 			action = "add"
+		case "resources":
+			server := ""
+			if len(fields) > 1 {
+				server = fields[1]
+			}
+			return mcpQueryCmd("resources", func() (string, error) { return formatMCPResources(server), nil })
+		case "read":
+			if len(fields) < 3 {
+				m.appendLine("error", "用法: /mcp read <server> <uri>", arg)
+				return nil
+			}
+			return mcpQueryCmd("read", func() (string, error) { return mcp.ReadResource(fields[1], strings.Join(fields[2:], " ")) })
+		case "prompts":
+			server := ""
+			if len(fields) > 1 {
+				server = fields[1]
+			}
+			return mcpQueryCmd("prompts", func() (string, error) { return formatMCPPrompts(server), nil })
+		case "prompt":
+			if len(fields) < 3 {
+				m.appendLine("error", "用法: /mcp prompt <server> <name> [key=value ...]", arg)
+				return nil
+			}
+			promptArgs := map[string]string{}
+			for _, field := range fields[3:] {
+				if key, value, ok := strings.Cut(field, "="); ok {
+					promptArgs[key] = value
+				}
+			}
+			return mcpQueryCmd("prompt", func() (string, error) { return mcp.GetPrompt(fields[1], fields[2], promptArgs) })
+		case "login":
+			if len(fields) < 2 {
+				m.appendLine("error", "用法: /mcp login <server>", arg)
+				return nil
+			}
+			cfg, ok := configuredMCPServer(fields[1])
+			if !ok {
+				m.appendLine("error", "未找到已启用 MCP Server: "+fields[1], arg)
+				return nil
+			}
+			if strings.EqualFold(cfg.Type, "stdio") || cfg.URL == "" {
+				m.appendLine("error", "只有远程 Streamable HTTP MCP Server 支持 OAuth 登录", arg)
+				return nil
+			}
+			m.appendLine("info", "正在启动 MCP OAuth 登录；浏览器授权完成后会自动连接…", fields[1])
+			return mcpQueryCmd("login", func() (string, error) {
+				if err := mcp.ConnectOAuth(mcpServerConfig(cfg)); err != nil {
+					return "", err
+				}
+				return "MCP OAuth 登录成功并已实时连接: " + cfg.Name, nil
+			})
 		case "off", "disable":
 			if len(fields) < 2 {
 				m.appendLine("error", "用法: /mcp off <name>", arg)
-				return
+				return nil
 			}
 			args = map[string]string{"action": "disable_mcp_server", "name": fields[1]}
 			action = "off"
 		case "on", "enable":
 			if len(fields) < 2 {
 				m.appendLine("error", "用法: /mcp on <name>", arg)
-				return
+				return nil
 			}
 			args = map[string]string{"action": "enable_mcp_server", "name": fields[1]}
 			action = "on"
 		case "remove", "rm":
 			if len(fields) < 2 {
 				m.appendLine("error", "用法: /mcp remove <name>", arg)
-				return
+				return nil
 			}
 			args = map[string]string{"action": "remove_mcp_server", "name": fields[1]}
 			action = "remove"
 		default:
-			m.appendLine("info", "用法: /mcp list | /mcp import <claude.json> | /mcp add <name> <command> [args] | /mcp off <name> | /mcp on <name> | /mcp remove <name>", arg)
-			return
+			m.appendLine("info", "用法: /mcp status | import <claude.json> | add <name> <command|url> | login <name> | resources/read | prompts/prompt | off/on/remove", arg)
+			return nil
 		}
 	}
-	out, err := config.ManageConfig(args)
-	if err != nil {
-		m.appendLine("error", "MCP "+action+" 失败: "+err.Error(), err.Error())
-		return
+	if action == "status" {
+		out, err := config.ManageConfig(args)
+		if err != nil {
+			m.appendLine("error", "MCP status 失败: "+err.Error(), err.Error())
+			return nil
+		}
+		message := out + "\n\n实时连接:\n" + mcp.FormatServerStatus()
+		m.appendResultLine(message, message)
+		return nil
 	}
-	m.appendLine("result", out+"\n提示: MCP 配置变更通常在新会话/重启后生效。", out)
+	return mcpAdminCmd(action, args)
 }
 
-func (m *AgentModel) handleSkillSlash(arg string) {
+func mcpQueryCmd(action string, fn func() (string, error)) tea.Cmd {
+	return func() tea.Msg {
+		out, err := fn()
+		return mcpResultMsg{action: action, out: out, err: err}
+	}
+}
+
+func mcpAdminCmd(action string, args map[string]string) tea.Cmd {
+	return func() tea.Msg {
+		out, err := config.ManageConfig(args)
+		if err != nil {
+			return mcpResultMsg{action: action, err: err}
+		}
+		name := strings.TrimSpace(args["name"])
+		switch action {
+		case "off", "remove":
+			mcp.Disconnect(name)
+		case "add", "on":
+			if cfg, ok := configuredMCPServer(name); ok {
+				if err := mcp.Connect(mcpServerConfig(cfg)); err != nil {
+					out += "\n[WARN] 配置已保存，但实时连接失败: " + err.Error()
+				} else {
+					out += "\n[OK] 已实时连接，无需重启。"
+				}
+			}
+		case "import":
+			for _, cfg := range config.GlobalConfig.MCPServerConfigs {
+				if cfg.Disabled {
+					continue
+				}
+				if err := mcp.Connect(mcpServerConfig(cfg)); err != nil {
+					out += "\n[WARN] " + cfg.Name + " 实时连接失败: " + err.Error()
+				}
+			}
+		}
+		return mcpResultMsg{action: action, out: out}
+	}
+}
+
+func configuredMCPServer(name string) (config.MCPServerConfig, bool) {
+	for _, cfg := range config.GlobalConfig.MCPServerConfigs {
+		if cfg.Name == name && !cfg.Disabled {
+			return cfg, true
+		}
+	}
+	return config.MCPServerConfig{}, false
+}
+
+func mcpServerConfig(cfg config.MCPServerConfig) mcp.ServerConfig {
+	return mcp.ServerConfig{
+		Name: cfg.Name, Type: cfg.Type, Command: cfg.Command, Args: cfg.Args, Env: cfg.Env, CWD: cfg.CWD,
+		URL: cfg.URL, Headers: cfg.Headers, BearerTokenEnvVar: cfg.BearerTokenEnvVar,
+		EnabledTools: cfg.EnabledTools, DisabledTools: cfg.DisabledTools,
+		StartupTimeoutSec: cfg.StartupTimeoutSec, ToolTimeoutSec: cfg.ToolTimeoutSec,
+		Required: cfg.Required, Disabled: cfg.Disabled,
+	}
+}
+
+func formatMCPResources(server string) string {
+	resources := mcp.ListResources(server)
+	templates := mcp.ListResourceTemplates(server)
+	if len(resources) == 0 && len(templates) == 0 {
+		return "没有发现匹配的 MCP Resource。"
+	}
+	var b strings.Builder
+	for _, resource := range resources {
+		fmt.Fprintf(&b, "- %s · %s · %s", resource.Server, resource.URI, firstNonEmpty(resource.Title, resource.Name))
+		if resource.MIMEType != "" {
+			fmt.Fprintf(&b, " · %s", resource.MIMEType)
+		}
+		b.WriteByte('\n')
+	}
+	for _, template := range templates {
+		fmt.Fprintf(&b, "- %s · template=%s · %s", template.Server, template.URITemplate, firstNonEmpty(template.Title, template.Name))
+		if template.MIMEType != "" {
+			fmt.Fprintf(&b, " · %s", template.MIMEType)
+		}
+		b.WriteByte('\n')
+	}
+	return strings.TrimSpace(b.String())
+}
+
+func formatMCPPrompts(server string) string {
+	prompts := mcp.ListPrompts(server)
+	if len(prompts) == 0 {
+		return "没有发现匹配的 MCP Prompt。"
+	}
+	var b strings.Builder
+	for _, prompt := range prompts {
+		fmt.Fprintf(&b, "- %s · %s · %s", prompt.Server, prompt.Name, firstNonEmpty(prompt.Title, prompt.Name))
+		if prompt.Description != "" {
+			fmt.Fprintf(&b, "\n  %s", prompt.Description)
+		}
+		b.WriteByte('\n')
+	}
+	return strings.TrimSpace(b.String())
+}
+
+func (m *AgentModel) formatLocalSkillList() string {
+	var catalog *skills.SkillCatalog
+	if m.ctrl != nil && m.ctrl.cfg.Agent != nil {
+		catalog = m.ctrl.cfg.Agent.Catalog
+	}
+	disabled := config.GlobalConfig.EffectiveDisabledSkills()
+	if catalog != nil {
+		disabled = append([]string(nil), catalog.DisabledSkills...)
+	}
+	globalDisabled := false
+	visibleDisabled := disabled[:0]
+	for _, name := range disabled {
+		if strings.TrimSpace(name) == "*" {
+			globalDisabled = true
+			continue
+		}
+		visibleDisabled = append(visibleDisabled, name)
+	}
+	disabled = visibleDisabled
+	if (catalog == nil || len(catalog.Skills) == 0) && len(disabled) == 0 && !globalDisabled {
+		return "当前没有发现 Skill。可使用 /skill find <关键词> 搜索 ClawHub 与 skills.sh。"
+	}
+	loaded := map[string]string{}
+	if m.ctrl != nil && m.ctrl.cfg.Agent != nil && m.ctrl.cfg.Agent.State != nil && m.ctrl.cfg.Agent.State.LoadedSkills != nil {
+		loaded = m.ctrl.cfg.Agent.State.LoadedSkills
+	}
+	var b strings.Builder
+	activeCount := 0
+	if catalog != nil {
+		activeCount = len(catalog.Skills)
+	}
+	b.WriteString(fmt.Sprintf("可用 Skills：%d 个\n", activeCount))
+	if globalDisabled {
+		b.WriteString("Skill 功能：已全局禁用（使用 /skill on 恢复）\n")
+	}
+	if catalog != nil {
+		for _, meta := range catalog.Skills {
+			if !meta.UserInvocable {
+				continue
+			}
+			flags := make([]string, 0, 2)
+			if _, ok := loaded[meta.Name]; ok {
+				flags = append(flags, "已加载")
+			}
+			if !meta.AllowImplicit {
+				flags = append(flags, "仅显式调用")
+			}
+			flagText := ""
+			if len(flags) > 0 {
+				flagText = " [" + strings.Join(flags, " / ") + "]"
+			}
+			b.WriteString(fmt.Sprintf("- %s%s: %s\n", meta.Name, flagText, truncateStr(meta.Description, 140)))
+		}
+	}
+	if len(disabled) > 0 {
+		b.WriteString(fmt.Sprintf("\n已禁用 Skills：%d 个\n", len(disabled)))
+		for _, name := range disabled {
+			b.WriteString("- " + name + " [已禁用]\n")
+		}
+	}
+	b.WriteString("\n查看: /skill list · 全局开关: /skill on|off · 单项启停: /skill on|off <name> · 仅启用一个: /skill only <name> · 查找市场: /skill find <关键词>")
+	return strings.TrimSpace(b.String())
+}
+
+func (m *AgentModel) handleSkillSlash(arg string) tea.Cmd {
 	fields := strings.Fields(arg)
 	args := map[string]string{"action": "status"}
 	action := "status"
 	if len(fields) > 0 {
 		switch fields[0] {
-		case "list", "status":
+		case "list":
+			m.reloadSkillCatalog()
+			message := m.formatLocalSkillList()
+			m.appendResultLine(message, message)
+			return nil
+		case "rescan", "reload", "refresh":
+			m.reloadSkillCatalog()
+			return nil
+		case "status":
 			args["action"] = "status"
 		case "load":
 			if len(fields) < 2 {
 				m.appendLine("error", "用法: /skill load <skill-name>", arg)
-				return
+				return nil
 			}
 			m.loadCurrentSkill(fields[1])
-			return
+			return nil
 		case "unload", "close":
 			if len(fields) < 2 {
 				m.appendLine("error", "用法: /skill unload <skill-name>", arg)
-				return
+				return nil
 			}
 			m.unloadCurrentSkill(fields[1])
-			return
+			return nil
+		case "off", "disable":
+			if len(fields) == 1 {
+				m.setSkillSystemDisabled(true)
+				return nil
+			}
+			m.setSkillDisabled(fields[1], true)
+			return nil
+		case "on", "enable":
+			if len(fields) == 1 {
+				m.setSkillSystemDisabled(false)
+				return nil
+			}
+			m.setSkillDisabled(fields[1], false)
+			return nil
+		case "only":
+			if len(fields) < 2 {
+				m.appendLine("error", "用法: /skill only <skill-name>", arg)
+				return nil
+			}
+			m.enableOnlySkill(fields[1])
+			return nil
+		case "find", "search":
+			marketArgs, query := parseSkillMarketArgs(fields[1:])
+			if query == "" {
+				m.appendLine("error", "用法: /skill find <关键词> [market=all|clawhub|skills.sh] [limit=8]", arg)
+				return nil
+			}
+			marketArgs["action"] = "search"
+			marketArgs["query"] = query
+			m.appendLine("info", "正在搜索 ClawHub / skills.sh（只读，不会安装）…", query)
+			m.refreshViewport()
+			return skillMarketCmd("search", marketArgs)
+		case "inspect", "info":
+			if len(fields) < 2 {
+				m.appendLine("error", "用法: /skill inspect <clawhub:slug|skills:owner/repo@skill>", arg)
+				return nil
+			}
+			marketArgs, _ := parseSkillMarketArgs(fields[2:])
+			marketArgs["action"] = "inspect"
+			marketArgs["source"] = fields[1]
+			m.appendLine("info", "正在检查 Skill 来源与安全状态…", fields[1])
+			m.refreshViewport()
+			return skillMarketCmd("inspect", marketArgs)
+		case "install":
+			if len(fields) < 2 {
+				m.appendLine("error", "用法: /skill install <source> [acknowledge-risk] [force]", arg)
+				return nil
+			}
+			marketArgs, _ := parseSkillMarketArgs(fields[2:])
+			marketArgs["action"] = "install"
+			marketArgs["source"] = fields[1]
+			marketArgs["confirm_install"] = "true"
+			for _, flag := range fields[2:] {
+				switch strings.ToLower(flag) {
+				case "acknowledge-risk", "ack-risk":
+					marketArgs["acknowledge_risk"] = "true"
+				case "force", "--force":
+					marketArgs["force"] = "true"
+				}
+			}
+			m.appendLine("info", "正在下载并静态审查 Skill；不会执行其中脚本…", fields[1])
+			m.refreshViewport()
+			return skillMarketCmd("install", marketArgs)
+		case "managed", "installed":
+			return skillMarketCmd("managed", map[string]string{"action": "managed"})
+		case "updates", "check-updates", "outdated":
+			marketArgs := map[string]string{"action": "check_updates"}
+			if len(fields) > 1 {
+				marketArgs["name"] = fields[1]
+			}
+			return skillMarketCmd("check_updates", marketArgs)
+		case "update", "upgrade":
+			marketArgs := map[string]string{"action": "update", "confirm_update": "true"}
+			if len(fields) > 1 && !strings.HasPrefix(fields[1], "-") && fields[1] != "acknowledge-risk" && fields[1] != "ack-risk" {
+				marketArgs["name"] = fields[1]
+			}
+			for _, flag := range fields[1:] {
+				if flag == "acknowledge-risk" || flag == "ack-risk" {
+					marketArgs["acknowledge_risk"] = "true"
+				}
+			}
+			m.appendLine("info", "正在检查并更新未冻结 Skill；旧版本会保留为可回滚备份…", arg)
+			return skillMarketCmd("update", marketArgs)
+		case "pin", "unpin":
+			if len(fields) < 2 {
+				m.appendLine("error", "用法: /skill "+fields[0]+" <name>", arg)
+				return nil
+			}
+			return skillMarketCmd(fields[0], map[string]string{"action": fields[0], "name": fields[1]})
+		case "uninstall":
+			if len(fields) < 2 {
+				m.appendLine("error", "用法: /skill uninstall <name>", arg)
+				return nil
+			}
+			return skillMarketCmd("uninstall", map[string]string{"action": "uninstall", "name": fields[1], "confirm_remove": "true"})
+		case "rollback", "restore":
+			if len(fields) < 2 {
+				m.appendLine("error", "用法: /skill rollback <name> [version|digest-prefix]", arg)
+				return nil
+			}
+			marketArgs := map[string]string{"action": "rollback", "name": fields[1], "confirm_rollback": "true"}
+			if len(fields) > 2 {
+				marketArgs["version"] = fields[2]
+			}
+			return skillMarketCmd("rollback", marketArgs)
+		case "audit", "check":
+			return skillMarketCmd("audit", map[string]string{"action": "audit"})
 		case "add":
 			source := strings.TrimSpace(strings.TrimPrefix(arg, "add"))
 			if source == "" {
 				m.appendLine("error", "用法: /skill add /path/to/skills", arg)
-				return
+				return nil
 			}
 			args = map[string]string{"action": "add_skill_source", "source": source}
 			action = "add"
-		case "off", "disable":
+		case "source-off", "off-source":
 			source := strings.TrimSpace(strings.TrimPrefix(arg, fields[0]))
 			if source == "" {
-				m.appendLine("error", "用法: /skill off /path/to/skills", arg)
-				return
+				m.appendLine("error", "用法: /skill source-off /path/to/skills", arg)
+				return nil
 			}
 			args = map[string]string{"action": "disable_skill_source", "source": source}
-			action = "off"
-		case "on", "enable":
+			action = "source-off"
+		case "source-on", "on-source":
 			source := strings.TrimSpace(strings.TrimPrefix(arg, fields[0]))
 			if source == "" {
-				m.appendLine("error", "用法: /skill on /path/to/skills", arg)
-				return
+				m.appendLine("error", "用法: /skill source-on /path/to/skills", arg)
+				return nil
 			}
 			args = map[string]string{"action": "enable_skill_source", "source": source}
-			action = "on"
+			action = "source-on"
 		case "remove", "rm":
 			source := strings.TrimSpace(strings.TrimPrefix(arg, fields[0]))
 			if source == "" {
 				m.appendLine("error", "用法: /skill remove /path/to/skills", arg)
-				return
+				return nil
 			}
 			args = map[string]string{"action": "remove_skill_source", "source": source}
 			action = "remove"
 		default:
-			m.appendLine("info", "用法: /skill list | /skill load <name> | /skill unload <name> | /skill add <dir> | /skill off <dir> | /skill on <dir> | /skill remove <dir>", arg)
-			return
+			m.appendLine("info", "用法: /skill list | on|off（全局） | on|off <name>（单项） | only <name>（仅启用一个） | load <name> | find|inspect|install | managed|updates|update|pin|unpin|uninstall|rollback|audit | add|source-off|source-on|remove <dir>", arg)
+			return nil
 		}
 	}
 	out, err := config.ManageConfig(args)
 	if err != nil {
 		m.appendLine("error", "Skill "+action+" 失败: "+err.Error(), err.Error())
+		return nil
+	}
+	if m.ctrl != nil && m.ctrl.cfg.Agent != nil && m.ctrl.cfg.Agent.Catalog != nil {
+		switch action {
+		case "add", "source-off", "source-on", "remove":
+			m.ctrl.cfg.Agent.Catalog.Sources = skills.ResolveSources(config.GlobalConfig.SkillSources, config.GlobalConfig.DisabledSkillSources)
+		}
+	}
+	m.reloadSkillCatalog()
+	message := out + "\nSkill 配置已立即刷新；当前会话已加载的有效 Skill 也已重读。"
+	m.appendResultLine(message, message)
+	return nil
+}
+
+func parseSkillMarketArgs(fields []string) (map[string]string, string) {
+	args := map[string]string{}
+	var text []string
+	for _, field := range fields {
+		if key, value, ok := strings.Cut(field, "="); ok {
+			switch strings.ToLower(strings.TrimLeft(key, "-")) {
+			case "market", "limit", "dest":
+				args[strings.ToLower(strings.TrimLeft(key, "-"))] = value
+				continue
+			}
+		}
+		text = append(text, field)
+	}
+	return args, strings.TrimSpace(strings.Join(text, " "))
+}
+
+func skillMarketCmd(action string, args map[string]string) tea.Cmd {
+	return func() tea.Msg {
+		out, err := skills.ManageMarketplace(args)
+		return skillMarketResultMsg{action: action, out: out, err: err}
+	}
+}
+
+func (m *AgentModel) reloadSkillCatalog() {
+	if m.ctrl == nil || m.ctrl.cfg.Agent == nil || m.ctrl.cfg.Agent.Catalog == nil {
 		return
 	}
-	m.appendLine("result", out+"\n提示: Skill 来源变更通常在新会话后生效；已加载进当前上下文的 Skill 不会从历史中删除。", out)
+	catalog := m.ctrl.cfg.Agent.Catalog
+	if len(catalog.Sources) == 0 {
+		catalog.Sources = skills.ResolveSources(config.GlobalConfig.SkillSources, config.GlobalConfig.DisabledSkillSources)
+	}
+	if err := catalog.ReloadWithDisabled(config.GlobalConfig.EffectiveDisabledSkills()); err != nil {
+		m.appendLine("error", "Skill 目录刷新失败: "+err.Error(), err.Error())
+		return
+	}
+	refreshed, unloaded := reconcileTUILoadedSkills(m.ctrl.cfg.Agent.State, catalog)
+	detail := fmt.Sprintf("Skill 目录已刷新：%d 个可用。", len(catalog.Skills))
+	if refreshed > 0 || unloaded > 0 {
+		detail += fmt.Sprintf("已重载 %d，已移除失效/禁用 %d。", refreshed, unloaded)
+	}
+	m.appendLine("info", detail, "skill catalog refreshed")
+}
+
+func reconcileTUILoadedSkills(state *harness.AgentState, catalog *skills.SkillCatalog) (refreshed, unloaded int) {
+	if state == nil || catalog == nil || len(state.LoadedSkills) == 0 {
+		return 0, 0
+	}
+	for oldName := range state.LoadedSkills {
+		meta, ok := catalog.FindSkill(oldName)
+		if !ok {
+			delete(state.LoadedSkills, oldName)
+			unloaded++
+			continue
+		}
+		content, err := skills.LoadSkillContent(*meta)
+		if err != nil {
+			delete(state.LoadedSkills, oldName)
+			unloaded++
+			continue
+		}
+		if oldName != meta.Name {
+			delete(state.LoadedSkills, oldName)
+		}
+		state.LoadedSkills[meta.Name] = content
+		refreshed++
+	}
+	return refreshed, unloaded
 }
 
 func (m *AgentModel) loadCurrentSkill(name string) {
@@ -1469,9 +2012,21 @@ func (m *AgentModel) loadCurrentSkill(name string) {
 		m.appendLine("error", "当前 Agent 没有可用 Skill 目录", name)
 		return
 	}
+	if m.ctrl.cfg.Agent.Catalog.IsDisabled(name) {
+		hint := "/skill on " + name
+		if m.ctrl.cfg.Agent.Catalog.IsDisabled("*") {
+			hint = "/skill on"
+		}
+		m.appendLine("error", "Skill 已被禁用: "+name+"；使用 "+hint+" 恢复", name)
+		return
+	}
 	meta, ok := m.ctrl.cfg.Agent.Catalog.FindSkill(name)
 	if !ok {
 		m.appendLine("error", "未找到 Skill: "+name, name)
+		return
+	}
+	if !meta.UserInvocable {
+		m.appendLine("error", "Skill 不允许用户直接调用: "+name, name)
 		return
 	}
 	content, err := skills.LoadSkillContent(*meta)
@@ -1482,21 +2037,88 @@ func (m *AgentModel) loadCurrentSkill(name string) {
 	if m.ctrl.cfg.Agent.State.LoadedSkills == nil {
 		m.ctrl.cfg.Agent.State.LoadedSkills = map[string]string{}
 	}
-	m.ctrl.cfg.Agent.State.LoadedSkills[name] = content
-	m.appendLine("result", fmt.Sprintf("已加载 Skill [%s] 到当前会话 (%d 字符)", name, len(content)), name)
+	m.ctrl.cfg.Agent.State.LoadedSkills[meta.Name] = content
+	message := fmt.Sprintf("已加载 Skill [%s] 到当前会话 (%d 字符)", meta.Name, len(content))
+	m.appendResultLine(message, message)
 }
 
 func (m *AgentModel) unloadCurrentSkill(name string) {
-	if m.ctrl == nil || m.ctrl.cfg.Agent == nil || m.ctrl.cfg.Agent.State == nil {
-		m.appendLine("error", "当前 Agent 状态不可用", name)
+	m.setSkillDisabled(name, true)
+}
+
+func (m *AgentModel) setSkillDisabled(name string, disabled bool) {
+	name = strings.TrimSpace(name)
+	action := "enable_skill"
+	label := "启用"
+	if disabled {
+		action = "disable_skill"
+		label = "禁用"
+	}
+	out, err := config.ManageConfig(map[string]string{"action": action, "name": name})
+	if err != nil {
+		m.appendLine("error", "Skill "+label+"失败: "+err.Error(), err.Error())
 		return
 	}
-	if _, ok := m.ctrl.cfg.Agent.State.LoadedSkills[name]; !ok {
-		m.appendLine("info", "当前会话未加载 Skill: "+name, name)
+	// Reloading applies the denylist to discovery and reconciles LoadedSkills,
+	// so unload/off works even when the Skill was not loaded in this session.
+	m.reloadSkillCatalog()
+	message := out + "\n已立即应用到当前会话，并持久化到 disabled_skills。"
+	if !disabled && config.GlobalConfig.SkillsDisabled {
+		message += "\n注意：Skill 功能仍处于全局关闭状态；还需执行 /skill on。"
+	}
+	m.appendResultLine(message, message)
+}
+
+func (m *AgentModel) setSkillSystemDisabled(disabled bool) {
+	action := "enable_skills"
+	label := "启用"
+	if disabled {
+		action = "disable_skills"
+		label = "禁用"
+	}
+	out, err := config.ManageConfig(map[string]string{"action": action})
+	if err != nil {
+		m.appendLine("error", "Skill 全局"+label+"失败: "+err.Error(), err.Error())
 		return
 	}
-	delete(m.ctrl.cfg.Agent.State.LoadedSkills, name)
-	m.appendLine("result", "已从当前会话关闭 Skill: "+name, name)
+	m.reloadSkillCatalog()
+	message := out + "\n已立即应用到当前会话；单个名称的 disabled_skills 设置保持不变。"
+	m.appendResultLine(message, message)
+}
+
+func (m *AgentModel) enableOnlySkill(name string) {
+	name = strings.TrimSpace(name)
+	if m.ctrl == nil || m.ctrl.cfg.Agent == nil || m.ctrl.cfg.Agent.Catalog == nil {
+		m.appendLine("error", "当前 Agent 没有可用 Skill 目录", name)
+		return
+	}
+	catalog := m.ctrl.cfg.Agent.Catalog
+	fresh, err := skills.LoadCatalog(catalog.Sources)
+	if err != nil {
+		m.appendLine("error", "Skill 目录刷新失败: "+err.Error(), err.Error())
+		return
+	}
+	selected, ok := fresh.FindSkill(name)
+	if !ok {
+		m.appendLine("error", "未找到 Skill: "+name+"；请先用 /skill list 查看准确名称", name)
+		return
+	}
+	names := make([]string, 0, len(fresh.Skills))
+	for _, meta := range fresh.Skills {
+		names = append(names, meta.Name)
+	}
+	out, err := config.ManageConfig(map[string]string{
+		"action":           "enable_only_skill",
+		"name":             selected.Name,
+		"available_skills": strings.Join(names, "\n"),
+	})
+	if err != nil {
+		m.appendLine("error", "Skill only 失败: "+err.Error(), err.Error())
+		return
+	}
+	m.reloadSkillCatalog()
+	message := out + fmt.Sprintf("\n已立即应用到当前会话：保留 %s，禁用其他 %d 个已发现 Skill。", selected.Name, max(0, len(names)-1))
+	m.appendResultLine(message, message)
 }
 
 func (m *AgentModel) startNewSession(goal string) tea.Cmd {
@@ -1583,29 +2205,209 @@ func (m *AgentModel) inputFocused() bool {
 }
 
 func (m AgentModel) currentInputValue() string {
-	if m.pendingPaste != "" {
-		return m.pendingPaste
+	segments := make([]string, 0, len(m.draftParts)+1)
+	for _, part := range m.draftParts {
+		segments = append(segments, part.text)
 	}
-	return m.input.Value()
+	segments = append(segments, decodeInputValue(m.input.Value()))
+	return joinDraftSegments(segments)
+}
+
+// normalizeInputNewlines keeps pasted/user-authored text inert when it is
+// rendered by the terminal. Some browser and editor clipboards still emit
+// CR-only line endings. A bare CR is meaningful in command output (progress
+// bars use it to redraw a line), but must be treated as a newline in user
+// input or every HTML source line visually overwrites the previous one.
+func normalizeInputNewlines(s string) string {
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	return strings.ReplaceAll(s, "\r", "\n")
+}
+
+func joinDraftSegments(segments []string) string {
+	var b strings.Builder
+	for _, segment := range segments {
+		if segment == "" {
+			continue
+		}
+		if b.Len() > 0 && !endsWithWhitespace(b.String()) && !startsWithWhitespace(segment) {
+			b.WriteByte('\n')
+		}
+		b.WriteString(segment)
+	}
+	return b.String()
+}
+
+func startsWithWhitespace(s string) bool {
+	r, _ := utf8.DecodeRuneInString(s)
+	return unicode.IsSpace(r)
+}
+
+func endsWithWhitespace(s string) bool {
+	r, _ := utf8.DecodeLastRuneInString(s)
+	return unicode.IsSpace(r)
+}
+
+func (m AgentModel) hasPasteBlocks() bool {
+	for _, part := range m.draftParts {
+		if part.pasted {
+			return true
+		}
+	}
+	return false
+}
+
+func (m AgentModel) draftDisplayPrefix() string {
+	if len(m.draftParts) == 0 {
+		return ""
+	}
+	var rows []string
+	pasteIndex := 0
+	for _, part := range m.draftParts {
+		if part.pasted {
+			pasteIndex++
+			rows = append(rows, pasteSummary(part.text, pasteIndex))
+			continue
+		}
+		if part.text != "" {
+			rows = append(rows, part.text)
+		}
+	}
+	if len(rows) == 0 {
+		return ""
+	}
+	return strings.Join(rows, "\n") + "\n"
+}
+
+func (m AgentModel) submittedDraftSummary() string {
+	if !m.hasPasteBlocks() {
+		return ""
+	}
+	lines := make([]string, 0, len(m.draftParts)+1)
+	pasteIndex := 0
+	for _, part := range m.draftParts {
+		if part.pasted {
+			pasteIndex++
+			lines = append(lines, pasteSummary(part.text, pasteIndex)+" "+pastePreview(part.text))
+			continue
+		}
+		if text := strings.TrimSpace(part.text); text != "" {
+			lines = append(lines, "补充文字："+truncateStr(text, 240))
+		}
+	}
+	if suffix := strings.TrimSpace(decodeInputValue(m.input.Value())); suffix != "" {
+		lines = append(lines, "补充文字："+truncateStr(suffix, 240))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func encodeInputValue(s string) string {
+	s = normalizeInputNewlines(s)
+	return strings.ReplaceAll(s, "\n", string(inputLineBreak))
+}
+
+func decodeInputValue(s string) string {
+	return strings.ReplaceAll(s, string(inputLineBreak), "\n")
+}
+
+func (m *AgentModel) moveInputCursorLine(delta int) bool {
+	if delta == 0 {
+		return false
+	}
+	runes := []rune(m.input.Value())
+	pos := m.input.Position()
+	if pos < 0 {
+		pos = 0
+	}
+	if pos > len(runes) {
+		pos = len(runes)
+	}
+	width := ChromeContentWidth(m.width) - 2
+	if width <= 0 {
+		width = 78
+	}
+	type cursorPoint struct{ row, col int }
+	points := make([]cursorPoint, len(runes)+1)
+	row, col := 0, 0
+	if prefix := m.draftDisplayPrefix(); prefix != "" {
+		for _, r := range []rune(prefix) {
+			if r == '\n' || r == '\r' {
+				row++
+				col = 0
+				continue
+			}
+			w := max(1, runewidth.RuneWidth(r))
+			if col > 0 && col+w > width {
+				row++
+				col = 0
+			}
+			col += w
+		}
+	}
+	for i := 0; i <= len(runes); i++ {
+		cursorWidth := 1
+		if i < len(runes) && runes[i] != inputLineBreak {
+			cursorWidth = max(1, runewidth.RuneWidth(runes[i]))
+		}
+		cursorRow, cursorCol := row, col
+		if cursorCol > 0 && cursorCol+cursorWidth > width {
+			cursorRow++
+			cursorCol = 0
+		}
+		points[i] = cursorPoint{row: cursorRow, col: cursorCol}
+		if i == len(runes) {
+			break
+		}
+		if runes[i] == inputLineBreak {
+			row++
+			col = 0
+			continue
+		}
+		w := max(1, runewidth.RuneWidth(runes[i]))
+		if col > 0 && col+w > width {
+			row++
+			col = 0
+		}
+		col += w
+	}
+	current := points[pos]
+	targetRow := current.row + delta
+	if targetRow < 0 {
+		return false
+	}
+	best, bestDistance := -1, int(^uint(0)>>1)
+	for i, point := range points {
+		if point.row != targetRow {
+			continue
+		}
+		distance := point.col - current.col
+		if distance < 0 {
+			distance = -distance
+		}
+		if distance < bestDistance {
+			best, bestDistance = i, distance
+		}
+	}
+	if best < 0 || best == pos {
+		return false
+	}
+	m.input.SetCursor(best)
+	return true
 }
 
 func (m *AgentModel) clearInputDraft() {
-	m.pendingPaste = ""
+	m.draftParts = nil
 	m.input.SetValue("")
 	m.input.SetCursor(0)
 	m.slashSelected = 0
 }
 
 func (m *AgentModel) acceptPaste(text string) {
+	text = normalizeInputNewlines(text)
 	if text == "" {
 		return
 	}
-	base := m.input.Value()
+	base := decodeInputValue(m.input.Value())
 	cursor := m.input.Position()
-	if m.pendingPaste != "" {
-		base = m.pendingPaste
-		cursor = len([]rune(base))
-	}
 	baseRunes := []rune(base)
 	if cursor < 0 {
 		cursor = 0
@@ -1613,29 +2415,55 @@ func (m *AgentModel) acceptPaste(text string) {
 	if cursor > len(baseRunes) {
 		cursor = len(baseRunes)
 	}
-	textRunes := []rune(text)
-	full := string(baseRunes[:cursor]) + text + string(baseRunes[cursor:])
-	nextCursor := cursor + len(textRunes)
-	if isLargePaste(full) {
-		m.pendingPaste = full
-		summary := pasteSummary(full)
-		m.input.SetValue(summary)
-		m.input.SetCursor(len([]rune(summary)))
+	prefix := string(baseRunes[:cursor])
+	tail := string(baseRunes[cursor:])
+	if isLargePaste(text) {
+		if prefix != "" {
+			m.draftParts = append(m.draftParts, inputDraftPart{text: prefix})
+		}
+		m.draftParts = append(m.draftParts, inputDraftPart{text: text, pasted: true})
+		m.input.SetValue(encodeInputValue(tail))
+		m.input.SetCursor(0)
 		m.slashSelected = 0
 		return
 	}
-	m.pendingPaste = ""
-	m.input.SetValue(full)
+	textRunes := []rune(text)
+	full := prefix + text + tail
+	nextCursor := cursor + len(textRunes)
+	m.input.SetValue(encodeInputValue(full))
 	m.input.SetCursor(nextCursor)
 	m.clampSlashSelection()
 }
 
+func (m *AgentModel) removeLastDraftPart() {
+	if len(m.draftParts) == 0 {
+		return
+	}
+	last := m.draftParts[len(m.draftParts)-1]
+	m.draftParts = m.draftParts[:len(m.draftParts)-1]
+	if last.pasted || last.text == "" {
+		return
+	}
+	runes := []rune(last.text)
+	if len(runes) > 0 {
+		runes = runes[:len(runes)-1]
+	}
+	m.input.SetValue(encodeInputValue(string(runes)))
+	m.input.SetCursor(len([]rune(m.input.Value())))
+}
+
 func (m *AgentModel) appendInputNewline() {
-	base := m.currentInputValue()
-	m.pendingPaste = base + "\n"
-	summary := pasteSummary(m.pendingPaste)
-	m.input.SetValue(summary)
-	m.input.SetCursor(len([]rune(summary)))
+	value := []rune(m.input.Value())
+	pos := m.input.Position()
+	if pos < 0 {
+		pos = 0
+	}
+	if pos > len(value) {
+		pos = len(value)
+	}
+	value = append(value[:pos], append([]rune{inputLineBreak}, value[pos:]...)...)
+	m.input.SetValue(string(value))
+	m.input.SetCursor(pos + 1)
 	m.slashSelected = 0
 }
 
@@ -1654,6 +2482,9 @@ func (m *AgentModel) toggleAllCollapsible() (count int, collapsed bool) {
 	for i := range m.lines {
 		line := &m.lines[i]
 		switch {
+		case isCollapsibleUserLine(*line):
+			count++
+			hasCollapsed = hasCollapsed || line.collapsed
 		case line.kind == "result" && line.raw != "" && line.raw != line.content:
 			count++
 			hasCollapsed = hasCollapsed || line.collapsed
@@ -1680,6 +2511,8 @@ func (m *AgentModel) toggleAllCollapsible() (count int, collapsed bool) {
 	for i := range m.lines {
 		line := &m.lines[i]
 		switch {
+		case isCollapsibleUserLine(*line):
+			line.collapsed = collapsed
 		case line.kind == "result" && line.raw != "" && line.raw != line.content:
 			line.collapsed = collapsed
 		case line.kind == "cmdout" && line.group > 0:
@@ -1691,6 +2524,10 @@ func (m *AgentModel) toggleAllCollapsible() (count int, collapsed bool) {
 		}
 	}
 	return count, collapsed
+}
+
+func isCollapsibleUserLine(line logLine) bool {
+	return line.kind == "user" && line.raw != "" && "You: "+line.raw != line.content
 }
 
 // toggleLastCollapsible is retained for package-level compatibility. The UI
@@ -2348,7 +3185,17 @@ func (m *AgentModel) refreshViewport() {
 		case "step":
 			b.WriteString(renderWrapped(styleStep, ts+"▸ "+ln.content, contentW) + "\n")
 		case "user":
-			b.WriteString(renderWrapped(styleAccent, ts+"▸ "+ln.content, contentW) + "\n\n")
+			// Normalize again while rendering so checkpoints created by older
+			// versions cannot reintroduce terminal-active carriage returns.
+			body := normalizeInputNewlines(ln.content)
+			if isCollapsibleUserLine(ln) {
+				if ln.collapsed {
+					body += "  [e 全部展开原文]"
+				} else {
+					body = "You: " + normalizeInputNewlines(ln.raw) + "\n[e 全部折叠]"
+				}
+			}
+			b.WriteString(renderWrapped(styleAccent, ts+"▸ "+body, contentW) + "\n\n")
 		case "thought":
 			b.WriteString(renderWrapped(styleThought, ts+"💭 "+ln.content, contentW) + "\n\n")
 		case "stream":
@@ -2429,6 +3276,11 @@ func (m *AgentModel) refreshViewport() {
 	if shouldStick {
 		m.viewport.GotoBottom()
 	}
+}
+
+func (m *AgentModel) returnToLiveTail() {
+	m.autoScroll = true
+	m.viewport.GotoBottom()
 }
 
 func lineTimestampPlain(ln logLine) string {
@@ -2592,6 +3444,7 @@ func formatApproxTokens(n int) string {
 
 func (m AgentModel) View() string {
 	if m.quitting {
+		m.hideInputCursorAnchor()
 		return ""
 	}
 	w, h := m.width, m.height
@@ -2601,15 +3454,21 @@ func (m AgentModel) View() string {
 	if h <= 0 {
 		h = 24
 	}
+	// View receives a model value, so it is safe to normalize and recompute the
+	// layout here. Event handlers still recalculate eagerly, but the final
+	// render must not trust a stale viewport height: a missed/delayed resize or
+	// a footer whose height changed between events would otherwise make
+	// MaxHeight silently cut the input box off the bottom of the terminal.
+	m.width, m.height = w, h
 	renderW := TerminalRenderWidth(w)
 	if w < 8 || h < 6 {
+		m.hideInputCursorAnchor()
 		text := runewidth.Truncate("DeepSentry · 窗口过小", renderW, "")
-		return styleApp.Width(renderW).Height(h).MaxHeight(h).Render(text)
+		return m.withCursorFrameMarker(styleApp.Width(renderW).Height(h).MaxHeight(h).Render(text))
 	}
-	bodyH := m.viewport.Height
-	if bodyH <= 0 {
-		bodyH = max(4, h-6)
-	}
+	m.recalcLayout()
+	layout := m.frameLayout()
+	bodyH := layout.bodyHeight
 
 	header := m.renderHeader(renderW)
 	stepInfo := ""
@@ -2636,13 +3495,21 @@ func (m AgentModel) View() string {
 	}
 	statusParts = append(statusParts, time.Now().Format("15:04:05"))
 	statusText := strings.Join(statusParts, "  │  ")
-	status := styleStatusBar.Width(renderW).Render(runewidth.Truncate(sanitizeTUIText(statusText), statusW, "…"))
-	body := lipgloss.NewStyle().
-		Width(renderW).
-		Height(bodyH).
-		Padding(0, 1).
-		Render(m.viewportView())
-	inputLine := lipgloss.NewStyle().PaddingLeft(1).Render(m.renderInputLine())
+	footerMarker := encodeFooterFrameMarker(m.footerVersion)
+	status := tagRenderedLines(styleStatusBar.Width(renderW).Render(runewidth.Truncate(sanitizeTUIText(statusText), statusW, "…")), footerMarker)
+	body := ""
+	if bodyH > 0 {
+		// recalcLayout already applies this height. Assigning it on this local
+		// copy as well makes the relationship explicit and keeps viewport.View
+		// from returning more rows than the body wrapper was budgeted for.
+		m.viewport.Height = bodyH
+		body = lipgloss.NewStyle().
+			Width(renderW).
+			Height(bodyH).
+			Padding(0, 1).
+			Render(m.viewportView())
+	}
+	inputLine := tagRenderedLines(lipgloss.NewStyle().PaddingLeft(inputLinePaddingLeft).Render(m.renderInputLine()), footerMarker)
 	helpW := max(1, renderW-2)
 	helpText := runewidth.Truncate(help, helpW, "…")
 	var helpLine string
@@ -2651,14 +3518,58 @@ func (m AgentModel) View() string {
 	} else {
 		helpLine = styleHelpHint.PaddingLeft(1).Render(" " + helpText)
 	}
+	helpLine = tagRenderedLines(helpLine, footerMarker)
 	footerParts := []string{}
-	if suggestions := m.renderSlashSuggestions(); suggestions != "" {
+	suggestions := m.renderSlashSuggestions()
+	if suggestions != "" {
 		footerParts = append(footerParts, suggestions)
 	}
 	footerParts = append(footerParts, status, inputLine, helpLine)
 	footer := lipgloss.JoinVertical(lipgloss.Left, footerParts...)
-	main := lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
-	return styleApp.Width(renderW).Height(h).Render(main)
+	mainParts := []string{header}
+	if body != "" {
+		mainParts = append(mainParts, body)
+	}
+	mainParts = append(mainParts, footer)
+	main := lipgloss.JoinVertical(lipgloss.Left, mainParts...)
+	// The component budget above is exact. Do not apply MaxHeight here:
+	// lipgloss clips from the bottom, which turns a layout mismatch into a
+	// disappearing input border/help line. Tests assert the exact frame height
+	// instead, so an overflow is caught rather than hidden from the user.
+	view := styleApp.Width(renderW).Height(h).Render(main)
+	// Publish the IME anchor from the exact components used for this frame.
+	// This avoids drift when suggestions, wrapped input, theme frames, or
+	// terminal resizing change the footer height.
+	m.syncInputCursorAnchorForLayout(
+		lipgloss.Height(header),
+		lipgloss.Height(body),
+		renderedBlockHeight(suggestions),
+		lipgloss.Height(status),
+	)
+	return m.withCursorFrameMarker(view)
+}
+
+func (m *AgentModel) invalidateFooter() {
+	m.footerVersion++
+}
+
+func tagRenderedLines(block, marker string) string {
+	if block == "" || marker == "" {
+		return block
+	}
+	lines := strings.Split(block, "\n")
+	for i := range lines {
+		lines[i] += marker
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m AgentModel) withCursorFrameMarker(view string) string {
+	row, col, mode := 0, 0, cursorAnchorPassthrough
+	if m.cursorAnchor != nil {
+		row, col, mode = m.cursorAnchor.snapshot()
+	}
+	return view + encodeCursorFrameMarker(row, col, mode)
 }
 
 func (m AgentModel) scrollPositionText() string {
@@ -2674,7 +3585,20 @@ func (m AgentModel) scrollPositionText() string {
 	return fmt.Sprintf("滚动 %.0f%%", m.viewport.ScrollPercent()*100)
 }
 
-func (m *AgentModel) recalcLayout() {
+type agentFrameLayout struct {
+	renderWidth       int
+	headerHeight      int
+	suggestionsHeight int
+	statusHeight      int
+	inputHeight       int
+	helpHeight        int
+	bodyHeight        int
+}
+
+// frameLayout is the single source of truth for both rendering and the
+// physical IME cursor anchor. Heights are measured from the actual rendered
+// components instead of duplicating a collection of one-line assumptions.
+func (m AgentModel) frameLayout() agentFrameLayout {
 	w, h := m.width, m.height
 	if w <= 0 {
 		w = 80
@@ -2682,11 +3606,38 @@ func (m *AgentModel) recalcLayout() {
 	if h <= 0 {
 		h = 24
 	}
-	// header(1) + status(1) + input box(content rows + 2) + help(1) + optional slash suggestions.
-	inputRows := m.inputContentRowCount(ChromeContentWidth(w) - 2)
-	chromeLines := inputRows + 5 + m.slashSuggestionLineCount()
-	m.viewport.Width = max(1, TerminalRenderWidth(w)-2)
-	m.viewport.Height = max(1, h-chromeLines)
+	renderW := TerminalRenderWidth(w)
+	headerH := lipgloss.Height(m.renderHeader(renderW))
+	suggestionsH := renderedBlockHeight(m.renderSlashSuggestions())
+	statusH := lipgloss.Height(styleStatusBar.Width(renderW).Render(""))
+	inputH := lipgloss.Height(lipgloss.NewStyle().PaddingLeft(inputLinePaddingLeft).Render(m.renderInputLine()))
+	helpH := lipgloss.Height(styleHelpHint.PaddingLeft(1).Render(" "))
+	fixedH := styleApp.GetVerticalFrameSize() + headerH + suggestionsH + statusH + inputH + helpH
+	bodyH := h - fixedH
+	if bodyH < 0 {
+		bodyH = 0
+	}
+	return agentFrameLayout{
+		renderWidth:       renderW,
+		headerHeight:      headerH,
+		suggestionsHeight: suggestionsH,
+		statusHeight:      statusH,
+		inputHeight:       inputH,
+		helpHeight:        helpH,
+		bodyHeight:        bodyH,
+	}
+}
+
+func (m *AgentModel) recalcLayout() {
+	w := m.width
+	if w <= 0 {
+		w = 80
+	}
+	layout := m.frameLayout()
+	m.viewport.Width = max(1, layout.renderWidth-2)
+	// bubbles/viewport expects a positive height even when an extremely short
+	// terminal leaves no body row. View omits the body in that edge case.
+	m.viewport.Height = max(1, layout.bodyHeight)
 	m.input.Width = clampInputWidth(ChromeContentWidth(w) - 2)
 }
 
@@ -2862,13 +3813,18 @@ func (m AgentModel) focusedInputRows(width int) ([]string, int, int) {
 	if width <= 0 {
 		return []string{""}, 0, 0
 	}
-	value := m.input.Value()
+	value := decodeInputValue(m.input.Value())
+	inputPos := m.input.Position()
+	if prefix := m.draftDisplayPrefix(); prefix != "" {
+		value = prefix + value
+		inputPos += len([]rune(prefix))
+	}
 	placeholder := false
 	if value == "" {
 		value = m.inputPlaceholderText()
 		placeholder = true
 	}
-	pos := m.input.Position()
+	pos := inputPos
 	runes := []rune(value)
 	if pos < 0 {
 		pos = 0
@@ -2950,6 +3906,8 @@ func (m AgentModel) focusedInputRows(width int) ([]string, int, int) {
 	return rows, cursorRow, cursorCol
 }
 
+const inputLinePaddingLeft = 1
+
 func (m AgentModel) inputCursorAnchor() (row, col int, ok bool) {
 	if !m.inputFocused() {
 		return 0, 0, false
@@ -2964,9 +3922,33 @@ func (m AgentModel) inputCursorAnchor() (row, col int, ok bool) {
 	if w < 8 || h < 6 {
 		return 0, 0, false
 	}
-	bodyH := m.viewport.Height
-	if bodyH <= 0 {
-		bodyH = max(4, h-6)
+	// Use the same measured frame budget as View. In particular, never derive
+	// the IME anchor from viewport.Height: that field may still describe the
+	// previous frame while the input has wrapped, suggestions appeared, or a
+	// resize event is being processed.
+	m.width, m.height = w, h
+	layout := m.frameLayout()
+	return m.inputCursorAnchorForLayout(
+		layout.headerHeight,
+		layout.bodyHeight,
+		layout.suggestionsHeight,
+		layout.statusHeight,
+	)
+}
+
+func (m AgentModel) inputCursorAnchorForLayout(headerH, bodyH, suggestionsH, statusH int) (row, col int, ok bool) {
+	if !m.inputFocused() {
+		return 0, 0, false
+	}
+	w, h := m.width, m.height
+	if w <= 0 {
+		w = 80
+	}
+	if h <= 0 {
+		h = 24
+	}
+	if w < 8 || h < 6 {
+		return 0, 0, false
 	}
 	innerW := ChromeContentWidth(w) - 2
 	_, cursorRow, cursorCol := m.focusedInputRows(innerW)
@@ -2976,10 +3958,25 @@ func (m AgentModel) inputCursorAnchor() (row, col int, ok bool) {
 	if cursorCol < 0 {
 		cursorCol = 0
 	}
-	// 1-based terminal coordinates: header + viewport + suggestions + status + input top border + content row.
-	row = 1 + bodyH + m.slashSuggestionLineCount() + 1 + 1 + cursorRow + 1
-	col = 1 + 1 + cursorCol + 1
+	// Coordinates are 1-based. Use the actual rendered component heights
+	// instead of assuming a one-line header/status or deriving suggestions
+	// from their item count. The input itself has a one-cell outer inset and
+	// a one-cell box border.
+	outerTop := styleApp.GetMarginTop() + styleApp.GetBorderTopSize() + styleApp.GetPaddingTop()
+	outerLeft := styleApp.GetMarginLeft() + styleApp.GetBorderLeftSize() + styleApp.GetPaddingLeft()
+	row = outerTop + headerH + bodyH + suggestionsH + statusH + 1 + cursorRow + 1
+	col = outerLeft + inputLinePaddingLeft + 1 + cursorCol + 1
+	if row < 1 || row > h || col < 1 || col > TerminalRenderWidth(w) {
+		return 0, 0, false
+	}
 	return row, col, true
+}
+
+func renderedBlockHeight(block string) int {
+	if block == "" {
+		return 0
+	}
+	return lipgloss.Height(block)
 }
 
 func clampInputWidth(w int) int {
@@ -3050,13 +4047,25 @@ func truncateStr(s string, n int) string {
 	return truncateDisplay(s, n, "…")
 }
 
-func pasteSummary(s string) string {
+func pasteSummary(s string, index int) string {
+	s = normalizeInputNewlines(s)
 	lines := strings.Count(s, "\n") + 1
 	chars := len([]rune(s))
-	return fmt.Sprintf("[已粘贴 %d 行 / %d 字符，Enter 发送完整内容，Ctrl+U 清空]", lines, chars)
+	return fmt.Sprintf("[粘贴文本 #%d · %d 行 · %d 字符]", index, lines, chars)
+}
+
+func pastePreview(s string) string {
+	s = normalizeInputNewlines(s)
+	s = strings.ReplaceAll(s, "\n", " ↵ ")
+	s = strings.Join(strings.Fields(s), " ")
+	if s == "" {
+		return "（空白内容）"
+	}
+	return truncateStr(s, 120)
 }
 
 func summarizeUserText(s string) string {
+	s = normalizeInputNewlines(s)
 	lines := strings.Count(s, "\n") + 1
 	chars := len([]rune(s))
 	first := strings.TrimSpace(strings.SplitN(s, "\n", 2)[0])

@@ -423,6 +423,53 @@ func TestManageConfigImportClaudeMCPAndToggle(t *testing.T) {
 	}
 }
 
+func TestManageConfigAddsStructuredHTTPMCPFields(t *testing.T) {
+	old := GlobalConfig
+	defer func() { GlobalConfig = old }()
+
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if _, err := ManageConfig(map[string]string{
+		"config_path":         path,
+		"action":              "add_mcp_server",
+		"name":                "remote-docs",
+		"type":                "http",
+		"url":                 "https://mcp.example.test/mcp",
+		"headers":             "X-Workspace=security",
+		"token_env":           "MCP_DOCS_TOKEN",
+		"enabled_tools":       "search,read",
+		"disabled_tools":      "delete",
+		"startup_timeout_sec": "30",
+		"tool_timeout_sec":    "120",
+		"required":            "true",
+	}); err != nil {
+		t.Fatalf("add HTTP MCP: %v", err)
+	}
+	if len(GlobalConfig.MCPServerConfigs) != 1 {
+		t.Fatalf("expected one MCP config: %#v", GlobalConfig.MCPServerConfigs)
+	}
+	got := GlobalConfig.MCPServerConfigs[0]
+	if got.Type != "streamable_http" || got.URL != "https://mcp.example.test/mcp" || got.Headers["X-Workspace"] != "security" || got.BearerTokenEnvVar != "MCP_DOCS_TOKEN" || !got.Required {
+		t.Fatalf("structured HTTP fields were not preserved: %#v", got)
+	}
+	if len(got.EnabledTools) != 2 || got.ToolTimeoutSec != 120 || got.StartupTimeoutSec != 30 {
+		t.Fatalf("tool filters/timeouts were not preserved: %#v", got)
+	}
+}
+
+func TestManageConfigImportsClaudeHTTPMCP(t *testing.T) {
+	old := GlobalConfig
+	defer func() { GlobalConfig = old }()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	content := `{"mcpServers":{"docs":{"type":"http","url":"https://mcp.example.test/mcp","headers":{"X-Team":"blue"}}}}`
+	if _, err := ManageConfig(map[string]string{"config_path": path, "action": "import_claude_mcp", "content": content}); err != nil {
+		t.Fatal(err)
+	}
+	got := GlobalConfig.MCPServerConfigs[0]
+	if got.Type != "streamable_http" || got.Headers["X-Team"] != "blue" {
+		t.Fatalf("unexpected imported HTTP MCP: %#v", got)
+	}
+}
+
 func TestManageConfigToggleSkillSource(t *testing.T) {
 	old := GlobalConfig
 	defer func() { GlobalConfig = old }()
@@ -444,6 +491,96 @@ func TestManageConfigToggleSkillSource(t *testing.T) {
 	}
 	if len(GlobalConfig.DisabledSkillSources) != 1 || GlobalConfig.DisabledSkillSources[0] != "/opt/deepsentry-skills" {
 		t.Fatalf("unexpected disabled skill sources: %#v", GlobalConfig.DisabledSkillSources)
+	}
+}
+
+func TestManageConfigToggleSkillByNameCaseInsensitively(t *testing.T) {
+	old := GlobalConfig
+	defer func() { GlobalConfig = old }()
+
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	for _, name := range []string{"fun-brainstorming", "FUN-BRAINSTORMING"} {
+		if _, err := ManageConfig(map[string]string{
+			"config_path": path,
+			"action":      "disable_skill",
+			"name":        name,
+		}); err != nil {
+			t.Fatalf("disable_skill %q: %v", name, err)
+		}
+	}
+	if got := readYAMLStringSeq(t, path, "disabled_skills"); len(got) != 1 || got[0] != "fun-brainstorming" {
+		t.Fatalf("disabled_skills should be case-insensitive and idempotent: %#v", got)
+	}
+	if len(GlobalConfig.DisabledSkills) != 1 {
+		t.Fatalf("runtime disabled skills not reloaded: %#v", GlobalConfig.DisabledSkills)
+	}
+	if _, err := ManageConfig(map[string]string{
+		"config_path": path,
+		"action":      "enable_skill",
+		"name":        "Fun-Brainstorming",
+	}); err != nil {
+		t.Fatalf("enable_skill: %v", err)
+	}
+	if got := readYAMLStringSeq(t, path, "disabled_skills"); len(got) != 0 {
+		t.Fatalf("enable should remove the name regardless of case: %#v", got)
+	}
+}
+
+func TestManageConfigTogglesAllSkillsWithoutPath(t *testing.T) {
+	old := GlobalConfig
+	defer func() { GlobalConfig = old }()
+
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if _, err := ManageConfig(map[string]string{"config_path": path, "action": "disable_skills"}); err != nil {
+		t.Fatalf("disable_skills: %v", err)
+	}
+	if !GlobalConfig.SkillsDisabled {
+		t.Fatal("global Skill switch was not disabled")
+	}
+	if _, err := ManageConfig(map[string]string{"config_path": path, "action": "enable_skills"}); err != nil {
+		t.Fatalf("enable_skills: %v", err)
+	}
+	if GlobalConfig.SkillsDisabled {
+		t.Fatal("global Skill switch was not enabled")
+	}
+}
+
+func TestManageConfigEnablesOnlyOneSkillAtomically(t *testing.T) {
+	old := GlobalConfig
+	defer func() { GlobalConfig = old }()
+
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	initial := "skills_disabled: true\ndisabled_skills:\n  - stale-skill\n  - fofamap\n"
+	if err := os.WriteFile(path, []byte(initial), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, err := ManageConfig(map[string]string{
+		"config_path":      path,
+		"action":           "enable_only_skill",
+		"name":             "FOFAMAP",
+		"available_skills": "fofamap\nfun-brainstorming\nlog-audit",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "仅启用 Skill: FOFAMAP") {
+		t.Fatalf("unexpected result: %s", out)
+	}
+	if GlobalConfig.SkillsDisabled {
+		t.Fatal("only must also turn on the global Skill switch")
+	}
+	doc, _, err := loadConfigNode(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := readScalarSeq(ensureConfigRoot(doc), "disabled_skills")
+	for _, want := range []string{"stale-skill", "fun-brainstorming", "log-audit"} {
+		if !containsStringFold(got, want) {
+			t.Fatalf("disabled_skills=%#v missing %q", got, want)
+		}
+	}
+	if containsStringFold(got, "fofamap") {
+		t.Fatalf("selected Skill remained disabled: %#v", got)
 	}
 }
 

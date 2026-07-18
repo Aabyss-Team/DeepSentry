@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -157,12 +158,38 @@ func validateMCPServers(servers []MCPServerConfig) error {
 		}
 		seen[name] = true
 		serverType := strings.ToLower(strings.TrimSpace(server.Type))
-		if serverType != "" && serverType != "stdio" {
-			return fmt.Errorf("mcp_server_configs[%d].type=%q 暂不支持；当前仅支持 stdio", i, server.Type)
+		if serverType == "" {
+			serverType = "stdio"
 		}
-		if strings.TrimSpace(server.Command) == "" {
-			return fmt.Errorf("mcp_server_configs[%d].command 不能为空", i)
+		switch serverType {
+		case "stdio":
+			if strings.TrimSpace(server.Command) == "" {
+				return fmt.Errorf("mcp_server_configs[%d].command 不能为空", i)
+			}
+		case "http", "streamable_http":
+			parsed, err := url.Parse(strings.TrimSpace(server.URL))
+			if err != nil || parsed.Host == "" || (parsed.Scheme != "https" && !(parsed.Scheme == "http" && isLoopbackHost(parsed.Hostname()))) {
+				return fmt.Errorf("mcp_server_configs[%d].url 必须使用 HTTPS；仅 localhost/回环地址允许 HTTP", i)
+			}
+		default:
+			return fmt.Errorf("mcp_server_configs[%d].type=%q 暂不支持；可用 stdio/http/streamable_http", i, server.Type)
+		}
+		if server.StartupTimeoutSec < 0 || server.StartupTimeoutSec > 300 || server.ToolTimeoutSec < 0 || server.ToolTimeoutSec > 3600 {
+			return fmt.Errorf("mcp_server_configs[%d] timeout 超出允许范围", i)
+		}
+		if tokenEnv := strings.TrimSpace(server.BearerTokenEnvVar); tokenEnv != "" && !regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`).MatchString(tokenEnv) {
+			return fmt.Errorf("mcp_server_configs[%d].bearer_token_env_var 不是合法环境变量名", i)
+		}
+		for key, value := range server.Headers {
+			if strings.TrimSpace(key) == "" || strings.ContainsAny(key+value, "\r\n") {
+				return fmt.Errorf("mcp_server_configs[%d].headers 包含无效请求头", i)
+			}
 		}
 	}
 	return nil
+}
+
+func isLoopbackHost(host string) bool {
+	host = strings.ToLower(strings.TrimSpace(host))
+	return host == "localhost" || host == "127.0.0.1" || host == "::1"
 }

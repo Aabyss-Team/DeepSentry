@@ -17,6 +17,8 @@ type Store struct {
 	mu   sync.Mutex
 }
 
+var storeFileMu sync.Mutex
+
 func NewStore(path string) *Store {
 	path = strings.TrimSpace(path)
 	if path == "" {
@@ -26,34 +28,70 @@ func NewStore(path string) *Store {
 }
 
 func (s *Store) Load() ([]Task, error) {
+	storeFileMu.Lock()
+	defer storeFileMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.loadUnlocked()
 }
 
 func (s *Store) Save(tasks []Task) error {
+	storeFileMu.Lock()
+	defer storeFileMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.saveUnlocked(tasks)
 }
 
 func (s *Store) Add(task Task) error {
+	_, created, err := s.AddUnique(task)
+	if err != nil {
+		return err
+	}
+	if !created {
+		return fmt.Errorf("等价定时任务已存在")
+	}
+	return nil
+}
+
+// AddUnique makes schedule creation idempotent. Re-submitting the same prompt
+// and schedule returns the existing task instead of writing another job.
+func (s *Store) AddUnique(task Task) (existing Task, created bool, err error) {
+	storeFileMu.Lock()
+	defer storeFileMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	tasks, err := s.loadUnlocked()
 	if err != nil {
-		return err
+		return Task{}, false, err
 	}
 	for _, existing := range tasks {
 		if existing.ID == task.ID {
-			return fmt.Errorf("任务 ID 已存在: %s", task.ID)
+			return existing, false, nil
+		}
+		if equivalentTask(existing, task) {
+			return existing, false, nil
 		}
 	}
 	tasks = append(tasks, task)
-	return s.saveUnlocked(tasks)
+	if err := s.saveUnlocked(tasks); err != nil {
+		return Task{}, false, err
+	}
+	return task, true, nil
+}
+
+func equivalentTask(a, b Task) bool {
+	normalize := func(s string) string { return strings.Join(strings.Fields(strings.ToLower(s)), " ") }
+	return normalize(a.Prompt) == normalize(b.Prompt) &&
+		a.Kind == b.Kind && a.RunAt.Equal(b.RunAt) && a.Timezone == b.Timezone &&
+		a.Repeat == b.Repeat && a.Weekday == b.Weekday && a.IntervalSec == b.IntervalSec &&
+		normalize(a.Selector) == normalize(b.Selector) && normalize(a.Notify) == normalize(b.Notify) &&
+		a.AllowBatch == b.AllowBatch
 }
 
 func (s *Store) Remove(id string) (Task, bool, error) {
+	storeFileMu.Lock()
+	defer storeFileMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	tasks, err := s.loadUnlocked()
@@ -78,6 +116,8 @@ func (s *Store) Remove(id string) (Task, bool, error) {
 }
 
 func (s *Store) Update(task Task) error {
+	storeFileMu.Lock()
+	defer storeFileMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	tasks, err := s.loadUnlocked()

@@ -50,6 +50,45 @@ func TestCheckpointRedactsConfiguredSecrets(t *testing.T) {
 	}
 }
 
+func TestCheckpointStructuralRedactionPreservesValidJSONAndLongText(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	store, err := NewCheckpointStore("session_structural_redaction")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Redacting the serialized form of this value used to consume the escaped
+	// quote after foo and leave syntactically invalid JSON.
+	content := "<!doctype html>\n<head>HEAD_MARKER</head>\npassword=foo\"bar\\baz\n<body>MIDDLE_MARKER</body>\n</html> TAIL_MARKER"
+	if err := store.Save(CheckpointData{
+		State:   NewAgentState(""),
+		History: []analyzer.Message{{Role: "user", Content: content}},
+	}); err != nil {
+		t.Fatalf("save structurally redacted checkpoint: %v", err)
+	}
+	raw, err := os.ReadFile(store.SessionDir() + "/checkpoint.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !json.Valid(raw) {
+		t.Fatalf("checkpoint must remain valid JSON:\n%s", raw)
+	}
+	if strings.Contains(string(raw), "password=foo") {
+		t.Fatalf("checkpoint leaked credential: %s", raw)
+	}
+	loaded, err := LoadCheckpoint("session_structural_redaction")
+	if err != nil {
+		t.Fatalf("load structurally redacted checkpoint: %v", err)
+	}
+	if len(loaded.History) != 1 {
+		t.Fatalf("history length=%d", len(loaded.History))
+	}
+	for _, marker := range []string{"HEAD_MARKER", "MIDDLE_MARKER", "TAIL_MARKER", "</html>"} {
+		if !strings.Contains(loaded.History[0].Content, marker) {
+			t.Fatalf("redaction lost %q from long text: %q", marker, loaded.History[0].Content)
+		}
+	}
+}
+
 func TestSessionSummariesSortNewestFirst(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	olderID := "session_100"

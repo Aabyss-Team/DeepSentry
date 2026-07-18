@@ -372,6 +372,9 @@ func renderMarkdownTableStacked(rows [][]string, width int) []string {
 	if len(data) == 0 {
 		data = rows[:1]
 	}
+	if isMarkdownLabelValueTable(headers) {
+		return renderMarkdownLabelValueRows(data, width)
+	}
 	out := make([]string, 0, len(data))
 	for _, row := range data {
 		parts := make([]string, 0, len(headers))
@@ -383,6 +386,64 @@ func renderMarkdownTableStacked(rows [][]string, width int) []string {
 			parts = append(parts, header+": "+value)
 		}
 		out = append(out, strings.Split(wrapDisplay(strings.Join(parts, " · "), max(1, width)), "\n")...)
+	}
+	return out
+}
+
+// isMarkdownLabelValueTable identifies the common two-column summary shape
+// emitted by models, for example "项目 | 内容" or "字段 | 值". Repeating
+// those generic headers for every stacked row produces mechanical text such
+// as "项目: 任务成果 · 内容: ...". The first data cell is already the useful
+// label, so render it as a definition-style list instead.
+func isMarkdownLabelValueTable(headers []string) bool {
+	if len(headers) != 2 {
+		return false
+	}
+	left := strings.ToLower(strings.TrimSpace(headers[0]))
+	right := strings.ToLower(strings.TrimSpace(headers[1]))
+	leftLabels := map[string]bool{
+		"项目": true, "字段": true, "名称": true, "属性": true, "类别": true, "类型": true,
+		"item": true, "field": true, "name": true, "property": true, "category": true, "type": true,
+	}
+	rightLabels := map[string]bool{
+		"内容": true, "值": true, "说明": true, "详情": true, "描述": true, "结果": true,
+		"content": true, "value": true, "details": true, "description": true, "result": true,
+	}
+	return leftLabels[left] && rightLabels[right]
+}
+
+func renderMarkdownLabelValueRows(rows [][]string, width int) []string {
+	width = max(1, width)
+	out := make([]string, 0, len(rows))
+	for _, row := range rows {
+		label := ""
+		value := ""
+		if len(row) > 0 {
+			label = strings.TrimSpace(row[0])
+		}
+		if len(row) > 1 {
+			value = strings.TrimSpace(row[1])
+		}
+		if label == "" && value == "" {
+			continue
+		}
+		prefix := "• "
+		if label != "" {
+			prefix += label + "："
+		}
+		if value == "" {
+			out = append(out, mdListMarker.Render("•")+" "+mdTableHeader.Render(label))
+			continue
+		}
+		bodyWidth := max(1, width-displayWidth(prefix))
+		wrapped := strings.Split(wrapDisplay(value, bodyWidth), "\n")
+		for i, line := range wrapped {
+			if i == 0 {
+				out = append(out, mdListMarker.Render("•")+" "+mdTableHeader.Render(label+"：")+line)
+				continue
+			}
+			out = append(out, strings.Repeat(" ", displayWidth(prefix))+line)
+		}
 	}
 	return out
 }

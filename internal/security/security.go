@@ -382,6 +382,9 @@ func lowRiskCommandWithDangerousArgs(verb string, args []string) string {
 			return fmt.Sprintf("%s 原地修改文件", verb)
 		}
 		if verb == "curl" {
+			if lower == "--insecure" || strings.HasPrefix(lower, "--insecure=") || curlShortOptionsContainInsecure(lower) {
+				return "curl 跳过 TLS 证书验证，可能被中间人篡改"
+			}
 			if lower == "-o" || lower == "--output" || lower == "-O" || strings.HasPrefix(lower, "--output=") {
 				return "curl 下载写入文件"
 			}
@@ -409,6 +412,14 @@ func lowRiskCommandWithDangerousArgs(verb string, args []string) string {
 		}
 	}
 	return ""
+}
+
+func curlShortOptionsContainInsecure(arg string) bool {
+	if len(arg) < 2 || arg[0] != '-' || strings.HasPrefix(arg, "--") {
+		return false
+	}
+	// curl's -k disables verification while uppercase -K means --config.
+	return strings.Contains(arg[1:], "k")
 }
 
 func isDangerousToken(token string) bool {

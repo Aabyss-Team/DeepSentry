@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"ai-edr/internal/analyzer"
+	"ai-edr/internal/builtin"
 	"ai-edr/internal/collector"
 	"ai-edr/internal/config"
 	"ai-edr/internal/executor"
@@ -41,6 +42,7 @@ func main() {
 	enableWindowsANSI()
 	defer ui.ResetTerminalState()
 	defer mcp.CloseAll()
+	defer builtin.CloseBrowserSessions()
 
 	// 🟢 [核心增强] 强制设置 Windows 控制台代码页为 UTF-8
 	// 这解决了即便开启了 ANSI 渲染，底层系统命令输出依然可能坚持使用 GBK 的问题

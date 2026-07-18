@@ -428,22 +428,112 @@ func extractClarificationQuestion(raw string) string {
 		return ""
 	}
 	lower := strings.ToLower(text)
-	needles := []string{
-		"请提供", "请告诉", "需要您", "需要你", "我需要", "需要确认", "请确认",
-		"webhook", "url", "token", "地址", "选项", "选择", "？", "?",
+	// Plain-text recovery must be deliberately conservative. A final answer
+	// often contains rhetorical questions, words such as “需要/选择/地址”, or
+	// URLs; those signals alone do not mean the user must provide anything.
+	// Prefer explicit missing-information requests, plus short direct questions.
+	strongRequests := []string{
+		"请提供", "请补充", "请告诉", "请告知", "请确认", "请填写", "请给出", "请选择", "请回答",
+		"麻烦提供", "需要您提供", "需要你提供", "还缺少", "缺少必要", "缺少以下", "无法继续", "才能继续",
+		"please provide", "please tell", "please confirm", "please choose", "please answer",
+		"need you to provide", "missing required", "cannot continue", "before i can continue",
 	}
-	for _, n := range needles {
-		if strings.Contains(text, n) || strings.Contains(lower, n) {
-			if len([]rune(text)) > 4000 {
-				return string([]rune(text)[:4000]) + "\n...(内容过长已截断)..."
+	for _, marker := range strongRequests {
+		if strings.Contains(text, marker) || strings.Contains(lower, marker) {
+			return truncateClarificationQuestion(text)
+		}
+	}
+	if looksLikeInteractiveChoicePrompt(text) {
+		return truncateClarificationQuestion(text)
+	}
+
+	runes := []rune(text)
+	if len(runes) <= 240 && strings.Count(text, "\n") <= 3 && endsAsQuestion(text) {
+		questionWords := []string{
+			"什么", "哪个", "哪一个", "哪种", "是否", "还是", "多少", "哪里", "何时", "什么时候", "怎么", "如何", "能否", "要不要", "可以吗",
+			"what", "which", "where", "when", "how", "would you", "do you", "can you", "should i",
+		}
+		for _, marker := range questionWords {
+			if strings.Contains(text, marker) || strings.Contains(lower, marker) {
+				return text
 			}
-			return text
 		}
 	}
 	return ""
 }
 
+func looksLikeInteractiveChoicePrompt(text string) bool {
+	lower := strings.ToLower(strings.TrimSpace(text))
+	if lower == "" {
+		return false
+	}
+	// An ask_user action is already a strong protocol signal. These phrases
+	// distinguish an actionable choice/request from a rhetorical question in a
+	// long conclusion, even when playful prose follows the final question mark.
+	for _, marker := range []string{
+		"请选", "选一个", "选一项", "选哪", "想选", "想要哪", "你选", "您选", "翻牌",
+		"回复序号", "回复编号", "输入序号", "输入编号", "请回复", "告诉我你的选择", "告诉我您的选择",
+		"choose one", "pick one", "select one", "which option", "reply with", "enter the number",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+
+	// Menu-shaped asks often carry the question near the top and end with a
+	// friendly sentence. Require both a question and explicit menu/option
+	// language so ordinary reports containing lists do not become prompts.
+	hasQuestion := strings.Contains(text, "？") || strings.Contains(text, "?")
+	hasMenu := false
+	for _, marker := range []string{"菜单", "选项", "可选", "请选择以下", "options", "choices", "menu"} {
+		if strings.Contains(lower, marker) {
+			hasMenu = true
+			break
+		}
+	}
+	return hasQuestion && hasMenu && choiceLineCount(text) >= 2
+}
+
+func choiceLineCount(text string) int {
+	count := 0
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "-") || strings.HasPrefix(line, "*") || strings.HasPrefix(line, "•") {
+			count++
+			continue
+		}
+		runes := []rune(line)
+		if len(runes) >= 2 && runes[0] >= '0' && runes[0] <= '9' && (runes[1] == '.' || runes[1] == ')' || runes[1] == '、') {
+			count++
+			continue
+		}
+		// Emoji-led menu rows in conversational Skills commonly use " — " or
+		// " - " instead of Markdown bullets.
+		if strings.Contains(line, " — ") || strings.Contains(line, " - ") {
+			count++
+		}
+	}
+	return count
+}
+
+func endsAsQuestion(text string) bool {
+	text = strings.TrimSpace(text)
+	return strings.HasSuffix(text, "？") || strings.HasSuffix(text, "?")
+}
+
+func truncateClarificationQuestion(text string) string {
+	runes := []rune(strings.TrimSpace(text))
+	if len(runes) > 1200 {
+		return string(runes[:1200]) + "\n...(问题背景过长已截断)..."
+	}
+	return string(runes)
+}
+
 func finalizeResponse(resp AgentResponse) AgentResponse {
+	resp = normalizeResponseSemantics(resp)
 	if resp.Command != "" {
 		realRisk, realReason := security.CheckRisk(resp.Command)
 		resp.RiskLevel = realRisk
@@ -459,6 +549,75 @@ func finalizeResponse(resp AgentResponse) AgentResponse {
 		}
 	}
 	return resp
+}
+
+func normalizeResponseSemantics(resp AgentResponse) AgentResponse {
+	action := strings.ToLower(strings.TrimSpace(resp.Action))
+	if action == "ask_user" {
+		question := strings.TrimSpace(resp.Question)
+		if question == "" {
+			question = strings.TrimSpace(resp.Thought)
+		}
+		// In an explicit ask_user envelope, a trailing question mark remains
+		// actionable regardless of length. The stricter extractor is shared with
+		// untyped plain-text recovery, where rhetorical questions need more care.
+		validAsk := len(nonEmptyStrings(resp.Options)) > 0 || extractClarificationQuestion(question) != "" || endsAsQuestion(question)
+		if validAsk {
+			resp.Action = "ask_user"
+			resp.Question = question
+			resp.IsFinished = false
+			resp.FinalReport = ""
+			return resp
+		}
+		// A substantial non-question payload is a user-facing answer that the
+		// provider put in the wrong field. Present it instead of opening an
+		// input panel that has nothing actionable to answer.
+		payload := firstNonEmptyString(resp.FinalReport, resp.Question)
+		if len([]rune(payload)) >= 160 || strings.Count(payload, "\n") >= 3 {
+			resp.Action = "finish"
+			resp.IsFinished = true
+			resp.FinalReport = payload
+			resp.Question = ""
+			resp.Options = nil
+			resp.Thought = "模型把总结误标为 ask_user，已自动按最终报告呈现。"
+			return resp
+		}
+		// Short malformed asks should be retried, not shown as a fake prompt.
+		resp.Action = ""
+		resp.Question = ""
+		resp.Options = nil
+		resp.Thought = "ask_user 未包含明确可回答的问题，正在自动请求模型改正。"
+		return resp
+	}
+
+	if action == "think" || action == "thinking" || action == "analysis" || action == "reflect" {
+		// These are provider-side narration aliases, never executable actions.
+		// A long answer-like payload can finish directly; a short thought asks
+		// the next model turn for a real action without rendering a fake tool.
+		payload := firstNonEmptyString(resp.FinalReport, resp.Question, resp.Thought)
+		if strings.TrimSpace(resp.FinalReport) != "" || len([]rune(payload)) >= 240 || strings.Count(payload, "\n") >= 4 {
+			resp.Action = "finish"
+			resp.IsFinished = true
+			resp.FinalReport = payload
+			resp.Question = ""
+			resp.Options = nil
+			resp.Thought = "模型使用了非标准总结动作，已自动按最终报告呈现。"
+			return resp
+		}
+		resp.Action = ""
+		resp.Thought = "模型只返回了思考过程，正在自动请求可执行动作或最终报告。"
+	}
+	return resp
+}
+
+func nonEmptyStrings(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			out = append(out, value)
+		}
+	}
+	return out
 }
 
 const (
@@ -991,7 +1150,11 @@ func parseToolArgs(raw map[string]interface{}) map[string]string {
 		case bool:
 			out[k] = fmt.Sprintf("%v", val)
 		default:
-			out[k] = fmt.Sprintf("%v", v)
+			if encoded, err := json.Marshal(v); err == nil {
+				out[k] = string(encoded)
+			} else {
+				out[k] = fmt.Sprintf("%v", v)
+			}
 		}
 	}
 	return out

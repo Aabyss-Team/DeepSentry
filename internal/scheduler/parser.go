@@ -13,12 +13,16 @@ import (
 
 var (
 	relativeAfterRE = regexp.MustCompile(`(?i)(\d+)\s*(分钟|分|小时|时|天|日)\s*后`)
-	clockRE         = regexp.MustCompile(`(凌晨|早上|上午|中午|下午|晚上|今晚)?\s*(\d{1,2})(?:[:：点时]\s*(\d{1,2})?)\s*(?:分)?`)
+	clockColonRE    = regexp.MustCompile(`(凌晨|早上|上午|中午|下午|晚上|今晚)?\s*(\d{1,2})[:：]\s*(\d{2})`)
+	clockPointRE    = regexp.MustCompile(`(凌晨|早上|上午|中午|下午|晚上|今晚)?\s*(\d{1,2})[点时]\s*(\d{1,2})?\s*(?:分)?`)
 	markerClockRE   = regexp.MustCompile(`(凌晨|早上|上午|中午|下午|晚上|今晚)\s*(\d{1,2})(?:\s*(\d{1,2})\s*分)?`)
 	ymdRE           = regexp.MustCompile(`(\d{4})[-/年](\d{1,2})[-/月](\d{1,2})日?`)
 	mdRE            = regexp.MustCompile(`(\d{1,2})月(\d{1,2})[日号]?`)
 	intervalRE      = regexp.MustCompile(`每(?:隔)?\s*(\d+)\s*(分钟|分|小时|时|天|日)`)
 	ipPortRE        = regexp.MustCompile(`\b(?:\d{1,3}\.){3}\d{1,3}:\d{2,5}\b`)
+	questionRE      = regexp.MustCompile(`(?i)(?:^|[\s*_#])q\d+\s*[:：]`)
+	hashAnswerRE    = regexp.MustCompile(`(?i)\b[0-9a-f]{32}(?:[0-9a-f]{8}|[0-9a-f]{32})?\b`)
+	logTimestampRE  = regexp.MustCompile(`(?m)^\s*(?:\[?\d{1,2}:\d{2}:\d{2}\]?|\d{4}[-/]\d{1,2}[-/]\d{1,2})`)
 )
 
 func PlanTask(input PlanInput, now time.Time) (Plan, error) {
@@ -118,36 +122,101 @@ func ParseNaturalAt(text string, now time.Time, loc *time.Location) (Task, []str
 }
 
 func LooksLikeSchedule(text string) bool {
+	ok, _ := DetectScheduleIntent(text)
+	return ok
+}
+
+// DetectScheduleIntent is deliberately conservative because a positive result
+// takes the native mutation path and persists a job without an LLM round-trip.
+// Time words plus generic verbs are not enough: the user must also express a
+// scheduling request, a relative delay, or a recurring cadence.
+func DetectScheduleIntent(text string) (bool, string) {
 	text = strings.TrimSpace(text)
 	if text == "" {
-		return false
+		return false, "空输入"
 	}
 	if looksLikeAnswerOrMaliciousArtifact(text) {
-		return false
+		return false, "更像答案、日志或取证材料"
 	}
-	hasTime := false
-	for _, n := range []string{"明天", "后天", "今天", "每天", "每日", "每周", "每星期", "每礼拜", "每隔", "分钟后", "小时后", "天后"} {
-		if strings.Contains(text, n) {
-			hasTime = true
-			break
-		}
+	hasTime := containsAny(text, "明天", "后天", "今天", "今晚", "每天", "每日", "每周", "每星期", "每礼拜", "每隔", "分钟后", "小时后", "天后")
+	if !hasTime && (ymdRE.MatchString(text) || mdRE.MatchString(text)) {
+		hasTime = true
 	}
 	if !hasTime {
 		_, _, hasTime = extractClock(text)
 	}
 	if !hasTime {
-		return false
+		return false, "未识别到可靠的未来时间"
 	}
-	for _, n := range []string{"帮我", "提醒", "巡检", "检查", "执行", "运行", "跑", "生成", "报告", "通知", "发送", "发钉钉", "钉钉", "飞书", "邮件", "邮箱", "email", "mail"} {
-		if strings.Contains(text, n) {
+	hasTask := containsAny(strings.ToLower(text), "提醒", "巡检", "检查", "执行", "运行", "跑", "生成", "备份", "汇总", "总结", "同步", "通知", "发送", "发钉钉", "钉钉", "飞书", "邮件", "邮箱", "email", "mail")
+	if !hasTask {
+		return false, "未识别到要调度的任务"
+	}
+
+	lower := strings.ToLower(text)
+	explicit := containsAny(lower, "创建定时任务", "添加定时任务", "设置定时任务", "定时执行", "定时运行", "设置提醒", "设个提醒", "提醒我", "帮我提醒", "安排在", "计划在", "到点提醒", "schedule", "remind me")
+	requested := containsAny(lower, "帮我", "请帮我", "请在", "请于", "请明天", "请后天", "麻烦在", "麻烦帮我", "我要你", "我想让你")
+	relative := relativeAfterRE.MatchString(text) || strings.Contains(text, "半小时后")
+	recurring := containsAny(text, "每天", "每日", "每周", "每星期", "每礼拜", "每隔")
+	trimmed := strings.TrimSpace(text)
+	directRelative := relative && startsWithRelativeTime(trimmed) && !containsAny(text, "结果", "显示", "记录", "日志", "会在", "已经")
+	directRecurring := recurring && hasAnyPrefix(trimmed, "每天", "每日", "每周", "每星期", "每礼拜", "每隔") && !containsAny(text, "会在", "已经", "原本", "当前", "日志显示", "配置为", "脚本在", "程序在")
+	if explicit || requested || directRelative || directRecurring {
+		reason := "显式调度请求"
+		switch {
+		case recurring:
+			reason = "显式重复周期"
+		case relative:
+			reason = "显式相对延时"
+		}
+		return true, reason
+	}
+	return false, "只出现了时间和动作词，没有明确要求创建调度"
+}
+
+func containsAny(text string, needles ...string) bool {
+	for _, needle := range needles {
+		if strings.Contains(text, needle) {
 			return true
 		}
 	}
 	return false
 }
 
+func hasAnyPrefix(text string, prefixes ...string) bool {
+	for _, prefix := range prefixes {
+		if strings.HasPrefix(text, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func startsWithRelativeTime(text string) bool {
+	if strings.HasPrefix(text, "半小时后") {
+		return true
+	}
+	idx := relativeAfterRE.FindStringIndex(text)
+	return len(idx) == 2 && idx[0] == 0
+}
+
 func looksLikeAnswerOrMaliciousArtifact(text string) bool {
 	lower := strings.ToLower(text)
+	// Security challenge answers often contain labels such as "Q10：", an
+	// answer marker and a hash.  They may also contain words like "执行", which
+	// are schedule action verbs, so reject this shape before looking for time.
+	if questionRE.MatchString(text) && (strings.Contains(text, "答案") || strings.Contains(lower, "answer")) {
+		return true
+	}
+	if hashAnswerRE.MatchString(text) && (strings.Contains(text, "答案") || strings.Contains(lower, "md5") || strings.Contains(lower, "sha")) {
+		return true
+	}
+	if strings.Count(text, "\n") >= 3 && !containsAny(lower, "创建定时任务", "设置定时任务", "设置提醒", "schedule", "remind me") {
+		return true
+	}
+	if logTimestampRE.MatchString(text) || strings.Contains(text, "HTTP/1.") || strings.Contains(text, "```") {
+		return true
+	}
 	if ipPortRE.MatchString(text) {
 		for _, needle := range []string{"回连", "反连", "reverse shell", "callback", "connect back", "提交", "答案", "flag"} {
 			if strings.Contains(lower, needle) || strings.Contains(text, needle) {
@@ -177,23 +246,35 @@ func parseRunTime(raw string, now time.Time, loc *time.Location, repeat string, 
 	}
 	if m := relativeAfterRE.FindStringSubmatch(raw); len(m) == 3 {
 		n, _ := strconv.Atoi(m[1])
+		if n <= 0 {
+			return time.Time{}, nil, fmt.Errorf("相对时间必须大于 0")
+		}
 		d := durationForUnit(n, m[2])
 		return now.Add(d), []string{"已识别相对时间: " + m[0]}, nil
 	}
 
 	date := dateFromWords(raw, now)
+	explicitDate := containsAny(raw, "今天", "今晚", "明天", "后天")
 	if ymd := ymdRE.FindStringSubmatch(raw); len(ymd) == 4 {
 		y, _ := strconv.Atoi(ymd[1])
 		mon, _ := strconv.Atoi(ymd[2])
 		day, _ := strconv.Atoi(ymd[3])
 		date = time.Date(y, time.Month(mon), day, 0, 0, 0, 0, loc)
+		if date.Year() != y || int(date.Month()) != mon || date.Day() != day {
+			return time.Time{}, nil, fmt.Errorf("无效日期: %s", ymd[0])
+		}
+		explicitDate = true
 	} else if md := mdRE.FindStringSubmatch(raw); len(md) == 3 {
 		mon, _ := strconv.Atoi(md[1])
 		day, _ := strconv.Atoi(md[2])
 		date = time.Date(now.Year(), time.Month(mon), day, 0, 0, 0, 0, loc)
+		if int(date.Month()) != mon || date.Day() != day {
+			return time.Time{}, nil, fmt.Errorf("无效日期: %s", md[0])
+		}
 		if date.Before(now) {
 			date = date.AddDate(1, 0, 0)
 		}
+		explicitDate = true
 	} else if repeat == RepeatWeekly {
 		date = nextWeekday(now, weekday)
 	}
@@ -204,6 +285,9 @@ func parseRunTime(raw string, now time.Time, loc *time.Location, repeat string, 
 	}
 	runAt := time.Date(date.Year(), date.Month(), date.Day(), hour, minute, 0, 0, loc)
 	if !runAt.After(now) {
+		if repeat == RepeatOnce && explicitDate {
+			return time.Time{}, nil, fmt.Errorf("执行时间已过去: %s", runAt.Format(time.RFC3339))
+		}
 		runAt = advanceRepeat(runAt, now, repeat, intervalSec)
 	}
 	if !runAt.After(now) {
@@ -249,14 +333,11 @@ func extractClock(raw string) (int, int, bool) {
 		end   int
 	}
 	matches := []clockMatch{}
-	for _, idx := range clockRE.FindAllStringSubmatchIndex(raw, -1) {
-		if len(idx) >= 2 {
-			matches = append(matches, clockMatch{parts: clockRE.FindStringSubmatch(raw[idx[0]:idx[1]]), start: idx[0], end: idx[1]})
-		}
-	}
-	for _, idx := range markerClockRE.FindAllStringSubmatchIndex(raw, -1) {
-		if len(idx) >= 2 {
-			matches = append(matches, clockMatch{parts: markerClockRE.FindStringSubmatch(raw[idx[0]:idx[1]]), start: idx[0], end: idx[1]})
+	for _, re := range []*regexp.Regexp{clockColonRE, clockPointRE, markerClockRE} {
+		for _, idx := range re.FindAllStringSubmatchIndex(raw, -1) {
+			if len(idx) >= 2 {
+				matches = append(matches, clockMatch{parts: re.FindStringSubmatch(raw[idx[0]:idx[1]]), start: idx[0], end: idx[1]})
+			}
 		}
 	}
 	for _, m := range matches {
@@ -293,7 +374,7 @@ func extractClock(raw string) (int, int, bool) {
 func clockMatchIsEmbedded(raw string, start, end int) bool {
 	if start > 0 {
 		prev := raw[start-1]
-		if (prev >= '0' && prev <= '9') || prev == '.' || prev == ':' {
+		if (prev >= '0' && prev <= '9') || (prev >= 'a' && prev <= 'z') || (prev >= 'A' && prev <= 'Z') || prev == '_' || prev == '.' || prev == ':' {
 			return true
 		}
 	}

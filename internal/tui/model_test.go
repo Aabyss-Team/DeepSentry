@@ -2,16 +2,21 @@ package tui
 
 import (
 	"ai-edr/internal/analyzer"
+	"ai-edr/internal/config"
 	"ai-edr/internal/harness"
+	"ai-edr/internal/skills"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/spf13/viper"
 )
 
 func TestRestoreConversationHistoryShowsDialogueWithoutToolFeedback(t *testing.T) {
@@ -132,6 +137,220 @@ func TestSlashCommandRestoresViewportAfterSuggestionMenu(t *testing.T) {
 	}
 	if m.viewport.Height <= withMenu {
 		t.Fatalf("viewport height remained reserved for closed suggestions: before=%d after=%d", withMenu, m.viewport.Height)
+	}
+}
+
+func TestSkillListSlashRefreshesAndRendersActualResult(t *testing.T) {
+	m := NewAgentModel(nil, "model", "local", 30, true, false, StartupInfo{})
+	m.width, m.height = 100, 24
+	m.recalcLayout()
+	m.refreshViewport()
+	m.input.SetValue("/skill list")
+	m.input.SetCursor(len([]rune(m.input.Value())))
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(AgentModel)
+	if cmd != nil {
+		t.Fatal("/skill list should complete synchronously")
+	}
+	if m.input.Value() != "" {
+		t.Fatalf("submitted slash command should clear input, got %q", m.input.Value())
+	}
+	if len(m.lines) == 0 || m.lines[len(m.lines)-1].kind != "result" {
+		t.Fatalf("/skill list did not append a result: %#v", m.lines)
+	}
+	if m.lines[len(m.lines)-1].content != m.lines[len(m.lines)-1].raw {
+		t.Fatalf("skill list stored command text as result detail: %#v", m.lines[len(m.lines)-1])
+	}
+	view := stripANSIForTest(m.viewport.View())
+	if !strings.Contains(view, "当前没有发现 Skill") {
+		t.Fatalf("/skill list result was not refreshed into the viewport:\n%s", view)
+	}
+	if strings.Contains(view, "└ skill list") {
+		t.Fatalf("viewport rendered the command name instead of its result:\n%s", view)
+	}
+}
+
+func TestSkillListSlashReturnsScrolledViewToResult(t *testing.T) {
+	m := NewAgentModel(nil, "model", "local", 30, true, false, StartupInfo{})
+	m.width, m.height = 80, 18
+	m.recalcLayout()
+	for i := 0; i < 60; i++ {
+		m.appendLine("info", fmt.Sprintf("old output %02d", i), "")
+	}
+	m.refreshViewport()
+	m.autoScroll = false
+	m.viewport.GotoTop()
+	if m.viewport.AtBottom() {
+		t.Fatal("test setup must start away from the live tail")
+	}
+	m.input.SetValue("/skill list")
+	m.input.SetCursor(len([]rune(m.input.Value())))
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(AgentModel)
+	if cmd != nil {
+		t.Fatal("/skill list should complete synchronously")
+	}
+	if !m.autoScroll || !m.viewport.AtBottom() {
+		t.Fatalf("slash submission did not return to live tail: auto=%v offset=%d", m.autoScroll, m.viewport.YOffset)
+	}
+	if view := stripANSIForTest(m.viewport.View()); !strings.Contains(view, "当前没有发现 Skill") {
+		t.Fatalf("latest slash result is not visible after submitting from scrollback:\n%s", view)
+	}
+}
+
+func TestSkillRescanDiscoversManualLandingWithoutRestart(t *testing.T) {
+	root := t.TempDir()
+	catalog, err := skills.LoadCatalog([]string{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := harness.NewAgentState(root)
+	agent := &harness.DeepAgent{Catalog: catalog, State: state}
+	m := NewAgentModel(newSessionController(SessionConfig{Agent: agent}), "model", "local", 30, true, false, StartupInfo{})
+	dir := filepath.Join(root, "landed-skill")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte("---\nname: landed-skill\ndescription: Manual landing test\n---\n# Landed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m.handleSkillSlash("rescan")
+	if _, ok := catalog.FindSkill("landed-skill"); !ok {
+		t.Fatalf("catalog after rescan=%#v", catalog.Skills)
+	}
+	m.loadCurrentSkill("LANDED-SKILL")
+	if _, ok := state.LoadedSkills["landed-skill"]; !ok {
+		t.Fatalf("loaded skills=%#v", state.LoadedSkills)
+	}
+}
+
+func TestSkillUnloadDisablesByNameEvenWhenNotLoaded(t *testing.T) {
+	oldConfig := config.GlobalConfig
+	t.Cleanup(func() {
+		config.GlobalConfig = oldConfig
+		viper.Reset()
+	})
+
+	root := t.TempDir()
+	dir := filepath.Join(root, "fun-brainstorming")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	doc := "---\nname: fun-brainstorming\ndescription: Creative workflow\n---\n# Body\n"
+	if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte(doc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(configPath, []byte("skill_sources:\n  - \""+root+"\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := config.InitConfig(configPath); err != nil {
+		t.Fatal(err)
+	}
+	catalog, err := skills.LoadCatalog([]string{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := harness.NewAgentState(root)
+	agent := &harness.DeepAgent{Catalog: catalog, State: state}
+	m := NewAgentModel(newSessionController(SessionConfig{Agent: agent}), "model", "local", 30, true, false, StartupInfo{})
+
+	m.handleSkillSlash("unload fun-brainstorming")
+	if len(state.LoadedSkills) != 0 {
+		t.Fatalf("test Skill was never loaded but state changed unexpectedly: %#v", state.LoadedSkills)
+	}
+	if !catalog.IsDisabled("FUN-BRAINSTORMING") {
+		t.Fatal("unload did not persist a name-level disable policy")
+	}
+	if _, ok := catalog.FindSkill("fun-brainstorming"); ok {
+		t.Fatal("disabled Skill remained discoverable")
+	}
+	if view := m.formatLocalSkillList(); !strings.Contains(view, "fun-brainstorming [已禁用]") {
+		t.Fatalf("disabled Skill missing from list output:\n%s", view)
+	}
+
+	m.handleSkillSlash("on fun-brainstorming")
+	if catalog.IsDisabled("fun-brainstorming") {
+		t.Fatal("/skill on did not clear the denylist")
+	}
+	if _, ok := catalog.FindSkill("fun-brainstorming"); !ok {
+		t.Fatal("/skill on did not rediscover the Skill immediately")
+	}
+
+	m.loadCurrentSkill("fun-brainstorming")
+	if len(state.LoadedSkills) != 1 {
+		t.Fatalf("failed to set up loaded Skill: %#v", state.LoadedSkills)
+	}
+	m.handleSkillSlash("off")
+	if !config.GlobalConfig.SkillsDisabled || len(catalog.Skills) != 0 || len(state.LoadedSkills) != 0 {
+		t.Fatalf("parameterless /skill off did not disable all Skills: global=%v catalog=%#v loaded=%#v", config.GlobalConfig.SkillsDisabled, catalog.Skills, state.LoadedSkills)
+	}
+	m.handleSkillSlash("on")
+	if config.GlobalConfig.SkillsDisabled {
+		t.Fatal("parameterless /skill on did not restore the global switch")
+	}
+	if _, ok := catalog.FindSkill("fun-brainstorming"); !ok {
+		t.Fatal("global /skill on did not rediscover Skills")
+	}
+}
+
+func TestSkillOnlyEnablesSelectedAndDisablesAllOtherDiscoveredSkills(t *testing.T) {
+	oldConfig := config.GlobalConfig
+	t.Cleanup(func() {
+		config.GlobalConfig = oldConfig
+		viper.Reset()
+	})
+
+	root := t.TempDir()
+	for _, name := range []string{"fofamap", "fun-brainstorming", "log-audit"} {
+		dir := filepath.Join(root, name)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		doc := fmt.Sprintf("---\nname: %s\ndescription: %s test\n---\n# %s\n", name, name, name)
+		if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte(doc), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(configPath, []byte("skills_disabled: true\nskill_sources:\n  - \""+root+"\"\ndisabled_skills:\n  - fofamap\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := config.InitConfig(configPath); err != nil {
+		t.Fatal(err)
+	}
+	catalog, err := skills.LoadCatalog([]string{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalog.ApplyDisabledSkills(config.GlobalConfig.EffectiveDisabledSkills())
+	state := harness.NewAgentState(root)
+	state.LoadedSkills = map[string]string{"fun-brainstorming": "old", "log-audit": "old"}
+	agent := &harness.DeepAgent{Catalog: catalog, State: state}
+	m := NewAgentModel(newSessionController(SessionConfig{Agent: agent}), "model", "local", 30, true, false, StartupInfo{})
+
+	m.handleSkillSlash("only fofamap")
+	if config.GlobalConfig.SkillsDisabled {
+		t.Fatal("/skill only left the global switch disabled")
+	}
+	if len(catalog.Skills) != 1 || !strings.EqualFold(catalog.Skills[0].Name, "fofamap") {
+		t.Fatalf("available Skills=%#v, want only fofamap", catalog.Skills)
+	}
+	if len(state.LoadedSkills) != 0 {
+		t.Fatalf("disabled Skills remained loaded: %#v", state.LoadedSkills)
+	}
+	for _, want := range []string{"fun-brainstorming", "log-audit"} {
+		if !catalog.IsDisabled(want) {
+			t.Fatalf("%s was not disabled", want)
+		}
+	}
+	if catalog.IsDisabled("fofamap") {
+		t.Fatal("selected Skill remained disabled")
+	}
+	if len(m.lines) == 0 || !strings.Contains(m.lines[len(m.lines)-1].content, "保留 fofamap") {
+		t.Fatalf("missing only confirmation: %#v", m.lines)
 	}
 }
 
@@ -696,6 +915,49 @@ func TestInputViewRendersFocusedInputAboveHelpLine(t *testing.T) {
 	}
 }
 
+func TestViewSelfHealsStaleViewportAndPreservesCompleteIMEInput(t *testing.T) {
+	m := NewAgentModel(nil, "provider / model", "本地模式", 50, true, false, StartupInfo{})
+	m.width, m.height = 213, 57
+	m.input.Focus()
+	m.input.SetValue("你锚点")
+	m.input.SetCursor(1)
+	for i := 0; i < 180; i++ {
+		m.appendLine("info", fmt.Sprintf("长报告内容 %03d %s", i, strings.Repeat("奥特曼资料 ", 18)), "report")
+	}
+	m.recalcLayout()
+	m.refreshViewport()
+
+	// Reproduce the failure mode from the screenshot: the viewport still
+	// carries an older/taller frame budget when the focused footer is drawn.
+	// View must repair this itself instead of relying on bottom clipping.
+	m.viewport.Height = m.height
+	view := m.View()
+	if got := lipgloss.Height(view); got != m.height {
+		t.Fatalf("rendered frame height=%d, want terminal height=%d", got, m.height)
+	}
+	plain := stripANSIForTest(view)
+	row, col, ok := renderedMarkerPosition(plain, "锚点")
+	if !ok {
+		t.Fatalf("focused Chinese input disappeared from the footer:\n%s", plain)
+	}
+	lines := strings.Split(plain, "\n")
+	if row < 2 || row+1 >= len(lines) {
+		t.Fatalf("input row %d does not leave room for both borders/help (frame rows=%d)", row, len(lines))
+	}
+	topBorder := strings.Contains(lines[row-2], "╭") || strings.Contains(lines[row-2], "+-")
+	bottomBorder := strings.Contains(lines[row], "╰") || strings.Contains(lines[row], "+-")
+	if !topBorder || !bottomBorder {
+		t.Fatalf("input box is incomplete around row %d: top=%q content=%q bottom=%q", row, lines[row-2], lines[row-1], lines[row])
+	}
+	if !strings.Contains(lines[row+1], "Enter 发送") {
+		t.Fatalf("input help line was clipped: %q", lines[row+1])
+	}
+	anchorRow, anchorCol, mode := m.cursorAnchor.snapshot()
+	if mode != cursorAnchorVisible || anchorRow != row || anchorCol != col {
+		t.Fatalf("IME anchor=%d,%d mode=%d; rendered cursor cell=%d,%d", anchorRow, anchorCol, mode, row, col)
+	}
+}
+
 func TestFocusedInputCursorAnchorUsesDisplayColumns(t *testing.T) {
 	m := NewAgentModel(nil, "model", "local", 30, true, false, StartupInfo{})
 	m.width = 80
@@ -776,8 +1038,275 @@ func TestLargePasteStillUsesSummaryInsteadOfExpandingInput(t *testing.T) {
 	if len(rows) > 2 {
 		t.Fatalf("large paste summary should stay compact, rows=%d text=%q", len(rows), stripANSIForTest(strings.Join(rows, "\n")))
 	}
-	if !strings.Contains(m.input.Value(), "已粘贴") {
-		t.Fatalf("large paste should keep summary, got %q", m.input.Value())
+	if m.input.Value() != "" || len(m.draftParts) != 1 || !m.draftParts[0].pasted {
+		t.Fatalf("large paste should become a separate chip, input=%q parts=%#v", m.input.Value(), m.draftParts)
+	}
+	if rendered := stripANSIForTest(strings.Join(rows, "\n")); !strings.Contains(rendered, "粘贴文本 #1") {
+		t.Fatalf("large paste chip missing, got %q", rendered)
+	}
+}
+
+func TestMultipleLargePastesRenderSeparateChipsAndPreservePayload(t *testing.T) {
+	m := NewAgentModel(nil, "model", "local", 30, true, false, StartupInfo{})
+	m.width = 120
+	m.height = 24
+	m.recalcLayout()
+	first := strings.Repeat("甲", 400)
+	second := strings.Repeat("乙", 500)
+	m.acceptPaste(first)
+	m.acceptPaste(second)
+	m.recalcLayout()
+
+	if len(m.draftParts) != 2 || !m.draftParts[0].pasted || !m.draftParts[1].pasted {
+		t.Fatalf("two pastes should remain two ordered blocks: %#v", m.draftParts)
+	}
+	if got, want := m.currentInputValue(), first+"\n"+second; got != want {
+		t.Fatalf("full payload mismatch: got=%d runes want=%d", len([]rune(got)), len([]rune(want)))
+	}
+	rendered := stripANSIForTest(m.renderFocusedInputContent(ChromeContentWidth(m.width) - 2))
+	for _, want := range []string{"[粘贴文本 #1 · 1 行 · 400 字符]", "[粘贴文本 #2 · 1 行 · 500 字符]"} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("missing independent paste chip %q in %q", want, rendered)
+		}
+	}
+}
+
+func TestBracketedHTMLPasteEventPreservesHeadMiddleAndTail(t *testing.T) {
+	m := NewAgentModel(nil, "model", "local", 30, false, false, StartupInfo{})
+	m.width, m.height = 100, 24
+	m.pendingAsk = &askState{respCh: make(chan string, 1)}
+	m.input.Focus()
+	m.recalcLayout()
+	html := "<!doctype html>\n<head>HEAD_MARKER</head>\n" + strings.Repeat("<p>MIDDLE_MARKER</p>\n", 200) + "</html>"
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(html), Paste: true})
+	m = updated.(AgentModel)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(" 代码啥意思")})
+	m = updated.(AgentModel)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(AgentModel)
+	if len(m.lines) == 0 {
+		t.Fatal("pasted user line missing")
+	}
+	raw := m.lines[len(m.lines)-1].raw
+	for _, marker := range []string{"<!doctype html>", "HEAD_MARKER", "MIDDLE_MARKER", "</html>", "代码啥意思"} {
+		if !strings.Contains(raw, marker) {
+			t.Fatalf("bracketed paste lost %q; raw length=%d", marker, len([]rune(raw)))
+		}
+	}
+}
+
+func TestCROnlyLongHTMLPasteExpandsFromStartWithoutTerminalOverwrite(t *testing.T) {
+	m := NewAgentModel(nil, "model", "local", 30, false, false, StartupInfo{})
+	m.width, m.height = 120, 30
+	m.pendingAsk = &askState{respCh: make(chan string, 1)}
+	m.input.Focus()
+	m.recalcLayout()
+
+	// Browser/editor clipboards can contain CR-only line endings. Before the
+	// normalization fix, sanitizeTUIText correctly treated those as command
+	// progress redraws, so expansion visually collapsed to the final </html>.
+	html := "<!DOCTYPE html>\r<html>\r<head>HEAD_MARKER</head>\r" +
+		strings.Repeat("<div>MIDDLE_MARKER</div>\r", 2800) + "</html>"
+	if len([]rune(html)) < 70000 {
+		t.Fatalf("regression fixture should exercise a 70K-class paste, got %d", len([]rune(html)))
+	}
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(html), Paste: true})
+	m = updated.(AgentModel)
+	if len(m.draftParts) != 1 || strings.ContainsRune(m.draftParts[0].text, '\r') {
+		t.Fatalf("pasted block must normalize CR at ingress: %#v", m.draftParts)
+	}
+	if summary := pasteSummary(m.draftParts[0].text, 1); strings.Contains(summary, "· 1 行 ·") {
+		t.Fatalf("CR-only HTML must not be mislabeled as one line: %q", summary)
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(" 分析一下字段代码")})
+	m = updated.(AgentModel)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(AgentModel)
+	line := m.lines[len(m.lines)-1]
+	if strings.ContainsRune(line.raw, '\r') {
+		t.Fatal("submitted user payload still contains terminal-active carriage returns")
+	}
+	for _, marker := range []string{"<!DOCTYPE html>", "HEAD_MARKER", "MIDDLE_MARKER", "</html>", "分析一下字段代码"} {
+		if !strings.Contains(line.raw, marker) {
+			t.Fatalf("submitted payload lost %q", marker)
+		}
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("e")})
+	m = updated.(AgentModel)
+	view := stripANSIForTest(m.viewport.View())
+	if strings.ContainsRune(view, '\r') {
+		t.Fatal("expanded viewport leaked a carriage return")
+	}
+	for _, marker := range []string{"<!DOCTYPE html>", "HEAD_MARKER"} {
+		if !strings.Contains(view, marker) {
+			t.Fatalf("expanded view should open at the HTML start and contain %q:\n%s", marker, view)
+		}
+	}
+}
+
+func TestExpandingLongUserTextKeepsReadingAnchorInsteadOfJumpingToTail(t *testing.T) {
+	m := NewAgentModel(nil, "model", "local", 30, false, false, StartupInfo{})
+	m.width, m.height = 80, 16
+	m.recalcLayout()
+	raw := "HEAD_MARKER\n" + strings.Repeat("middle evidence line\n", 80) + "</html> TAIL_MARKER"
+	m.appendLine("user", "You: "+summarizeUserText(raw), raw)
+	m.lines[len(m.lines)-1].collapsed = true
+	m.refreshViewport()
+	m.viewport.GotoBottom()
+	m.autoScroll = true
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("e")})
+	m = updated.(AgentModel)
+	view := stripANSIForTest(m.viewport.View())
+	if !strings.Contains(view, "HEAD_MARKER") {
+		t.Fatalf("expanded view should remain at the document start, got:\n%s", view)
+	}
+	if m.autoScroll {
+		t.Fatal("expanding long text must leave live-tail mode")
+	}
+}
+
+func TestTypingAfterLargePasteStaysVisibleAndPreservesFullDraft(t *testing.T) {
+	m := NewAgentModel(nil, "model", "local", 30, true, false, StartupInfo{})
+	m.width = 120
+	m.height = 24
+	m.recalcLayout()
+	pasted := strings.Repeat("证据", 180)
+	m.acceptPaste(pasted)
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("补充说明")})
+	m = updated.(AgentModel)
+	if got := m.currentInputValue(); got != pasted+"\n补充说明" {
+		t.Fatalf("full draft was not preserved, got length=%d", len([]rune(got)))
+	}
+	if !strings.Contains(m.input.Value(), "补充说明") {
+		t.Fatalf("typing after paste should remain directly editable, got %q", m.input.Value())
+	}
+	rows, _, _ := m.focusedInputRows(ChromeContentWidth(m.width) - 2)
+	if rendered := stripANSIForTest(strings.Join(rows, "\n")); !strings.Contains(rendered, "粘贴文本 #1") || !strings.Contains(rendered, "补充说明") {
+		t.Fatalf("paste chip and editable suffix should render together, got %q", rendered)
+	}
+}
+
+func TestSubmittedPastesEchoIndependentPreviewsAndTypedSuffix(t *testing.T) {
+	m := NewAgentModel(nil, "model", "local", 30, false, false, StartupInfo{})
+	m.width, m.height = 120, 24
+	m.pendingAsk = &askState{respCh: make(chan string, 1)}
+	m.input.Focus()
+	first := "FIRST_PREVIEW " + strings.Repeat("甲", 360)
+	second := "SECOND_PREVIEW " + strings.Repeat("乙", 380)
+	m.acceptPaste(first)
+	m.acceptPaste(second)
+	m.input.SetValue("你好呀")
+	m.input.SetCursor(len([]rune(m.input.Value())))
+	m.recalcLayout()
+	m.refreshViewport()
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(AgentModel)
+	if len(m.lines) == 0 {
+		t.Fatal("submitted user line missing")
+	}
+	line := m.lines[len(m.lines)-1]
+	if line.kind != "user" || !line.collapsed {
+		t.Fatalf("pasted submission should be a collapsed user summary: %#v", line)
+	}
+	for _, want := range []string{"粘贴文本 #1", "FIRST_PREVIEW", "粘贴文本 #2", "SECOND_PREVIEW", "补充文字：你好呀"} {
+		if !strings.Contains(line.content, want) {
+			t.Fatalf("submitted summary missing %q: %q", want, line.content)
+		}
+	}
+	for _, want := range []string{first, second, "你好呀"} {
+		if !strings.Contains(line.raw, want) {
+			t.Fatalf("full submitted payload missing content %q", truncateStr(want, 24))
+		}
+	}
+	m.refreshViewport()
+	view := stripANSIForTest(m.viewport.View())
+	for _, want := range []string{"FIRST_PREVIEW", "SECOND_PREVIEW", "你好呀", "全部展开原文"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("live viewport should show compact submitted content %q:\n%s", want, view)
+		}
+	}
+}
+
+func TestMultilineArrowsMoveCursorBeforeHistory(t *testing.T) {
+	m := NewAgentModel(nil, "model", "local", 30, true, false, StartupInfo{})
+	m.inputHistory = []string{"历史指令"}
+	m.input.SetValue(encodeInputValue("第一行\n第二行"))
+	m.input.SetCursor(len([]rune("第一行\n第二")))
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyUp})
+	m = updated.(AgentModel)
+	if decodeInputValue(m.input.Value()) != "第一行\n第二行" || m.historyIdx != -1 {
+		t.Fatalf("up inside multiline input must move cursor, not recall history: value=%q history=%d", m.input.Value(), m.historyIdx)
+	}
+	if got, want := m.input.Position(), len([]rune("第一")); got != want {
+		t.Fatalf("cursor=%d want=%d", got, want)
+	}
+}
+
+func TestWrappedInputArrowsMoveCursorBeforeHistory(t *testing.T) {
+	m := NewAgentModel(nil, "model", "local", 30, true, false, StartupInfo{})
+	m.width, m.height = 24, 20
+	m.recalcLayout()
+	m.inputHistory = []string{"历史指令"}
+	m.input.SetValue(strings.Repeat("甲", 30))
+	m.input.SetCursor(25)
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyUp})
+	m = updated.(AgentModel)
+	if m.historyIdx != -1 || m.input.Value() != strings.Repeat("甲", 30) {
+		t.Fatalf("up inside wrapped input must move cursor, not history: pos=%d history=%d", m.input.Position(), m.historyIdx)
+	}
+	if m.input.Position() >= 25 {
+		t.Fatalf("cursor should move to the previous visual row, got %d", m.input.Position())
+	}
+}
+
+func TestSubmitWhileBrowsingReturnsToLiveTail(t *testing.T) {
+	m := NewAgentModel(nil, "model", "local", 30, false, false, StartupInfo{})
+	m.width, m.height = 80, 14
+	for i := 0; i < 80; i++ {
+		m.appendLine("info", fmt.Sprintf("history line %03d", i), "history")
+	}
+	m.pendingAsk = &askState{respCh: make(chan string, 1)}
+	m.input.Focus()
+	m.input.SetValue("新的回复")
+	m.recalcLayout()
+	m.refreshViewport()
+	m.autoScroll = false
+	m.viewport.GotoTop()
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(AgentModel)
+	if !m.autoScroll || !m.viewport.AtBottom() {
+		t.Fatalf("submitting from history must return to live tail: offset=%d auto=%v", m.viewport.YOffset, m.autoScroll)
+	}
+	if view := stripANSIForTest(m.viewport.View()); !strings.Contains(view, "You: 新的回复") {
+		t.Fatalf("submitted message should be visible at live tail:\n%s", view)
+	}
+}
+
+func TestLongUserMessageShowsFullTextAndCanCollapse(t *testing.T) {
+	m := NewAgentModel(nil, "model", "local", 30, false, false, StartupInfo{})
+	m.width, m.height = 100, 30
+	m.recalcLayout()
+	raw := strings.Repeat("长文证据", 100) + " UNIQUE_USER_TAIL"
+	m.appendLine("user", "You: "+summarizeUserText(raw), raw)
+	m.refreshViewport()
+	if view := stripANSIForTest(m.viewport.View()); !strings.Contains(view, "UNIQUE_USER_TAIL") {
+		t.Fatalf("submitted user text should be visible in full by default:\n%s", view)
+	}
+
+	m.toggleAllCollapsible()
+	m.refreshViewport()
+	view := stripANSIForTest(m.viewport.View())
+	if strings.Contains(view, "UNIQUE_USER_TAIL") || !strings.Contains(view, "全部展开原文") {
+		t.Fatalf("long user text should collapse to an expandable summary:\n%s", view)
 	}
 }
 
@@ -1070,6 +1599,46 @@ func TestIdleFocusedInputFooterSurvivesHistoryScrolling(t *testing.T) {
 	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyPgDown})
 	m = updated.(AgentModel)
 	assertFocusedInputFooterVisible(t, m)
+}
+
+func TestScrollingInvalidatesEveryInputFooterRowWithoutMovingIMEAnchor(t *testing.T) {
+	m := NewAgentModel(nil, "provider / model", "local", 100, true, false, StartupInfo{AwaitGoal: true})
+	m.width, m.height = 90, 20
+	m.input.Focus()
+	m.input.SetValue("中文输入")
+	m.input.SetCursor(len([]rune(m.input.Value())))
+	for i := 0; i < 120; i++ {
+		m.appendLine("info", fmt.Sprintf("history %03d", i), "")
+	}
+	m.recalcLayout()
+	m.refreshViewport()
+
+	before := strings.Split(m.View(), "\n")
+	beforeRow, beforeCol, beforeMode := m.cursorAnchor.snapshot()
+	updated, _ := m.Update(tea.MouseMsg{Button: tea.MouseButtonWheelUp})
+	m = updated.(AgentModel)
+	after := strings.Split(m.View(), "\n")
+	afterRow, afterCol, afterMode := m.cursorAnchor.snapshot()
+
+	if m.footerVersion == 0 {
+		t.Fatal("scroll did not invalidate the fixed footer")
+	}
+	if beforeRow != afterRow || beforeCol != afterCol || beforeMode != afterMode {
+		t.Fatalf("scroll moved IME anchor: before=%d,%d/%d after=%d,%d/%d", beforeRow, beforeCol, beforeMode, afterRow, afterCol, afterMode)
+	}
+	if len(before) < 4 || len(after) < 4 {
+		t.Fatalf("unexpected short frames: before=%d after=%d", len(before), len(after))
+	}
+	beforeFooter := before[len(before)-4:]
+	afterFooter := after[len(after)-4:]
+	if stripANSIForTest(strings.Join(beforeFooter, "\n")) != stripANSIForTest(strings.Join(afterFooter, "\n")) {
+		t.Fatalf("scroll changed the visible input footer:\nbefore=%q\nafter=%q", stripANSIForTest(strings.Join(beforeFooter, "\n")), stripANSIForTest(strings.Join(afterFooter, "\n")))
+	}
+	for i := range beforeFooter {
+		if beforeFooter[i] == afterFooter[i] {
+			t.Fatalf("footer row %d was left cache-identical after scroll", i)
+		}
+	}
 }
 
 func assertFocusedInputFooterVisible(t *testing.T, m AgentModel) {

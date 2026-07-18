@@ -3,6 +3,7 @@ package mcp
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -17,10 +18,11 @@ import (
 
 // ExternalTool MCP 发现的外部工具
 type ExternalTool struct {
-	Name        string
-	Description string
-	Server      string
-	InputSchema map[string]interface{}
+	Name         string
+	OriginalName string
+	Description  string
+	Server       string
+	InputSchema  map[string]interface{}
 }
 
 // ToolHandler 外部工具执行回调
@@ -28,14 +30,18 @@ type ToolHandler func(args map[string]string) (string, error)
 
 // Registry MCP 工具注册表（对标 deepagents MCP 扩展）
 type Registry struct {
-	mu       sync.RWMutex
-	tools    map[string]*ExternalTool
-	handlers map[string]ToolHandler
+	mu        sync.RWMutex
+	tools     map[string]*ExternalTool
+	handlers  map[string]ToolHandler
+	aliases   map[string]string
+	ambiguous map[string]bool
 }
 
 var globalRegistry = &Registry{
-	tools:    make(map[string]*ExternalTool),
-	handlers: make(map[string]ToolHandler),
+	tools:     make(map[string]*ExternalTool),
+	handlers:  make(map[string]ToolHandler),
+	aliases:   make(map[string]string),
+	ambiguous: make(map[string]bool),
 }
 
 type stdioConnection struct {
@@ -66,6 +72,61 @@ func (r *Registry) RegisterHandler(name string, tool ExternalTool, handler ToolH
 	r.handlers[name] = handler
 }
 
+func (r *Registry) registerServerHandler(server string, tool ExternalTool, handler ToolHandler) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.registerServerHandlerLocked(server, tool, handler)
+}
+
+func (r *Registry) registerServerHandlerLocked(server string, tool ExternalTool, handler ToolHandler) string {
+	original := strings.TrimSpace(tool.OriginalName)
+	if original == "" {
+		original = strings.TrimSpace(tool.Name)
+	}
+	canonical := canonicalToolName(server, original)
+	tool.Name = canonical
+	tool.OriginalName = original
+	r.tools[canonical] = &tool
+	r.handlers[canonical] = handler
+	if previous, exists := r.aliases[original]; !exists && !r.ambiguous[original] {
+		r.aliases[original] = canonical
+	} else if exists && previous != canonical {
+		delete(r.aliases, original)
+		r.ambiguous[original] = true
+	}
+	return canonical
+}
+
+type serverToolHandler struct {
+	tool    ExternalTool
+	handler ToolHandler
+}
+
+// replaceServerHandlers swaps one server's complete tool set under one lock so
+// list_changed refreshes never expose a half-empty registry to concurrent calls.
+func (r *Registry) replaceServerHandlers(server string, discovered []serverToolHandler) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for name, tool := range r.tools {
+		if tool != nil && tool.Server == server {
+			delete(r.tools, name)
+			delete(r.handlers, name)
+		}
+	}
+	for _, item := range discovered {
+		original := strings.TrimSpace(item.tool.OriginalName)
+		if original == "" {
+			original = strings.TrimSpace(item.tool.Name)
+		}
+		canonical := canonicalToolName(server, original)
+		item.tool.Name = canonical
+		item.tool.OriginalName = original
+		r.tools[canonical] = &item.tool
+		r.handlers[canonical] = item.handler
+	}
+	r.rebuildAliasesLocked()
+}
+
 func (r *Registry) unregisterServer(server string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -75,15 +136,87 @@ func (r *Registry) unregisterServer(server string) {
 			delete(r.handlers, name)
 		}
 	}
+	r.rebuildAliasesLocked()
+}
+
+func (r *Registry) rebuildAliasesLocked() {
+	r.aliases = make(map[string]string)
+	r.ambiguous = make(map[string]bool)
+	for canonical, tool := range r.tools {
+		if tool == nil || tool.Server == "" {
+			continue
+		}
+		original := tool.OriginalName
+		if strings.TrimSpace(original) == "" {
+			original = tool.Name
+		}
+		if previous, exists := r.aliases[original]; !exists && !r.ambiguous[original] {
+			r.aliases[original] = canonical
+		} else if exists && previous != canonical {
+			delete(r.aliases, original)
+			r.ambiguous[original] = true
+		}
+	}
 }
 
 // Get 获取 MCP 工具
 func (r *Registry) Get(name string) (*ExternalTool, ToolHandler, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+	if canonical, ok := r.aliases[name]; ok {
+		name = canonical
+	}
 	t, ok := r.tools[name]
 	h := r.handlers[name]
 	return t, h, ok && h != nil
+}
+
+func canonicalToolName(server, tool string) string {
+	clean := func(value string) string {
+		original := strings.TrimSpace(value)
+		var b strings.Builder
+		changed := false
+		for _, r := range original {
+			if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '-' {
+				b.WriteRune(r)
+			} else {
+				b.WriteByte('_')
+				changed = true
+			}
+		}
+		value = strings.Trim(b.String(), "_")
+		if value == "" {
+			value = "tool"
+			changed = true
+		}
+		hash := fmt.Sprintf("%x", sha256.Sum256([]byte(original)))[:8]
+		if changed || len(value) > 30 {
+			if len(value) > 21 {
+				value = value[:21]
+			}
+			value = strings.TrimRight(value, "_-") + "_" + hash
+		}
+		return value
+	}
+	server, tool = clean(server), clean(tool)
+	if server == "" {
+		return tool
+	}
+	return server + "__" + tool
+}
+
+// ListTools returns immutable copies for native tool-schema generation.
+func (r *Registry) ListTools() []ExternalTool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]ExternalTool, 0, len(r.tools))
+	for _, tool := range r.tools {
+		if tool != nil {
+			out = append(out, *tool)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
 }
 
 // ListNames 列出已注册 MCP 工具名
@@ -113,10 +246,21 @@ func (r *Registry) FormatPrompt() string {
 		names = append(names, name)
 	}
 	sort.Strings(names)
+	const promptBudget = 12000
+	omitted := 0
 	for _, name := range names {
 		t := r.tools[name]
-		b.WriteString(fmt.Sprintf("- **mcp:%s** (%s): %s\n", name, t.Server, t.Description))
+		line := fmt.Sprintf("- **mcp:%s** (%s): %s\n", name, t.Server, truncateMCPText(t.Description, 600))
+		if b.Len()+len(line) > promptBudget {
+			omitted++
+			continue
+		}
+		b.WriteString(line)
 	}
+	if omitted > 0 {
+		b.WriteString(fmt.Sprintf("… 另有 %d 个 MCP 工具因 prompt 预算未列出。\n", omitted))
+	}
+	b.WriteString(FormatServerInstructions())
 	return b.String()
 }
 
@@ -131,14 +275,21 @@ func (r *Registry) Run(name string, args map[string]string) (string, error) {
 
 // ServerConfig MCP 服务器启动配置
 type ServerConfig struct {
-	Name     string            `json:"name" yaml:"name"`
-	Type     string            `json:"type" yaml:"type"`
-	Command  string            `json:"command" yaml:"command"`
-	Args     []string          `json:"args" yaml:"args"`
-	Env      map[string]string `json:"env" yaml:"env"`
-	CWD      string            `json:"cwd" yaml:"cwd"`
-	URL      string            `json:"url" yaml:"url"`
-	Disabled bool              `json:"disabled" yaml:"disabled"`
+	Name              string            `json:"name" yaml:"name"`
+	Type              string            `json:"type" yaml:"type"`
+	Command           string            `json:"command" yaml:"command"`
+	Args              []string          `json:"args" yaml:"args"`
+	Env               map[string]string `json:"env" yaml:"env"`
+	CWD               string            `json:"cwd" yaml:"cwd"`
+	URL               string            `json:"url" yaml:"url"`
+	Headers           map[string]string `json:"headers" yaml:"headers"`
+	BearerTokenEnvVar string            `json:"bearer_token_env_var" yaml:"bearer_token_env_var"`
+	EnabledTools      []string          `json:"enabled_tools" yaml:"enabled_tools"`
+	DisabledTools     []string          `json:"disabled_tools" yaml:"disabled_tools"`
+	StartupTimeoutSec int               `json:"startup_timeout_sec" yaml:"startup_timeout_sec"`
+	ToolTimeoutSec    int               `json:"tool_timeout_sec" yaml:"tool_timeout_sec"`
+	Required          bool              `json:"required" yaml:"required"`
+	Disabled          bool              `json:"disabled" yaml:"disabled"`
 }
 
 // ConnectStdio 连接 stdio MCP 服务器并发现 tools（简化 JSON-RPC 2.0）
@@ -407,6 +558,7 @@ func monitorStdioConnection(conn *stdioConnection, cmd *exec.Cmd) {
 
 // CloseAll stops every stdio MCP child process. It is safe to call repeatedly.
 func CloseAll() {
+	closeSDKConnections()
 	stdioConnections.Lock()
 	connections := make([]*stdioConnection, 0, len(stdioConnections.byName))
 	for name, conn := range stdioConnections.byName {
@@ -598,7 +750,7 @@ func readJSONRPCResponse(r *bufio.Reader, wantID int, timeout time.Duration) ([]
 // LoadServersFromConfig 从配置加载 MCP 服务器
 func LoadServersFromConfig(servers []ServerConfig) error {
 	for _, s := range servers {
-		if err := ConnectStdio(s); err != nil {
+		if err := Connect(s); err != nil {
 			return fmt.Errorf("MCP [%s]: %w", s.Name, err)
 		}
 	}

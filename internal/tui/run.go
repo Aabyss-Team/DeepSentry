@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"os"
 
 	"ai-edr/internal/analyzer"
 	"ai-edr/internal/collector"
@@ -51,9 +52,10 @@ func Run(cfg SessionConfig) error {
 	}
 
 	m := NewAgentModel(ctrl, title, status, cfg.MaxSteps, cfg.AwaitGoal, !cfg.AwaitGoal && len(*cfg.History) > 0, cfg.Startup)
+	defer m.cursorAnchor.release()
 	m.restoreConversationHistory(*cfg.History)
 	m.refreshViewport()
-	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseAllMotion())
+	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseAllMotion(), tea.WithOutput(newInputCursorOutput(os.Stdout, m.cursorAnchor)))
 	ctrl.SetProgram(p)
 
 	go ctrl.pumpEvents()

@@ -4,6 +4,7 @@ import (
 	"ai-edr/internal/analyzer"
 	"ai-edr/internal/config"
 	"ai-edr/internal/executor"
+	"ai-edr/internal/skills"
 	"ai-edr/internal/tools"
 	"encoding/json"
 	"errors"
@@ -38,10 +39,66 @@ func TestBuildSystemPromptAdaptsDensityToModelProfile(t *testing.T) {
 	if len(compact) >= len(full) {
 		t.Fatalf("compact prompt was not reduced: compact=%d full=%d", len(compact), len(full))
 	}
-	for _, required := range []string{"tool_catalog", "config_manage", "风险确认", "验证结果"} {
+	for _, required := range []string{"tool_catalog", "config_manage", "风险确认", "验证结果", "Skill 安装只允许 skill_market", "curl -k/--insecure"} {
 		if !strings.Contains(compact, required) {
 			t.Fatalf("compact prompt lost required rule %q", required)
 		}
+	}
+}
+
+func TestBasePromptDoesNotSuppressOrReshapeSummarySections(t *testing.T) {
+	prompt := (&DeepAgent{}).deepAgentBasePrompt()
+	for _, unwanted := range []string{
+		"不要自行添加“本次收获",
+		"项目 | 内容",
+		"不要因栏目名称自动删除",
+	} {
+		if strings.Contains(prompt, unwanted) {
+			t.Fatalf("base prompt should leave summary content/shape to the model, found %q", unwanted)
+		}
+	}
+}
+
+func TestReconcileLoadedSkillsHotReloadsAndRemovesMissing(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "hot-skill")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	doc := "---\nname: hot-skill\ndescription: Hot skill\n---\nversion two\n"
+	if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte(doc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	catalog, err := skills.LoadCatalog([]string{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := NewAgentState(root)
+	state.LoadedSkills["HOT-SKILL"] = "version one"
+	refreshed, unloaded := reconcileLoadedSkills(state, catalog)
+	if refreshed != 1 || unloaded != 0 || !strings.Contains(state.LoadedSkills["hot-skill"], "version two") {
+		t.Fatalf("refresh=%d unload=%d loaded=%#v", refreshed, unloaded, state.LoadedSkills)
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := catalog.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	refreshed, unloaded = reconcileLoadedSkills(state, catalog)
+	if refreshed != 0 || unloaded != 1 || len(state.LoadedSkills) != 0 {
+		t.Fatalf("refresh=%d unload=%d loaded=%#v", refreshed, unloaded, state.LoadedSkills)
+	}
+}
+
+func TestRestoreCheckpointCannotResurrectDisabledSkill(t *testing.T) {
+	catalog := &skills.SkillCatalog{DisabledSkills: []string{"blocked-skill"}}
+	agent := &DeepAgent{Catalog: catalog, State: NewAgentState("")}
+	state := NewAgentState("")
+	state.LoadedSkills["blocked-skill"] = "stale checkpoint instructions"
+	agent.RestoreFromCheckpoint(&CheckpointData{State: state})
+	if len(agent.State.LoadedSkills) != 0 {
+		t.Fatalf("disabled checkpoint skill was restored: %#v", agent.State.LoadedSkills)
 	}
 }
 
@@ -142,6 +199,30 @@ func TestOffloadOutputIsSessionScoped(t *testing.T) {
 	}
 	if string(dataA) != outA || string(dataB) != outB {
 		t.Fatalf("offloaded outputs were not isolated: A=%q B=%q", string(dataA), string(dataB))
+	}
+}
+
+func TestBrowserAndBoundedReadOutputsStayInModelContext(t *testing.T) {
+	dir := t.TempDir()
+	agent := &DeepAgent{
+		State:      NewAgentStateWithSession(dir, "browser_context"),
+		Middleware: []Middleware{&ContextMiddleware{OutputThreshold: 8000}},
+	}
+	browserOutput := "Browser session: browser_test\n" + strings.Repeat("browser-page-content ", 900)
+	browserAction := &AgentAction{Type: ActionTool, ToolName: "browser_browse"}
+	if got := agent.prepareActionOutput(1, browserAction, browserOutput); got != browserOutput {
+		t.Fatalf("browser snapshot should stay inline, got prefix %q", safeUTF8BytePrefix(got, 120))
+	}
+
+	readOutput := "[视角: 控制端]\n" + strings.Repeat("R", maxFileReadDisplay)
+	if got := agent.prepareActionOutput(2, &AgentAction{Type: ActionReadFile}, readOutput); got != readOutput {
+		t.Fatalf("bounded read_file output should not be recursively offloaded: %q", safeUTF8BytePrefix(got, 120))
+	}
+
+	ordinary := strings.Repeat("ordinary-output ", 900)
+	got := agent.prepareActionOutput(3, &AgentAction{Type: ActionTool, ToolName: "process_list"}, ordinary)
+	if !strings.Contains(got, "output_step3.txt") {
+		t.Fatalf("ordinary large tool output should still offload: %q", got)
 	}
 }
 

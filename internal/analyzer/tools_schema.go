@@ -1,6 +1,7 @@
 package analyzer
 
 import (
+	"ai-edr/internal/mcp"
 	deepsentrytools "ai-edr/internal/tools"
 	"encoding/json"
 	"fmt"
@@ -131,6 +132,29 @@ func AgentToolDefinitionsForContext(limit int, contextText string) []ToolDefinit
 				Parameters:  deepsentrytools.JSONSchema(name),
 			},
 		})
+	}
+	// Full native-tool profiles expose MCP tools with the server-provided JSON
+	// schema, matching first-class MCP clients. Limited profiles keep the
+	// compact agent_action compatibility path to stay within provider limits.
+	if limit <= 0 {
+		for _, tool := range mcp.Global().ListTools() {
+			parameters := tool.InputSchema
+			if parameters == nil {
+				parameters = map[string]interface{}{"type": "object", "additionalProperties": true}
+			}
+			description := truncateToolDescription(tool.Description, 800)
+			if description == "" {
+				description = "MCP tool exposed by server " + tool.Server
+			}
+			definitions = append(definitions, ToolDefinition{
+				Type: "function",
+				Function: FunctionDef{
+					Name:        tool.Name,
+					Description: description,
+					Parameters:  parameters,
+				},
+			})
+		}
 	}
 	return definitions
 }
@@ -270,7 +294,15 @@ func ParseNamedToolCall(name, toolCallArgs string) (AgentResponse, error) {
 	}
 	if name != "tool_catalog" {
 		if _, ok := deepsentrytools.Get(name); !ok {
-			return AgentResponse{}, fmt.Errorf("unknown native built-in tool: %s", name)
+			if _, _, mcpOK := mcp.Global().Get(name); !mcpOK {
+				return AgentResponse{}, fmt.Errorf("unknown native tool: %s", name)
+			}
+			return AgentResponse{
+				Thought:  "调用已连接的 MCP 工具 " + name,
+				Action:   "tool",
+				ToolName: name,
+				ToolArgs: parseToolArgs(raw),
+			}, nil
 		}
 	}
 	return AgentResponse{

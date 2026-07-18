@@ -217,12 +217,21 @@ func normalizeURL(raw string) (string, error) {
 	if raw == "" {
 		return "", fmt.Errorf("url 不能为空")
 	}
-	if !strings.HasPrefix(raw, "http://") && !strings.HasPrefix(raw, "https://") {
+	lower := strings.ToLower(raw)
+	for _, blocked := range []string{"javascript:", "data:", "file:", "ftp:", "mailto:", "chrome:"} {
+		if strings.HasPrefix(lower, blocked) {
+			return "", fmt.Errorf("仅允许 http/https URL: %s", raw)
+		}
+	}
+	if !strings.HasPrefix(lower, "http://") && !strings.HasPrefix(lower, "https://") {
 		raw = "http://" + raw
 	}
 	u, err := url.Parse(raw)
 	if err != nil || u.Host == "" {
 		return "", fmt.Errorf("非法 URL: %s", raw)
+	}
+	if !strings.EqualFold(u.Scheme, "http") && !strings.EqualFold(u.Scheme, "https") {
+		return "", fmt.Errorf("仅允许 http/https URL: %s", raw)
 	}
 	return u.String(), nil
 }

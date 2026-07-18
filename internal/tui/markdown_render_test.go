@@ -39,7 +39,7 @@ func TestRenderMarkdownReportRendersTableAndInlineStyles(t *testing.T) {
 }
 
 func TestRenderMarkdownReportFitsWidth(t *testing.T) {
-	md := "| 字段 | 很长的说明 |\n|---|---|\n| 路径 | /var/www/html/uploads/reports/report_20260630_214228.md |"
+	md := "| 字段 | 很长的说明 |\n|---|---|\n| 路径 | /var/www/html/uploads/reports/report_YYYYMMDD_HHMMSS.md |"
 	rendered := renderMarkdownReport(md, 48)
 	for _, line := range strings.Split(rendered, "\n") {
 		if got := lipgloss.Width(line); got > 48 {
@@ -118,6 +118,32 @@ func TestMarkdownTableFallsBackWithoutOverflowAtNarrowWidth(t *testing.T) {
 		plain := strings.ReplaceAll(stripANSIForTest(rendered), "\n", "")
 		if !strings.Contains(plain, "a-05") || !strings.Contains(plain, "available") {
 			t.Fatalf("narrow table lost data at width=%d:\n%s", width, plain)
+		}
+	}
+}
+
+func TestMarkdownSummaryTableUsesNaturalLabelValueRows(t *testing.T) {
+	md := strings.Join([]string{
+		"| 项目 | 内容 |",
+		"|---|---|",
+		"| 任务成果 | 安徽邮电职业技术学院到 ahptc.cn 的资产调查已经完成 |",
+		"| 技能成长 | 学会使用 domain 查询语法 |",
+	}, "\n")
+	rendered := renderMarkdownBlocks(md, 34)
+	plain := stripANSIForTest(rendered)
+	for _, bad := range []string{"项目:", "项目：", "内容:", "内容：", " · "} {
+		if strings.Contains(plain, bad) {
+			t.Fatalf("generic table headers should not repeat in summary rows (%q):\n%s", bad, plain)
+		}
+	}
+	for _, want := range []string{"• 任务成果：", "• 技能成长：", "ahptc.cn", "domain"} {
+		if !strings.Contains(plain, want) {
+			t.Fatalf("natural summary row missing %q:\n%s", want, plain)
+		}
+	}
+	for _, line := range strings.Split(rendered, "\n") {
+		if got := lipgloss.Width(line); got > 34 {
+			t.Fatalf("summary row width=%d want <=34: %q", got, line)
 		}
 	}
 }

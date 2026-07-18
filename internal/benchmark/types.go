@@ -6,17 +6,17 @@ import "time"
 type Category string
 
 const (
-	CatLLM          Category = "llm"
-	CatLocalTool    Category = "local_tool"
-	CatRemoteTool   Category = "remote_tool"
-	CatLinkage      Category = "linkage"
-	CatFilesystem   Category = "filesystem"
-	CatAgent        Category = "agent"
-	CatHarness      Category = "harness"
-	CatResilience   Category = "resilience"
-	CatForensics    Category = "forensics"
-	CatIncident     Category = "incident"
-	CatSecurity     Category = "security"
+	CatLLM        Category = "llm"
+	CatLocalTool  Category = "local_tool"
+	CatRemoteTool Category = "remote_tool"
+	CatLinkage    Category = "linkage"
+	CatFilesystem Category = "filesystem"
+	CatAgent      Category = "agent"
+	CatHarness    Category = "harness"
+	CatResilience Category = "resilience"
+	CatForensics  Category = "forensics"
+	CatIncident   Category = "incident"
+	CatSecurity   Category = "security"
 )
 
 // CategoryMeta 维度权重与说明

@@ -73,9 +73,19 @@ func ManageConfig(args map[string]string) (string, error) {
 		changed, err = manageToggleMCPServer(root, args, false)
 	case "remove_mcp_server", "remove_mcp":
 		changed, err = manageRemoveMCPServer(root, args)
-	case "disable_skill_source", "skill_off":
+	case "disable_skill", "skill_off":
+		changed, err = manageToggleSkill(root, args, true)
+	case "enable_skill", "skill_on":
+		changed, err = manageToggleSkill(root, args, false)
+	case "disable_skills", "skills_off":
+		changed, err = manageToggleSkillSystem(root, true)
+	case "enable_skills", "skills_on":
+		changed, err = manageToggleSkillSystem(root, false)
+	case "enable_only_skill", "skill_only":
+		changed, err = manageEnableOnlySkill(root, args)
+	case "disable_skill_source", "skill_source_off":
 		changed, err = manageToggleSkillSource(root, args, true)
-	case "enable_skill_source", "skill_on":
+	case "enable_skill_source", "skill_source_on":
 		changed, err = manageToggleSkillSource(root, args, false)
 	case "remove_skill_source", "skill_remove":
 		changed, err = manageRemoveSkillSource(root, args)
@@ -126,6 +136,8 @@ func configStatus(path string) (string, error) {
 	b.WriteString(fmt.Sprintf("配置文件: %s\n", path))
 	b.WriteString(fmt.Sprintf("skill_sources: %s\n", strings.Join(readScalarSeq(root, "skill_sources"), ", ")))
 	b.WriteString(fmt.Sprintf("disabled_skill_sources: %s\n", strings.Join(readScalarSeq(root, "disabled_skill_sources"), ", ")))
+	b.WriteString(fmt.Sprintf("disabled_skills: %s\n", strings.Join(readScalarSeq(root, "disabled_skills"), ", ")))
+	b.WriteString(fmt.Sprintf("skills_disabled: %v\n", readBoolScalar(root, "skills_disabled")))
 	b.WriteString(fmt.Sprintf("mcp_servers: %s\n", strings.Join(readScalarSeq(root, "mcp_servers"), ", ")))
 	b.WriteString(fmt.Sprintf("mcp_server_configs: %s\n", strings.Join(readMCPServerConfigSummaries(root), ", ")))
 	b.WriteString(fmt.Sprintf("targets: %d 个\n", len(readTargets(root))))
@@ -181,7 +193,7 @@ func configGet(path string, args map[string]string) (string, error) {
 	}
 	root := ensureConfigRoot(doc)
 	switch key {
-	case "skill_sources", "disabled_skill_sources", "mcp_servers":
+	case "skill_sources", "disabled_skill_sources", "disabled_skills", "mcp_servers":
 		return fmt.Sprintf("%s: %s", key, strings.Join(readScalarSeq(root, key), ", ")), nil
 	case "mcp_server_configs":
 		return fmt.Sprintf("%s: %s", key, strings.Join(readMCPServerConfigSummaries(root), ", ")), nil
@@ -229,12 +241,40 @@ func manageAddMCPServer(root *yaml.Node, args map[string]string) (string, error)
 	cwd := firstConfigArg(args, "cwd", "dir")
 	env := parseEnvArg(firstConfigArg(args, "env"))
 	serverType := strings.ToLower(valueOr(firstConfigArg(args, "type"), "stdio"))
+	if serverType == "http" {
+		serverType = "streamable_http"
+	}
 
-	if cwd != "" || len(env) > 0 || firstConfigArg(args, "structured") != "" || serverType != "stdio" {
+	structured := cwd != "" || len(env) > 0 || firstConfigArg(args, "structured") != "" || serverType != "stdio" ||
+		firstConfigArg(args, "url", "headers", "bearer_token_env_var", "token_env", "enabled_tools", "disabled_tools", "startup_timeout_sec", "tool_timeout_sec", "required") != ""
+	if structured {
 		if name == "" || (command == "" && serverType == "stdio") {
 			return "", fmt.Errorf("spec 为空时 name 和 command 必填")
 		}
-		cfg := MCPServerConfig{Name: name, Type: serverType, Command: command, Args: splitCSVArgs(rawArgs), Env: env, CWD: cwd, URL: firstConfigArg(args, "url")}
+		startupTimeout, err := parseOptionalIntArg(args, "startup_timeout_sec", 0, 300)
+		if err != nil {
+			return "", err
+		}
+		toolTimeout, err := parseOptionalIntArg(args, "tool_timeout_sec", 0, 3600)
+		if err != nil {
+			return "", err
+		}
+		cfg := MCPServerConfig{
+			Name:              name,
+			Type:              serverType,
+			Command:           command,
+			Args:              splitCSVArgs(rawArgs),
+			Env:               env,
+			CWD:               cwd,
+			URL:               firstConfigArg(args, "url"),
+			Headers:           parseEnvArg(firstConfigArg(args, "headers")),
+			BearerTokenEnvVar: firstConfigArg(args, "bearer_token_env_var", "token_env"),
+			EnabledTools:      splitCSVArgs(firstConfigArg(args, "enabled_tools")),
+			DisabledTools:     splitCSVArgs(firstConfigArg(args, "disabled_tools")),
+			StartupTimeoutSec: startupTimeout,
+			ToolTimeoutSec:    toolTimeout,
+			Required:          parseBoolArg(firstConfigArg(args, "required")),
+		}
 		upsertMCPServerConfig(root, cfg)
 		return fmt.Sprintf("已加入 mcp_server_configs: %s", name), nil
 	}
@@ -280,6 +320,7 @@ func manageImportClaudeMCP(root *yaml.Node, args map[string]string) (string, err
 			CWD     string            `json:"cwd"`
 			URL     string            `json:"url"`
 			Type    string            `json:"type"`
+			Headers map[string]string `json:"headers"`
 		} `json:"mcpServers"`
 	}
 	if err := json.Unmarshal([]byte(content), &raw); err != nil {
@@ -298,6 +339,10 @@ func manageImportClaudeMCP(root *yaml.Node, args map[string]string) (string, err
 			Env:     server.Env,
 			CWD:     server.CWD,
 			URL:     server.URL,
+			Headers: server.Headers,
+		}
+		if cfg.Type == "http" {
+			cfg.Type = "streamable_http"
 		}
 		upsertMCPServerConfig(root, cfg)
 		names = append(names, name)
@@ -349,6 +394,62 @@ func manageToggleSkillSource(root *yaml.Node, args map[string]string, disabled b
 	values = removeString(values, source)
 	setScalarSeq(root, "disabled_skill_sources", values)
 	return fmt.Sprintf("已启用 Skill 来源: %s", source), nil
+}
+
+func manageToggleSkill(root *yaml.Node, args map[string]string, disabled bool) (string, error) {
+	name := firstConfigArg(args, "name", "skill", "skill_name")
+	if name == "" {
+		return "", fmt.Errorf("name/skill/skill_name 不能为空")
+	}
+	if name == "*" || len([]rune(name)) > 128 || strings.ContainsAny(name, "\r\n\x00") {
+		return "", fmt.Errorf("Skill 名称无效")
+	}
+	values := readScalarSeq(root, "disabled_skills")
+	if disabled {
+		if !containsStringFold(values, name) {
+			values = append(values, name)
+		}
+		setScalarSeq(root, "disabled_skills", values)
+		return fmt.Sprintf("已禁用 Skill: %s", name), nil
+	}
+	values = removeStringFold(values, name)
+	setScalarSeq(root, "disabled_skills", values)
+	return fmt.Sprintf("已启用 Skill: %s", name), nil
+}
+
+func manageToggleSkillSystem(root *yaml.Node, disabled bool) (string, error) {
+	setBoolScalar(root, "skills_disabled", disabled)
+	if disabled {
+		return "已全局禁用 Skill 功能", nil
+	}
+	return "已全局启用 Skill 功能", nil
+}
+
+func manageEnableOnlySkill(root *yaml.Node, args map[string]string) (string, error) {
+	name := strings.TrimSpace(firstConfigArg(args, "name", "skill", "skill_name"))
+	if name == "" || name == "*" || len([]rune(name)) > 128 || strings.ContainsAny(name, "\r\n\x00") {
+		return "", fmt.Errorf("Skill 名称无效")
+	}
+
+	// Preserve existing disabled names so a temporarily missing Skill cannot
+	// become enabled unexpectedly when its source returns. Remove the selected
+	// name and add every other currently discovered name to the denylist.
+	disabled := removeStringFold(readScalarSeq(root, "disabled_skills"), name)
+	for _, candidate := range strings.Split(firstConfigArg(args, "available_skills", "skills"), "\n") {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" || strings.EqualFold(candidate, name) {
+			continue
+		}
+		if candidate == "*" || len([]rune(candidate)) > 128 || strings.ContainsAny(candidate, "\r\n\x00") {
+			return "", fmt.Errorf("Skill 名称无效: %s", candidate)
+		}
+		if !containsStringFold(disabled, candidate) {
+			disabled = append(disabled, candidate)
+		}
+	}
+	setScalarSeq(root, "disabled_skills", disabled)
+	setBoolScalar(root, "skills_disabled", false)
+	return fmt.Sprintf("仅启用 Skill: %s（其余已发现 Skill 均已禁用）", name), nil
 }
 
 func manageRemoveSkillSource(root *yaml.Node, args map[string]string) (string, error) {
@@ -716,6 +817,27 @@ func firstConfigArg(args map[string]string, keys ...string) string {
 	return ""
 }
 
+func containsStringFold(values []string, target string) bool {
+	target = strings.TrimSpace(target)
+	for _, value := range values {
+		if strings.EqualFold(strings.TrimSpace(value), target) {
+			return true
+		}
+	}
+	return false
+}
+
+func removeStringFold(values []string, target string) []string {
+	target = strings.TrimSpace(target)
+	out := values[:0]
+	for _, value := range values {
+		if !strings.EqualFold(strings.TrimSpace(value), target) {
+			out = append(out, value)
+		}
+	}
+	return out
+}
+
 func ensureSeq(root *yaml.Node, key string) *yaml.Node {
 	if node := findMapValue(root, key); node != nil {
 		if node.Kind != yaml.SequenceNode {
@@ -793,6 +915,10 @@ func boolNode(value bool) *yaml.Node {
 	return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!bool", Value: mapBool(value, "true", "false")}
 }
 
+func intNode(value int) *yaml.Node {
+	return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!int", Value: strconv.Itoa(value)}
+}
+
 func stringSeqNode(values []string) *yaml.Node {
 	seq := &yaml.Node{Kind: yaml.SequenceNode}
 	for _, value := range values {
@@ -834,6 +960,27 @@ func mcpServerConfigNode(cfg MCPServerConfig) *yaml.Node {
 	}
 	if cfg.URL != "" {
 		node.Content = append(node.Content, scalarNode("url"), scalarNode(cfg.URL))
+	}
+	if len(cfg.Headers) > 0 {
+		node.Content = append(node.Content, scalarNode("headers"), stringMapNode(cfg.Headers))
+	}
+	if cfg.BearerTokenEnvVar != "" {
+		node.Content = append(node.Content, scalarNode("bearer_token_env_var"), scalarNode(cfg.BearerTokenEnvVar))
+	}
+	if len(cfg.EnabledTools) > 0 {
+		node.Content = append(node.Content, scalarNode("enabled_tools"), stringSeqNode(cfg.EnabledTools))
+	}
+	if len(cfg.DisabledTools) > 0 {
+		node.Content = append(node.Content, scalarNode("disabled_tools"), stringSeqNode(cfg.DisabledTools))
+	}
+	if cfg.StartupTimeoutSec > 0 {
+		node.Content = append(node.Content, scalarNode("startup_timeout_sec"), intNode(cfg.StartupTimeoutSec))
+	}
+	if cfg.ToolTimeoutSec > 0 {
+		node.Content = append(node.Content, scalarNode("tool_timeout_sec"), intNode(cfg.ToolTimeoutSec))
+	}
+	if cfg.Required {
+		node.Content = append(node.Content, scalarNode("required"), boolNode(true))
 	}
 	if cfg.Disabled {
 		node.Content = append(node.Content, scalarNode("disabled"), boolNode(true))
@@ -1151,6 +1298,18 @@ func parseBoolArg(raw string) bool {
 	default:
 		return false
 	}
+}
+
+func parseOptionalIntArg(args map[string]string, key string, min, max int) (int, error) {
+	raw := strings.TrimSpace(args[key])
+	if raw == "" {
+		return 0, nil
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < min || value > max {
+		return 0, fmt.Errorf("%s 必须是 %d~%d 的整数", key, min, max)
+	}
+	return value, nil
 }
 
 func splitTags(raw string) []string {

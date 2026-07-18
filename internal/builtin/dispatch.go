@@ -2,6 +2,8 @@ package builtin
 
 import (
 	"ai-edr/internal/config"
+	"ai-edr/internal/mcp"
+	"ai-edr/internal/skills"
 	"fmt"
 	"strconv"
 	"strings"
@@ -34,6 +36,13 @@ func argInt(args map[string]string, key string, def, max int) int {
 func argBool(args map[string]string, key string) bool {
 	v := strings.ToLower(strings.TrimSpace(args[key]))
 	return v == "1" || v == "true" || v == "yes" || v == "y" || v == "on"
+}
+
+func argBoolDefault(args map[string]string, key string, def bool) bool {
+	if _, ok := args[key]; !ok {
+		return def
+	}
+	return argBool(args, key)
 }
 
 // Run 统一调度 Go 原生内置工具（BusyBox 模式，不依赖目标系统 CLI）
@@ -103,6 +112,10 @@ func Run(name string, args map[string]string, rt Runtime) (string, error) {
 		return WebSnapshot(rt, arg(args, "url", "target"), argInt(args, "max_bytes", 131072, 524288))
 	case "headless_browser":
 		return HeadlessBrowser(rt, arg(args, "url", "target"), arg(args, "mode"), argInt(args, "wait_ms", 1500, 10000), argInt(args, "max_text", 20000, 100000), arg(args, "selector"), argBool(args, "screenshot"))
+	case "browser_browse":
+		return BrowserBrowse(arg(args, "action"), arg(args, "session_id"), arg(args, "url", "target"), arg(args, "mode"), arg(args, "selector", "ref"), argInt(args, "wait_ms", 700, 10000), argInt(args, "max_text", 20000, 100000), argInt(args, "text_offset", 0, 10000000), argInt(args, "element_offset", 0, 100000), argInt(args, "element_limit", 120, 300))
+	case "browser_interact":
+		return BrowserInteract(arg(args, "action"), arg(args, "session_id"), arg(args, "selector", "ref"), args["text"], args["value"], arg(args, "key"), argBoolDefault(args, "clear", true), argBool(args, "submit"), argInt(args, "wait_ms", 700, 10000), argInt(args, "max_text", 20000, 100000), argInt(args, "text_offset", 0, 10000000), argInt(args, "element_offset", 0, 100000), argInt(args, "element_limit", 120, 300))
 	case "traceroute":
 		return tracerouteNative(rt, arg(args, "host", "target"))
 	case "firewall_status":
@@ -173,9 +186,115 @@ func Run(name string, args map[string]string, rt Runtime) (string, error) {
 		return FleetFile(rt, arg(args, "selector", "target", "targets"), arg(args, "action"), arg(args, "remote_path", "remote", "path"), arg(args, "local_path", "local"))
 	case "config_manage":
 		return config.ManageConfig(args)
+	case "skill_market":
+		return skills.ManageMarketplace(args)
+	case "mcp_resource":
+		return manageMCPResource(args)
+	case "mcp_prompt":
+		return manageMCPPrompt(args)
 	default:
 		return "", fmt.Errorf("未知内置工具: %s", name)
 	}
+}
+
+func manageMCPResource(args map[string]string) (string, error) {
+	action := strings.ToLower(arg(args, "action"))
+	if action == "" {
+		action = "list"
+	}
+	server := arg(args, "server")
+	switch action {
+	case "list":
+		resources := mcp.ListResources(server)
+		templates := mcp.ListResourceTemplates(server)
+		if len(resources) == 0 && len(templates) == 0 {
+			return "没有发现匹配的 MCP Resource。", nil
+		}
+		var b strings.Builder
+		for _, resource := range resources {
+			fmt.Fprintf(&b, "- %s · %s · %s", resource.Server, resource.URI, valueOrBuiltin(resource.Title, resource.Name))
+			if resource.MIMEType != "" {
+				fmt.Fprintf(&b, " · %s", resource.MIMEType)
+			}
+			if resource.Description != "" {
+				fmt.Fprintf(&b, "\n  %s", resource.Description)
+			}
+			b.WriteByte('\n')
+		}
+		for _, template := range templates {
+			fmt.Fprintf(&b, "- %s · template=%s · %s", template.Server, template.URITemplate, valueOrBuiltin(template.Title, template.Name))
+			if template.MIMEType != "" {
+				fmt.Fprintf(&b, " · %s", template.MIMEType)
+			}
+			b.WriteByte('\n')
+		}
+		return strings.TrimSpace(b.String()), nil
+	case "read":
+		if server == "" || arg(args, "uri") == "" {
+			return "", fmt.Errorf("mcp_resource read 需要 server 和 uri")
+		}
+		return mcp.ReadResource(server, arg(args, "uri"))
+	default:
+		return "", fmt.Errorf("未知 mcp_resource action: %s", action)
+	}
+}
+
+func manageMCPPrompt(args map[string]string) (string, error) {
+	action := strings.ToLower(arg(args, "action"))
+	if action == "" {
+		action = "list"
+	}
+	server := arg(args, "server")
+	switch action {
+	case "list":
+		prompts := mcp.ListPrompts(server)
+		if len(prompts) == 0 {
+			return "没有发现匹配的 MCP Prompt。", nil
+		}
+		var b strings.Builder
+		for _, prompt := range prompts {
+			fmt.Fprintf(&b, "- %s · %s · %s", prompt.Server, prompt.Name, valueOrBuiltin(prompt.Title, prompt.Name))
+			if prompt.Description != "" {
+				fmt.Fprintf(&b, "\n  %s", prompt.Description)
+			}
+			if len(prompt.Arguments) > 0 {
+				var names []string
+				for _, item := range prompt.Arguments {
+					if item != nil {
+						names = append(names, item.Name)
+					}
+				}
+				if len(names) > 0 {
+					fmt.Fprintf(&b, "\n  args: %s", strings.Join(names, ", "))
+				}
+			}
+			b.WriteByte('\n')
+		}
+		return strings.TrimSpace(b.String()), nil
+	case "get":
+		name := arg(args, "name", "prompt")
+		if server == "" || name == "" {
+			return "", fmt.Errorf("mcp_prompt get 需要 server 和 name")
+		}
+		promptArgs := make(map[string]string)
+		for key, value := range args {
+			switch key {
+			case "action", "server", "name", "prompt":
+			default:
+				promptArgs[key] = value
+			}
+		}
+		return mcp.GetPrompt(server, name, promptArgs)
+	default:
+		return "", fmt.Errorf("未知 mcp_prompt action: %s", action)
+	}
+}
+
+func valueOrBuiltin(value, fallback string) string {
+	if strings.TrimSpace(value) != "" {
+		return value
+	}
+	return fallback
 }
 
 func tracerouteNative(rt Runtime, host string) (string, error) {

@@ -130,6 +130,63 @@ func TestMCPProcessEnvironmentDoesNotImplicitlyInheritCredentials(t *testing.T) 
 	}
 }
 
+func TestRegistryCanonicalNamesAvoidCrossServerToolCollisions(t *testing.T) {
+	r := &Registry{tools: map[string]*ExternalTool{}, handlers: map[string]ToolHandler{}, aliases: map[string]string{}, ambiguous: map[string]bool{}}
+	handler := func(map[string]string) (string, error) { return "ok", nil }
+	r.registerServerHandler("alpha", ExternalTool{Name: "search", OriginalName: "search", Server: "alpha"}, handler)
+	if _, _, ok := r.Get("search"); !ok {
+		t.Fatal("single-server short alias should resolve")
+	}
+	r.registerServerHandler("beta", ExternalTool{Name: "search", OriginalName: "search", Server: "beta"}, handler)
+	if _, _, ok := r.Get("search"); ok {
+		t.Fatal("ambiguous short alias should not resolve")
+	}
+	for _, canonical := range []string{"alpha__search", "beta__search"} {
+		if _, _, ok := r.Get(canonical); !ok {
+			t.Fatalf("canonical name %s should resolve", canonical)
+		}
+	}
+	r.unregisterServer("beta")
+	if tool, _, ok := r.Get("search"); !ok || tool.Server != "alpha" {
+		t.Fatalf("short alias should recover after collision disappears: %#v ok=%v", tool, ok)
+	}
+}
+
+func TestRegistryCanonicalizesUnsafeAndLongNamesWithoutCollision(t *testing.T) {
+	r := &Registry{tools: map[string]*ExternalTool{}, handlers: map[string]ToolHandler{}, aliases: map[string]string{}, ambiguous: map[string]bool{}}
+	handler := func(map[string]string) (string, error) { return "ok", nil }
+	first := r.registerServerHandler("docs.server", ExternalTool{Name: "read/file", OriginalName: "read/file", Server: "docs.server"}, handler)
+	second := r.registerServerHandler("docs.server", ExternalTool{Name: "read.file", OriginalName: "read.file", Server: "docs.server"}, handler)
+	long := r.registerServerHandler(strings.Repeat("server", 20), ExternalTool{Name: strings.Repeat("tool", 30), OriginalName: strings.Repeat("tool", 30), Server: strings.Repeat("server", 20)}, handler)
+	if first == second {
+		t.Fatalf("unsafe names collapsed to the same canonical name: %q", first)
+	}
+	for _, name := range []string{first, second, long} {
+		if len(name) > 64 {
+			t.Fatalf("canonical native function name exceeds provider limit: %d %q", len(name), name)
+		}
+		if _, _, ok := r.Get(name); !ok {
+			t.Fatalf("canonical tool %q missing", name)
+		}
+	}
+	if got := r.ListTools(); len(got) != 3 {
+		t.Fatalf("ListTools returned %d tools", len(got))
+	}
+}
+
+func TestRegistryReplacesServerToolsAtomically(t *testing.T) {
+	r := &Registry{tools: map[string]*ExternalTool{}, handlers: map[string]ToolHandler{}, aliases: map[string]string{}, ambiguous: map[string]bool{}}
+	handler := func(map[string]string) (string, error) { return "ok", nil }
+	r.registerServerHandler("alpha", ExternalTool{Name: "old", OriginalName: "old", Server: "alpha"}, handler)
+	r.replaceServerHandlers("alpha", []serverToolHandler{{tool: ExternalTool{Name: "new", OriginalName: "new", Server: "alpha"}, handler: handler}})
+	if _, _, ok := r.Get("alpha__old"); ok {
+		t.Fatal("old server tool survived replacement")
+	}
+	if _, _, ok := r.Get("alpha__new"); !ok {
+		t.Fatal("new server tool missing after replacement")
+	}
+}
+
 func TestMCPHelperProcess(t *testing.T) {
 	if os.Getenv("GO_WANT_MCP_HELPER") != "1" {
 		return

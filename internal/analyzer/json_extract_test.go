@@ -93,6 +93,97 @@ func TestRecoverPlainTextResponseKeepsClarificationAsQuestion(t *testing.T) {
 	}
 }
 
+func TestRecoverPlainTextSummaryWithRhetoricalQuestionsFinishes(t *testing.T) {
+	raw := `让我想想这个问题：用户输入和独立验证到底应该怎么平衡？
+
+分析结果如下：
+1. 用户提供的信息是输入，不是无需验证的结论。
+2. 善意提供的信息也可能包含基于经验的推测。
+3. 工具的价值在于可靠地核验证据。
+
+所以总结成一条原则：尊重用户输入，同时独立核验证据链。`
+	resp, ok := recoverPlainTextResponse(raw)
+	if !ok || resp.Action != "finish" || !resp.IsFinished {
+		t.Fatalf("rhetorical summary must finish instead of asking user: %#v", resp)
+	}
+	if resp.FinalReport != raw || resp.Question != "" {
+		t.Fatalf("summary should be preserved as final report: %#v", resp)
+	}
+}
+
+func TestFinalizeResponseRejectsFakeAskUserSummary(t *testing.T) {
+	summary := `让我想想这个哲学问题：我们到底怎么平衡？
+
+这其实是一个永恒难题。
+1. 用户提供的是输入，不是无需验证的结论。
+2. Agent 应当独立核验证据链。
+3. 最后输出可靠结论。
+
+所以总结：信任输入，但保持独立判断。`
+	resp := finalizeResponse(AgentResponse{Action: "ask_user", Question: summary})
+	if resp.Action != "finish" || !resp.IsFinished || resp.FinalReport != summary {
+		t.Fatalf("fake ask_user summary should become final report: %#v", resp)
+	}
+}
+
+func TestFinalizeResponseKeepsRealShortAskUser(t *testing.T) {
+	resp := finalizeResponse(AgentResponse{Action: "ask_user", Question: "你希望使用可见 Chrome 还是无头浏览器？"})
+	if resp.Action != "ask_user" || resp.IsFinished {
+		t.Fatalf("real direct question should remain ask_user: %#v", resp)
+	}
+}
+
+func TestFinalizeResponseKeepsLongMenuAskUserInteractive(t *testing.T) {
+	question := `欢迎使用 DeepSentry！
+
+请选择本次需要执行的任务：
+
+🔍 FOFA 资产测绘 — 对已授权目标进行资产发现
+🛡️ 安全巡检 — 检查服务器状态与风险项
+📋 日志分析 — 汇总异常登录与关键时间线
+☁️ 服务器管理 — 查看已配置主机的运行状态
+🧰 其他任务 — 使用自然语言描述具体目标
+
+请输入选项名称，或直接说明希望完成的任务。`
+	resp := finalizeResponse(AgentResponse{Action: "ask_user", Question: question})
+	if resp.Action != "ask_user" || resp.IsFinished || resp.Question != question || resp.FinalReport != "" {
+		t.Fatalf("menu question must remain interactive: %#v", resp)
+	}
+}
+
+func TestFinalizeResponseAlwaysKeepsStructuredChoiceInteractive(t *testing.T) {
+	question := strings.Repeat("这是较长的背景说明。", 40)
+	resp := finalizeResponse(AgentResponse{
+		Action:      "ask_user",
+		Question:    question,
+		Options:     []string{"执行方案 A", "执行方案 B"},
+		IsFinished:  true,
+		FinalReport: "不应显示为报告",
+	})
+	if resp.Action != "ask_user" || resp.IsFinished || resp.FinalReport != "" || len(resp.Options) != 2 {
+		t.Fatalf("structured options must take precedence over finish fields: %#v", resp)
+	}
+}
+
+func TestFinalizeResponseKeepsLongDirectQuestionInteractive(t *testing.T) {
+	question := strings.Repeat("这里是执行前必须了解的较长背景。", 40) + "你希望我采用保守模式还是完整模式？"
+	resp := finalizeResponse(AgentResponse{Action: "ask_user", Question: question})
+	if resp.Action != "ask_user" || resp.IsFinished || resp.Question != question {
+		t.Fatalf("long direct question must remain interactive: %#v", resp)
+	}
+}
+
+func TestFinalizeResponseNormalizesThinkAlias(t *testing.T) {
+	short := finalizeResponse(AgentResponse{Action: "think", Thought: "我再思考一下"})
+	if short.Action != "" || short.IsFinished {
+		t.Fatalf("short think alias should request a corrected action: %#v", short)
+	}
+	long := finalizeResponse(AgentResponse{Action: "think", Thought: strings.Repeat("完整总结。", 60)})
+	if long.Action != "finish" || !long.IsFinished || long.FinalReport == "" {
+		t.Fatalf("long think alias should become a final report: %#v", long)
+	}
+}
+
 func TestDecodeJSONUnicodeEscapesInCommand(t *testing.T) {
 	got := decodeJSONUnicodeEscapes(`chmod +x /opt/scripts/cpu_monitor.sh \u0026\u0026 ls -la /opt/scripts/cpu_monitor.sh`)
 	if got != "chmod +x /opt/scripts/cpu_monitor.sh && ls -la /opt/scripts/cpu_monitor.sh" {

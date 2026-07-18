@@ -1,6 +1,8 @@
 package builtin
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -51,6 +53,12 @@ func TestNormalizeBrowserMode(t *testing.T) {
 	}
 }
 
+func TestNormalizeURLRejectsNonHTTPNavigation(t *testing.T) {
+	if _, err := normalizeURL("javascript:alert(1)"); err == nil {
+		t.Fatal("javascript URL should be rejected")
+	}
+}
+
 func TestLimitedStringBufferTruncates(t *testing.T) {
 	var b limitedStringBuffer
 	b.max = 5
@@ -66,5 +74,74 @@ func TestLimitedStringBufferTruncates(t *testing.T) {
 	}
 	if !b.truncated {
 		t.Fatal("expected truncated flag")
+	}
+}
+
+func TestBrowserSelectorReference(t *testing.T) {
+	if got := browserSelector("@e12"); got != `[data-deepsentry-ref="e12"]` {
+		t.Fatalf("browserSelector reference = %q", got)
+	}
+	if got := browserSelector("#search"); got != "#search" {
+		t.Fatalf("browserSelector css = %q", got)
+	}
+}
+
+func TestSliceBrowserTextUsesRuneOffsets(t *testing.T) {
+	page, total, next := sliceBrowserText("甲乙丙丁戊", 2, 2)
+	if page != "丙丁" || total != 5 || next != 4 {
+		t.Fatalf("sliceBrowserText = page=%q total=%d next=%d", page, total, next)
+	}
+}
+
+func TestBrowserInstallGuideIsActionable(t *testing.T) {
+	guide := browserInstallGuide()
+	for _, want := range []string{"Browser installation guide", "browser_binary", "Chrome"} {
+		if !strings.Contains(guide, want) {
+			t.Fatalf("install guide missing %q: %s", want, guide)
+		}
+	}
+}
+
+func TestControlledHeadlessBrowserSession(t *testing.T) {
+	if bin, _ := findBrowserBinary(); bin == "" {
+		t.Skip("Chrome/Chromium is not installed in the test environment")
+	}
+	CloseBrowserSessions()
+	defer CloseBrowserSessions()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/next" {
+			_, _ = w.Write([]byte(`<!doctype html><html><head><title>Deep Result Page</title></head><body><p>followed link successfully</p></body></html>`))
+			return
+		}
+		_, _ = w.Write([]byte(`<!doctype html><html><head><title>Browser Control Test</title></head><body>
+<input id="query" aria-label="query"><button id="apply" onclick="document.getElementById('result').textContent=document.getElementById('query').value">Apply</button>
+<a id="next" href="/next">Read details</a><p id="result">waiting</p></body></html>`))
+	}))
+	defer server.Close()
+
+	out, err := BrowserBrowse("open", "", server.URL, "headless", "", 100, 5000, 0, 0, 120)
+	if err != nil {
+		t.Fatalf("open headless browser: %v", err)
+	}
+	if !strings.Contains(out, "Browser Control Test") || !strings.Contains(out, "@e") {
+		t.Fatalf("unexpected open snapshot: %s", out)
+	}
+	if _, err := BrowserInteract("type", "", "#query", "hello browser", "", "", true, false, 50, 5000, 0, 0, 120); err != nil {
+		t.Fatalf("type: %v", err)
+	}
+	out, err = BrowserInteract("click", "", "#apply", "", "", "", true, false, 50, 5000, 0, 0, 120)
+	if err != nil {
+		t.Fatalf("click: %v", err)
+	}
+	if !strings.Contains(out, "hello browser") {
+		t.Fatalf("interaction result missing from snapshot: %s", out)
+	}
+	out, err = BrowserBrowse("follow", "", "", "", "#next", 50, 5000, 0, 0, 120)
+	if err != nil {
+		t.Fatalf("follow link: %v", err)
+	}
+	if !strings.Contains(out, "Deep Result Page") || !strings.Contains(out, "followed link successfully") {
+		t.Fatalf("follow result missing destination snapshot: %s", out)
 	}
 }

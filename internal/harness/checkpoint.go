@@ -64,13 +64,9 @@ func (c *CheckpointStore) SessionDir() string {
 func (c *CheckpointStore) Save(data CheckpointData) error {
 	data.SessionID = c.sessionID
 	data.SavedAt = time.Now()
-	raw, err := json.MarshalIndent(data, "", "  ")
+	raw, err := security.RedactJSON(data)
 	if err != nil {
 		return err
-	}
-	raw = []byte(security.RedactSensitiveText(string(raw)))
-	if !json.Valid(raw) {
-		return fmt.Errorf("checkpoint 脱敏后 JSON 无效，已拒绝写入")
 	}
 	tmpFile, err := os.CreateTemp(c.dir, "checkpoint-*.tmp")
 	if err != nil {

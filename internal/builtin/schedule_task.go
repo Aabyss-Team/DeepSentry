@@ -31,8 +31,13 @@ func ScheduleTask(rt Runtime, args map[string]string) (string, error) {
 		if err := validateScheduleCreate(plan, args); err != nil {
 			return "", err
 		}
-		if err := store.Add(plan.Task); err != nil {
+		existing, created, err := store.AddUnique(plan.Task)
+		if err != nil {
 			return "", err
+		}
+		if !created {
+			plan.Task = existing
+			return "等价定时任务已存在，未重复创建。\n\n" + formatSchedulePlan(plan, true), nil
 		}
 		return formatSchedulePlan(plan, true), nil
 	case "list":
@@ -104,6 +109,9 @@ func optionalBool(args map[string]string, key string) *bool {
 
 func validateScheduleCreate(plan scheduler.Plan, args map[string]string) error {
 	task := plan.Task
+	if !argBool(args, "confirm_create") {
+		return fmt.Errorf("拒绝创建定时任务: add/create 必须显式提供 confirm_create=true；不确定时请先用 action=plan 预览")
+	}
 	if task.Kind != scheduler.KindAgent {
 		return nil
 	}

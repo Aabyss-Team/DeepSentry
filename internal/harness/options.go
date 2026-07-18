@@ -79,7 +79,7 @@ func defaultMiddlewareStack(catalog *skills.SkillCatalog, memStore *memory.Store
 		NewMemoryMiddleware(memStore),
 		NewTodoMiddleware(),
 		NewSkillsMiddleware(catalog),
-		NewToolsMiddleware(),
+		NewToolsMiddleware(catalog),
 		NewFilesystemMiddleware(memStore),
 		NewSubAgentMiddleware(),
 		NewContextMiddleware(),
@@ -91,7 +91,7 @@ func SubAgentMiddlewareStack(catalog *skills.SkillCatalog, memStore *memory.Stor
 	return []Middleware{
 		NewTodoMiddleware(),
 		NewSkillsMiddleware(catalog),
-		NewToolsMiddleware(),
+		NewToolsMiddleware(catalog),
 		NewFilesystemMiddleware(memStore),
 		NewContextMiddleware(),
 	}

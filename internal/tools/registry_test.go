@@ -45,6 +45,10 @@ func TestFormatCatalogDetail(t *testing.T) {
 	if !strings.Contains(headless, "headless_browser") {
 		t.Fatal("catalog detail should include headless_browser")
 	}
+	browser := FormatCatalogDetail("浏览器控制", "")
+	if !strings.Contains(browser, "browser_browse") || !strings.Contains(browser, "browser_interact") {
+		t.Fatal("catalog detail should include persistent browser control tools")
+	}
 	pcap := FormatCatalogDetail("抓包分析", "pcap")
 	if !strings.Contains(pcap, "pcap_analyze") || !strings.Contains(pcap, "gopacket") {
 		t.Fatal("catalog detail should include pcap_analyze")
@@ -118,6 +122,10 @@ func TestWorkflowContractsRejectIncompleteOrWrongTypedCalls(t *testing.T) {
 		{"tcp_forward", map[string]string{"action": "start", "listen_port": "abc", "target_host": "127.0.0.1", "target_port": "80"}, "必须是整数"},
 		{"schedule_task", map[string]string{"action": "remove"}, "id"},
 		{"tsecbench", map[string]string{"action": "submit", "unique_code": "demo"}, "flag"},
+		{"browser_browse", map[string]string{"action": "open"}, "url"},
+		{"browser_browse", map[string]string{"action": "follow"}, "selector"},
+		{"browser_interact", map[string]string{"action": "click"}, "selector"},
+		{"browser_interact", map[string]string{"action": "type", "selector": "@e1"}, "text"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -134,6 +142,27 @@ func TestWorkflowContractsRejectIncompleteOrWrongTypedCalls(t *testing.T) {
 	schema := JSONSchema("script_run")
 	if _, ok := schema["anyOf"]; !ok {
 		t.Fatalf("script_run native schema must express content/path requirement: %#v", schema)
+	}
+}
+
+func TestBrowserToolsSplitReadAndMutationRisk(t *testing.T) {
+	browse, ok := Get("browser_browse")
+	if !ok || browse.RiskLevel != RiskLow {
+		t.Fatalf("browser_browse should be auto-runnable read-only browsing: %#v", browse)
+	}
+	interact, ok := Get("browser_interact")
+	if !ok || interact.RiskLevel != RiskHigh {
+		t.Fatalf("browser_interact should require high-risk confirmation: %#v", interact)
+	}
+}
+
+func TestBrowserBrowseDispatchStatus(t *testing.T) {
+	out, risk, err := Run("browser_browse", map[string]string{"action": "status"}, false)
+	if err != nil {
+		t.Fatalf("browser_browse status dispatch failed: %v", err)
+	}
+	if risk != RiskLow || !strings.Contains(out, "Browser control status") {
+		t.Fatalf("unexpected browser status result risk=%q out=%q", risk, out)
 	}
 }
 
