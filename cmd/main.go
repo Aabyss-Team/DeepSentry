@@ -898,6 +898,19 @@ func runWebShellSupervisor() int {
 	reportPath := strings.TrimSpace(os.Getenv("DEEPSENTRY_REPORT_PATH"))
 	progressPath := strings.TrimSpace(os.Getenv("DEEPSENTRY_WEBSHELL_PROGRESS_PATH"))
 	statusPath := strings.TrimSpace(os.Getenv("DEEPSENTRY_WEBSHELL_STATUS_PATH"))
+	var err error
+	if reportPath, err = validateWebShellArtifactPath(reportPath, "report"); err != nil {
+		fmt.Printf("[WEB] 状态: failed exit_code=2 error=%s\n", err)
+		return 2
+	}
+	if progressPath, err = validateWebShellArtifactPath(progressPath, "progress"); err != nil {
+		fmt.Printf("[WEB] 状态: failed exit_code=2 error=%s\n", err)
+		return 2
+	}
+	if statusPath, err = validateWebShellArtifactPath(statusPath, "status"); err != nil {
+		fmt.Printf("[WEB] 状态: failed exit_code=2 error=%s\n", err)
+		return 2
+	}
 	status := readWebShellStatus(statusPath)
 	status.SchemaVersion = 1
 	status.Status = "starting"
@@ -960,7 +973,7 @@ func runWebShellSupervisor() int {
 		status.Error = waitErr.Error()
 	}
 	if code == 0 {
-		if _, statErr := os.Stat(reportPath); statErr != nil {
+		if _, statErr := os.Stat(reportPath); statErr != nil { // #nosec G703 -- reportPath is validated as reports/report_*.md before use.
 			code = 3
 			status.Error = "worker exited without a readable report"
 		}
@@ -1023,11 +1036,65 @@ func createWebShellArtifacts(stamp string) (*os.File, string, string, error) {
 	return nil, "", "", fmt.Errorf("无法生成唯一的 WebShell 任务文件名")
 }
 
+func validateWebShellArtifactPath(path, kind string) (string, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return "", fmt.Errorf("WebShell %s path is empty", kind)
+	}
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	absReports, err := filepath.Abs("reports")
+	if err != nil {
+		return "", err
+	}
+	rel, err := filepath.Rel(absReports, absPath)
+	if err != nil {
+		return "", err
+	}
+	if rel == "." || rel == ".." || filepath.IsAbs(rel) || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("WebShell %s path must stay under reports/: %s", kind, path)
+	}
+	if rel != filepath.Base(absPath) {
+		return "", fmt.Errorf("WebShell %s path must be a direct reports/ file: %s", kind, path)
+	}
+	base := filepath.Base(absPath)
+	if !webShellArtifactNameAllowed(base, kind) {
+		return "", fmt.Errorf("WebShell %s path has unsupported filename: %s", kind, base)
+	}
+	return absPath, nil
+}
+
+func webShellArtifactNameAllowed(base, kind string) bool {
+	switch kind {
+	case "report":
+		return strings.HasPrefix(base, "report_") && strings.HasSuffix(base, ".md")
+	case "progress":
+		return strings.HasPrefix(base, "webshell_progress_") && strings.HasSuffix(base, ".log")
+	case "status":
+		return strings.HasPrefix(base, "webshell_status_") && strings.HasSuffix(base, ".json")
+	case "latest":
+		return base == "latest_webshell.txt"
+	case "any":
+		return webShellArtifactNameAllowed(base, "report") ||
+			webShellArtifactNameAllowed(base, "progress") ||
+			webShellArtifactNameAllowed(base, "status") ||
+			webShellArtifactNameAllowed(base, "latest")
+	default:
+		return false
+	}
+}
+
 func writePrivateFile(path string, data []byte) error {
-	if err := os.WriteFile(path, data, 0o600); err != nil {
+	safePath, err := validateWebShellArtifactPath(path, "any")
+	if err != nil {
 		return err
 	}
-	return os.Chmod(path, 0o600)
+	if err := os.WriteFile(safePath, data, 0o600); err != nil { // #nosec G703 -- safePath is restricted to known WebShell artifact files under reports/.
+		return err
+	}
+	return os.Chmod(safePath, 0o600) // #nosec G703 -- safePath is restricted to known WebShell artifact files under reports/.
 }
 
 func webShellStatusPath(progressPath string) string {
@@ -1051,7 +1118,11 @@ func writeWebShellStatus(path string, status webShellTaskStatus) error {
 
 func readWebShellStatus(path string) webShellTaskStatus {
 	var status webShellTaskStatus
-	raw, err := os.ReadFile(path)
+	safePath, err := validateWebShellArtifactPath(path, "status")
+	if err != nil {
+		return status
+	}
+	raw, err := os.ReadFile(safePath) // #nosec G703 -- safePath is restricted to reports/webshell_status_*.json.
 	if err == nil {
 		_ = json.Unmarshal(raw, &status)
 	}

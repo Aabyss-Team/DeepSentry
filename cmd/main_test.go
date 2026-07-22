@@ -233,7 +233,19 @@ func TestNoTUIExplicitTaskIsOneShotEvenWithPseudoTTY(t *testing.T) {
 }
 
 func TestWebShellStatusIsPrivateAndRoundTrips(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "webshell_status_task.json")
+	tmp := t.TempDir()
+	oldwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(oldwd)
+	if err := os.Chdir(tmp); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll("reports", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join("reports", "webshell_status_task.json")
 	code := 0
 	want := webShellTaskStatus{
 		SchemaVersion: 1,
@@ -268,6 +280,57 @@ func TestWebShellStatusIsPrivateAndRoundTrips(t *testing.T) {
 	}
 	if notice := webShellNoticeText(want.ReportPath, want.ProgressPath, path, "/tmp/latest.txt"); !strings.Contains(notice, "任务状态文件") || !strings.Contains(notice, "cat "+path) {
 		t.Fatalf("notice does not expose status path: %s", notice)
+	}
+}
+
+func TestValidateWebShellArtifactPathRestrictsToReports(t *testing.T) {
+	tmp := t.TempDir()
+	oldwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(oldwd)
+	if err := os.Chdir(tmp); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll("reports", 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	valid := map[string]string{
+		"report":   filepath.Join("reports", "report_20260722_120000.md"),
+		"progress": filepath.Join("reports", "webshell_progress_20260722_120000.log"),
+		"status":   filepath.Join("reports", "webshell_status_20260722_120000.json"),
+		"latest":   filepath.Join("reports", "latest_webshell.txt"),
+	}
+	for kind, path := range valid {
+		got, err := validateWebShellArtifactPath(path, kind)
+		if err != nil {
+			t.Fatalf("valid %s path rejected: %v", kind, err)
+		}
+		if !filepath.IsAbs(got) {
+			t.Fatalf("validated %s path is not absolute: %s", kind, got)
+		}
+	}
+
+	invalid := []struct {
+		kind string
+		path string
+	}{
+		{"status", filepath.Join("..", "webshell_status_task.json")},
+		{"status", filepath.Join(tmp, "webshell_status_task.json")},
+		{"status", filepath.Join("reports", "nested", "webshell_status_task.json")},
+		{"status", filepath.Join("reports", "report_task.md")},
+		{"report", filepath.Join("reports", "webshell_status_task.json")},
+		{"any", filepath.Join("reports", "random.txt")},
+	}
+	for _, tt := range invalid {
+		if got, err := validateWebShellArtifactPath(tt.path, tt.kind); err == nil {
+			t.Fatalf("invalid %s path accepted as %s: %s", tt.kind, got, tt.path)
+		}
+	}
+	if err := writePrivateFile(filepath.Join("..", "webshell_status_task.json"), []byte("bad")); err == nil {
+		t.Fatal("writePrivateFile accepted a path outside reports/")
 	}
 }
 
