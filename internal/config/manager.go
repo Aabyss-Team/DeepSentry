@@ -531,11 +531,15 @@ func manageSetSSH(root *yaml.Node, args map[string]string) (string, error) {
 	user := valueOr(firstConfigArg(args, "user", "ssh_user", "username"), "root")
 	password := firstConfigArg(args, "password", "ssh_password", "pass")
 	keyPath := firstConfigArg(args, "key_path", "ssh_key_path", "key")
+	deviceType := valueOr(firstConfigArg(args, "device_type", "ssh_device_type"), "auto")
 	setScalar(root, "target_protocol", "ssh")
 	setScalar(root, "ssh_host", host)
 	setScalar(root, "ssh_user", user)
 	setScalar(root, "ssh_password", password)
 	setScalar(root, "ssh_key_path", keyPath)
+	setScalar(root, "ssh_device_type", deviceType)
+	setScalar(root, "ssh_prompt", firstConfigArg(args, "prompt", "ssh_prompt"))
+	setScalar(root, "ssh_enable_password", firstConfigArg(args, "enable_password", "ssh_enable_password"))
 	return fmt.Sprintf("已设置单目标 SSH: %s@%s", user, host), nil
 }
 
@@ -558,6 +562,20 @@ func manageSetScalar(root *yaml.Node, args map[string]string) (string, error) {
 func validateManagedScalar(key, value string) error {
 	value = strings.TrimSpace(value)
 	switch key {
+	case "agent_runtime":
+		switch strings.ToLower(value) {
+		case "legacy", "v3":
+			return nil
+		default:
+			return fmt.Errorf("agent_runtime 必须是 legacy|v3，收到 %q", value)
+		}
+	case "terminal_theme":
+		switch strings.ToLower(value) {
+		case "auto", "dark", "light":
+			return nil
+		default:
+			return fmt.Errorf("terminal_theme 必须是 auto|dark|light，收到 %q", value)
+		}
 	case "model_profile":
 		switch strings.ToLower(value) {
 		case "auto", ModelProfileCompact, ModelProfileBalanced, ModelProfileFull:
@@ -1103,12 +1121,23 @@ func targetNode(t TargetConfig) *yaml.Node {
 		{"password", t.Password},
 		{"key_path", t.KeyPath},
 		{"prompt", t.Prompt},
+		{"auth_prompt_regex", t.AuthPromptRegex},
+		{"device_type", t.DeviceType},
+		{"enable_password", t.EnablePassword},
+		{"ftp_tls_mode", t.FTPTLSMode},
+		{"ftp_tls_server_name", t.FTPTLSServerName},
+		{"ftp_tls_ca_file", t.FTPTLSCAFile},
+		{"ftp_data_mode", t.FTPDataMode},
+		{"ftp_active_address", t.FTPActiveAddress},
 	}
 	node := &yaml.Node{Kind: yaml.MappingNode}
 	for _, f := range fields {
 		if f.value != "" || f.key == "password" || f.key == "key_path" {
 			node.Content = append(node.Content, scalarNode(f.key), scalarNode(f.value))
 		}
+	}
+	if t.FTPTLSInsecureSkipVerify {
+		node.Content = append(node.Content, scalarNode("ftp_tls_insecure_skip_verify"), boolNode(true))
 	}
 	if len(t.Tags) > 0 {
 		seq := &yaml.Node{Kind: yaml.SequenceNode}
@@ -1200,14 +1229,23 @@ func splitManagedEndpoint(endpoint string) (string, string) {
 
 func configTargetFromArgs(name, protocol, host string, args map[string]string) TargetConfig {
 	return TargetConfig{
-		Name:     name,
-		Protocol: protocol,
-		Host:     host,
-		User:     valueOr(firstConfigArg(args, "user", "ssh_user", "username"), defaultUser(protocol)),
-		Password: firstConfigArg(args, "password", "ssh_password", "pass"),
-		KeyPath:  firstConfigArg(args, "key_path", "ssh_key_path", "key"),
-		Prompt:   firstConfigArg(args, "prompt"),
-		Tags:     splitTags(firstConfigArg(args, "tags", "tag")),
+		Name:                     name,
+		Protocol:                 protocol,
+		Host:                     host,
+		User:                     valueOr(firstConfigArg(args, "user", "ssh_user", "username"), defaultUser(protocol)),
+		Password:                 firstConfigArg(args, "password", "ssh_password", "pass"),
+		KeyPath:                  firstConfigArg(args, "key_path", "ssh_key_path", "key"),
+		Prompt:                   firstConfigArg(args, "prompt"),
+		AuthPromptRegex:          firstConfigArg(args, "auth_prompt_regex", "telnet_auth_prompt_regex"),
+		DeviceType:               valueOr(firstConfigArg(args, "device_type", "ssh_device_type", "telnet_device_type"), "auto"),
+		EnablePassword:           firstConfigArg(args, "enable_password", "ssh_enable_password", "telnet_enable_password"),
+		FTPTLSMode:               firstConfigArg(args, "ftp_tls_mode", "tls_mode"),
+		FTPTLSServerName:         firstConfigArg(args, "ftp_tls_server_name", "tls_server_name"),
+		FTPTLSCAFile:             firstConfigArg(args, "ftp_tls_ca_file", "tls_ca_file"),
+		FTPTLSInsecureSkipVerify: parseBoolArg(firstConfigArg(args, "ftp_tls_insecure_skip_verify", "tls_insecure_skip_verify")),
+		FTPDataMode:              firstConfigArg(args, "ftp_data_mode", "data_mode"),
+		FTPActiveAddress:         firstConfigArg(args, "ftp_active_address", "active_address"),
+		Tags:                     splitTags(firstConfigArg(args, "tags", "tag")),
 	}
 }
 
@@ -1220,12 +1258,15 @@ func currentSingleTarget(root *yaml.Node) (TargetConfig, bool) {
 			return TargetConfig{}, false
 		}
 		return TargetConfig{
-			Name:     defaultTargetName("ssh", host),
-			Protocol: "ssh",
-			Host:     host,
-			User:     valueOr(readScalar(root, "ssh_user"), "root"),
-			Password: readScalar(root, "ssh_password"),
-			KeyPath:  readScalar(root, "ssh_key_path"),
+			Name:           defaultTargetName("ssh", host),
+			Protocol:       "ssh",
+			Host:           host,
+			User:           valueOr(readScalar(root, "ssh_user"), "root"),
+			Password:       readScalar(root, "ssh_password"),
+			KeyPath:        readScalar(root, "ssh_key_path"),
+			Prompt:         readScalar(root, "ssh_prompt"),
+			DeviceType:     valueOr(readScalar(root, "ssh_device_type"), "auto"),
+			EnablePassword: readScalar(root, "ssh_enable_password"),
 		}, true
 	case "telnet":
 		host := readScalar(root, "telnet_host")
@@ -1233,12 +1274,15 @@ func currentSingleTarget(root *yaml.Node) (TargetConfig, bool) {
 			return TargetConfig{}, false
 		}
 		return TargetConfig{
-			Name:     defaultTargetName("telnet", host),
-			Protocol: "telnet",
-			Host:     host,
-			User:     valueOr(readScalar(root, "telnet_user"), "root"),
-			Password: readScalar(root, "telnet_password"),
-			Prompt:   readScalar(root, "telnet_prompt"),
+			Name:            defaultTargetName("telnet", host),
+			Protocol:        "telnet",
+			Host:            host,
+			User:            valueOr(readScalar(root, "telnet_user"), "root"),
+			Password:        readScalar(root, "telnet_password"),
+			Prompt:          readScalar(root, "telnet_prompt"),
+			AuthPromptRegex: readScalar(root, "telnet_auth_prompt_regex"),
+			DeviceType:      valueOr(readScalar(root, "telnet_device_type"), "auto"),
+			EnablePassword:  readScalar(root, "telnet_enable_password"),
 		}, true
 	case "ftp":
 		host := readScalar(root, "ftp_host")
@@ -1246,11 +1290,17 @@ func currentSingleTarget(root *yaml.Node) (TargetConfig, bool) {
 			return TargetConfig{}, false
 		}
 		return TargetConfig{
-			Name:     defaultTargetName("ftp", host),
-			Protocol: "ftp",
-			Host:     host,
-			User:     valueOr(readScalar(root, "ftp_user"), "anonymous"),
-			Password: readScalar(root, "ftp_password"),
+			Name:                     defaultTargetName("ftp", host),
+			Protocol:                 "ftp",
+			Host:                     host,
+			User:                     valueOr(readScalar(root, "ftp_user"), "anonymous"),
+			Password:                 readScalar(root, "ftp_password"),
+			FTPTLSMode:               readScalar(root, "ftp_tls_mode"),
+			FTPTLSServerName:         readScalar(root, "ftp_tls_server_name"),
+			FTPTLSCAFile:             readScalar(root, "ftp_tls_ca_file"),
+			FTPTLSInsecureSkipVerify: parseBoolArg(readScalar(root, "ftp_tls_insecure_skip_verify")),
+			FTPDataMode:              readScalar(root, "ftp_data_mode"),
+			FTPActiveAddress:         readScalar(root, "ftp_active_address"),
 		}, true
 	default:
 		return TargetConfig{}, false
@@ -1259,12 +1309,13 @@ func currentSingleTarget(root *yaml.Node) (TargetConfig, bool) {
 
 func clearSingleTargetScalars(root *yaml.Node) {
 	for _, key := range []string{
-		"ssh_host", "ssh_user", "ssh_password", "ssh_key_path",
-		"telnet_host", "telnet_user", "telnet_password", "telnet_prompt",
-		"ftp_host", "ftp_user", "ftp_password",
+		"ssh_host", "ssh_user", "ssh_password", "ssh_key_path", "ssh_device_type", "ssh_prompt", "ssh_enable_password",
+		"telnet_host", "telnet_user", "telnet_password", "telnet_prompt", "telnet_auth_prompt_regex", "telnet_device_type", "telnet_enable_password",
+		"ftp_host", "ftp_user", "ftp_password", "ftp_tls_mode", "ftp_tls_server_name", "ftp_tls_ca_file", "ftp_data_mode", "ftp_active_address",
 	} {
 		setScalar(root, key, "")
 	}
+	setBoolScalar(root, "ftp_tls_insecure_skip_verify", false)
 }
 
 func readTargets(root *yaml.Node) []TargetConfig {
@@ -1278,14 +1329,23 @@ func readTargets(root *yaml.Node) []TargetConfig {
 			continue
 		}
 		targets = append(targets, TargetConfig{
-			Name:     readScalar(item, "name"),
-			Protocol: readScalar(item, "protocol"),
-			Host:     readScalar(item, "host"),
-			User:     readScalar(item, "user"),
-			Password: readScalar(item, "password"),
-			KeyPath:  readScalar(item, "key_path"),
-			Prompt:   readScalar(item, "prompt"),
-			Tags:     readScalarSeq(item, "tags"),
+			Name:                     readScalar(item, "name"),
+			Protocol:                 readScalar(item, "protocol"),
+			Host:                     readScalar(item, "host"),
+			User:                     readScalar(item, "user"),
+			Password:                 readScalar(item, "password"),
+			KeyPath:                  readScalar(item, "key_path"),
+			Prompt:                   readScalar(item, "prompt"),
+			AuthPromptRegex:          readScalar(item, "auth_prompt_regex"),
+			DeviceType:               readScalar(item, "device_type"),
+			EnablePassword:           readScalar(item, "enable_password"),
+			FTPTLSMode:               readScalar(item, "ftp_tls_mode"),
+			FTPTLSServerName:         readScalar(item, "ftp_tls_server_name"),
+			FTPTLSCAFile:             readScalar(item, "ftp_tls_ca_file"),
+			FTPTLSInsecureSkipVerify: parseBoolArg(readScalar(item, "ftp_tls_insecure_skip_verify")),
+			FTPDataMode:              readScalar(item, "ftp_data_mode"),
+			FTPActiveAddress:         readScalar(item, "ftp_active_address"),
+			Tags:                     readScalarSeq(item, "tags"),
 		})
 	}
 	return targets
@@ -1367,11 +1427,11 @@ func allowedScalarConfigKey(key string) bool {
 	switch key {
 	case "provider", "api_protocol", "api_url", "model_name", "api_key", "temperature",
 		"model_profile", "model_parameter_b", "context_window_tokens", "context_utilization",
-		"reserved_output_tokens", "native_tool_limit",
+		"reserved_output_tokens", "native_tool_limit", "agent_runtime", "terminal_theme",
 		"llm_timeout_sec", "llm_retries", "ssh_command_timeout_sec", "ssh_max_output_bytes",
 		"max_steps", "subagent_max_steps", "target_protocol", "ssh_host", "ssh_user",
-		"ssh_password", "ssh_key_path", "ssh_host_key_policy", "ssh_known_hosts_path", "telnet_host", "telnet_user", "telnet_password",
-		"telnet_prompt", "ftp_host", "ftp_user", "ftp_password", "use_native_tools",
+		"ssh_password", "ssh_key_path", "ssh_host_key_policy", "ssh_known_hosts_path", "ssh_device_type", "ssh_prompt", "ssh_enable_password", "telnet_host", "telnet_user", "telnet_password",
+		"telnet_prompt", "telnet_auth_prompt_regex", "telnet_device_type", "telnet_enable_password", "ftp_host", "ftp_user", "ftp_password", "ftp_tls_mode", "ftp_tls_server_name", "ftp_tls_ca_file", "ftp_tls_insecure_skip_verify", "ftp_data_mode", "ftp_active_address", "ftp_connect_timeout_sec", "ftp_command_timeout_sec", "ftp_transfer_timeout_sec", "use_native_tools",
 		"controller_proxy", "browser_binary", "browser_timeout_sec", "browser_artifact_dir",
 		"archive_max_entries", "archive_max_file_bytes", "archive_max_total_bytes",
 		"scheduler_enabled", "scheduler_store", "scheduler_interval_sec", "scheduler_timezone",

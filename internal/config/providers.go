@@ -45,7 +45,9 @@ type ProviderPreset struct {
 	NativeTools bool
 }
 
-// AllProviders 市场主流 API 预设（默认各家较新模型，用户可在 config 覆盖）
+// AllProviders contains convenience API/model presets. They are compatibility
+// defaults rather than a promise that a provider still labels them "latest";
+// operators can always override endpoint and model in config.
 var AllProviders = []ProviderPreset{
 	{
 		ID: ProviderOpenAI, DisplayName: "OpenAI",

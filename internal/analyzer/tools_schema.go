@@ -31,12 +31,25 @@ func AgentToolDefinitions() []ToolDefinition {
 // present, so omitted tools remain discoverable/invokable via the compatibility
 // path after tool_catalog describes them.
 func AgentToolDefinitionsForContext(limit int, contextText string) []ToolDefinition {
+	return agentToolDefinitionsForContext(limit, contextText, nil)
+}
+
+// AgentToolDefinitionsForContextWithPinned implements the Runtime v3 deferred
+// tool contract. Tools already discovered or successfully invoked remain
+// visible even when the per-turn candidate set changes. This cumulative
+// behavior prevents a verified schema from falling out of the next request
+// after context compaction.
+func AgentToolDefinitionsForContextWithPinned(limit int, contextText string, pinned []string) []ToolDefinition {
+	return agentToolDefinitionsForContext(limit, contextText, pinned)
+}
+
+func agentToolDefinitionsForContext(limit int, contextText string, pinned []string) []ToolDefinition {
 	definitions := []ToolDefinition{
 		{
 			Type: "function",
 			Function: FunctionDef{
 				Name:        "agent_action",
-				Description: "Execute a DeepSentry agent action. Prefer action=execute with native shell first; use action=tool only when shell is insufficient or a specialized DeepSentry tool is required.",
+				Description: "Execute a DeepSentry action that is not already exposed as a direct native function. Never wrap a visible built-in in agent_action; call that native function directly. Prefer action=execute for ordinary shell work.",
 				Parameters: map[string]interface{}{
 					"type": "object",
 					"properties": map[string]interface{}{
@@ -110,11 +123,11 @@ func AgentToolDefinitionsForContext(limit int, contextText string) []ToolDefinit
 		Type: "function",
 		Function: FunctionDef{
 			Name:        "tool_catalog",
-			Description: "Discover DeepSentry built-in tools or inspect one tool's full workflow and examples before calling it.",
+			Description: "Discover a DeepSentry built-in only when no currently exposed specialized function matches. Never repeat the same catalog search; after discovery invoke the returned exact tool instead of searching again.",
 			Parameters:  deepsentrytools.JSONSchema("tool_catalog"),
 		},
 	})
-	names := selectNativeToolNames(deepsentrytools.ListNames(), limit, contextText)
+	names := selectNativeToolNamesWithPinned(deepsentrytools.ListNames(), limit, contextText, pinned)
 	for _, name := range names {
 		tool, ok := deepsentrytools.Get(name)
 		if !ok {
@@ -123,6 +136,9 @@ func AgentToolDefinitionsForContext(limit int, contextText string) []ToolDefinit
 		description := fmt.Sprintf("DeepSentry built-in [%s, %s]. %s", tool.Category, tool.Perspective, tool.Description)
 		if help := deepsentrytools.FormatToolHelp(name); help != "" {
 			description += "\n" + truncateToolDescription(help, 800)
+		}
+		if aliases := deepsentrytools.SearchAliases(name); len(aliases) > 0 {
+			description += "\nTypical intents / 常见意图: " + strings.Join(aliases, ", ")
 		}
 		definitions = append(definitions, ToolDefinition{
 			Type: "function",
@@ -159,50 +175,44 @@ func AgentToolDefinitionsForContext(limit int, contextText string) []ToolDefinit
 	return definitions
 }
 
-func selectNativeToolNames(names []string, limit int, contextText string) []string {
+func selectNativeToolNamesWithPinned(names []string, limit int, contextText string, pinned []string) []string {
 	sort.Strings(names)
 	if limit <= 0 || len(names) <= limit {
 		return names
 	}
 	query := strings.ToLower(contextText)
-	coreOrder := []string{"config_manage", "fleet_inventory", "fleet_exec", "fleet_file", "target_health_summary", "read_log"}
 	selected := make([]string, 0, limit)
 	seen := map[string]bool{}
-	for _, name := range coreOrder {
-		if len(selected) >= limit {
-			break
+	// Previously selected tools have the strongest claim on the bounded native
+	// schema budget. Ignore stale/disabled names and preserve deterministic
+	// order so provider prompt caching remains as stable as possible.
+	pinned = append([]string(nil), pinned...)
+	sort.Strings(pinned)
+	for _, name := range pinned {
+		name = strings.TrimSpace(name)
+		if name == "" || seen[name] || !containsToolName(names, name) || len(selected) >= limit {
+			continue
 		}
-		if containsToolName(names, name) {
-			selected = append(selected, name)
-			seen[name] = true
-		}
+		selected = append(selected, name)
+		seen[name] = true
 	}
 	type scoredTool struct {
 		name  string
 		score int
 	}
 	var scored []scoredTool
-	terms := strings.FieldsFunc(query, func(r rune) bool {
-		return r == ' ' || r == ',' || r == '，' || r == '/' || r == ':' || r == '\n' || r == '\t'
-	})
 	for _, name := range names {
 		if seen[name] {
+			continue
+		}
+		if name == "config_manage" && !explicitDeepSentryConfigIntent(query) {
 			continue
 		}
 		tool, ok := deepsentrytools.Get(name)
 		if !ok {
 			continue
 		}
-		haystack := strings.ToLower(name + " " + tool.Category + " " + tool.Description + " " + tool.ArgsHint)
-		score := 0
-		if strings.Contains(query, strings.ToLower(name)) {
-			score += 100
-		}
-		for _, term := range terms {
-			if len([]rune(term)) >= 2 && strings.Contains(haystack, term) {
-				score += 5
-			}
-		}
+		score := deepsentrytools.SearchRelevance(tool, query)
 		scored = append(scored, scoredTool{name: name, score: score})
 	}
 	sort.Slice(scored, func(i, j int) bool {
@@ -215,9 +225,30 @@ func selectNativeToolNames(names []string, limit int, contextText string) []stri
 		if len(selected) >= limit {
 			break
 		}
+		// Runtime v3 uses true deferred exposure: zero-relevance tools remain
+		// hidden and are available through tool_catalog. Alphabetically filling
+		// the remaining budget made config_manage and other unrelated tools look
+		// like recommendations, which measurably reduced long-tail selection.
+		if item.score <= 0 {
+			continue
+		}
 		selected = append(selected, item.name)
 	}
 	return selected
+}
+
+func explicitDeepSentryConfigIntent(query string) bool {
+	query = strings.ToLower(query)
+	for _, marker := range []string{
+		"deepsentry", "config.yaml", "agent_runtime", "添加目标", "新增目标", "修改目标",
+		"fleet目标", "mcp server", "mcp_server", "skill来源", "启用skill", "禁用skill",
+		"enable skill", "disable skill", "show config", "config status", "manage config", "配置状态",
+	} {
+		if strings.Contains(query, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func containsToolName(names []string, want string) bool {

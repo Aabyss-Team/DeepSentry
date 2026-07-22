@@ -139,3 +139,24 @@ func TestCheckRiskRejectsTLSVerificationBypass(t *testing.T) {
 		}
 	}
 }
+
+func TestCheckRiskNetworkDeviceReadOnlyCommands(t *testing.T) {
+	for _, cmd := range []string{"display version", "display interface brief", "display ip routing-table", "display logbuffer | include ERROR", "display interface GigabitEthernet2/1/2 | include rate|packets|bytes|bandwidth|utilization|last|input|output", "show version", "show interfaces status", "show logging | section auth"} {
+		if risk, reason := CheckRisk(cmd); risk != "low" {
+			t.Fatalf("network read-only command %q risk=%s reason=%s", cmd, risk, reason)
+		}
+	}
+	for _, cmd := range []string{"super", "enable", "system-view", "configure terminal", "interface GigabitEthernet1/0/1", "save", "reset interface counters"} {
+		if risk, reason := CheckRisk(cmd); risk != "high" {
+			t.Fatalf("network mutation/elevation command %q risk=%s reason=%s", cmd, risk, reason)
+		}
+	}
+	for _, cmd := range []string{"quit", "return", "exit"} {
+		if risk, reason := CheckRisk(cmd); risk != "low" {
+			t.Fatalf("network view exit command %q risk=%s reason=%s", cmd, risk, reason)
+		}
+	}
+	if risk, _ := CheckRisk("display version | include VRP|rm -rf /tmp/x"); risk != "high" {
+		t.Fatalf("shell pipeline hidden after network regex must remain high risk, got %s", risk)
+	}
+}

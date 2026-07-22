@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -69,18 +70,46 @@ func TestTruncateOutput(t *testing.T) {
 }
 
 func TestLocalExecutorRunWithStreamingEmitsLines(t *testing.T) {
-	var lines []string
-	out, err := (&LocalExecutor{}).RunWithStreaming("printf 'one\\n'; printf 'two\\n'", func(line string) {
-		lines = append(lines, line)
-	})
+	for i := 0; i < 50; i++ {
+		var lines []string
+		out, err := (&LocalExecutor{}).RunWithStreaming("printf 'one\\n'; printf 'two\\n'", func(line string) {
+			lines = append(lines, line)
+		})
+		if err != nil {
+			t.Fatalf("iteration %d: RunWithStreaming failed: %v", i, err)
+		}
+		if !strings.Contains(out, "one") || !strings.Contains(out, "two") {
+			t.Fatalf("iteration %d: expected collected output to include both lines, got %q", i, out)
+		}
+		if len(lines) != 2 || lines[0] != "one\n" || lines[1] != "two\n" {
+			t.Fatalf("iteration %d: expected two streamed lines, got %#v", i, lines)
+		}
+	}
+}
+
+func TestLocalExecutorReturnsAfterForegroundShellWhenBackgroundServiceKeepsPipeOpen(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses POSIX background process semantics")
+	}
+	start := time.Now()
+	out, err := (&LocalExecutor{}).RunWithStreaming(`sleep 10 & child=$!; printf 'READY %s\n' "$child"`, nil)
 	if err != nil {
-		t.Fatalf("RunWithStreaming failed: %v", err)
+		t.Fatalf("background service launch failed: %v (output=%q)", err, out)
 	}
-	if !strings.Contains(out, "one") || !strings.Contains(out, "two") {
-		t.Fatalf("expected collected output to include both lines, got %q", out)
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("executor waited for background service pipe EOF: %s", elapsed)
 	}
-	if len(lines) != 2 || lines[0] != "one\n" || lines[1] != "two\n" {
-		t.Fatalf("expected two streamed lines, got %#v", lines)
+	fields := strings.Fields(out)
+	if len(fields) != 2 || fields[0] != "READY" {
+		t.Fatalf("unexpected launch output: %q", out)
+	}
+	pid, parseErr := strconv.Atoi(fields[1])
+	if parseErr != nil || pid <= 0 {
+		t.Fatalf("invalid background pid in %q", out)
+	}
+	process, findErr := os.FindProcess(pid)
+	if findErr == nil {
+		_ = process.Kill()
 	}
 }
 

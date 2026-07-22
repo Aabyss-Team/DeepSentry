@@ -1641,6 +1641,61 @@ func TestScrollingInvalidatesEveryInputFooterRowWithoutMovingIMEAnchor(t *testin
 	}
 }
 
+func TestViewportRefreshInvalidatesWholeFrameWithoutMovingIMEAnchor(t *testing.T) {
+	m := NewAgentModel(nil, "provider / model", "local", 50, true, false, StartupInfo{AwaitGoal: true})
+	m.width, m.height = 90, 20
+	m.input.Focus()
+	m.input.SetValue("中文输入")
+	m.input.SetCursor(len([]rune(m.input.Value())))
+	m.appendLine("info", "stable content", "stable content")
+	m.recalcLayout()
+	m.refreshViewport()
+
+	before := m.View()
+	beforeRow, beforeCol, beforeMode := m.cursorAnchor.snapshot()
+	m.refreshViewport()
+	after := m.View()
+	afterRow, afterCol, afterMode := m.cursorAnchor.snapshot()
+
+	if beforeRow != afterRow || beforeCol != afterCol || beforeMode != afterMode {
+		t.Fatalf("full repaint moved IME anchor: before=%d,%d/%d after=%d,%d/%d", beforeRow, beforeCol, beforeMode, afterRow, afterCol, afterMode)
+	}
+	beforeLines, afterLines := strings.Split(before, "\n"), strings.Split(after, "\n")
+	if len(beforeLines) != len(afterLines) {
+		t.Fatalf("frame height changed across identical refresh: %d != %d", len(beforeLines), len(afterLines))
+	}
+	for i := range beforeLines {
+		if beforeLines[i] == afterLines[i] {
+			t.Fatalf("row %d remained renderer-cache-identical across full refresh", i)
+		}
+	}
+	_, beforeClean := stripFrameMarkers([]byte(before))
+	_, afterClean := stripFrameMarkers([]byte(after))
+	if string(beforeClean) != string(afterClean) {
+		t.Fatal("private repaint markers changed the visible frame")
+	}
+}
+
+func TestDuplicateThoughtAndAskDisplayAreCoalesced(t *testing.T) {
+	m := NewAgentModel(nil, "model", "local", 50, true, false, StartupInfo{})
+	m.currentStep = 1
+	m.applyEvent(harness.UIEvent{Kind: harness.EventThought, Message: "同一段思考"})
+	m.applyEvent(harness.UIEvent{Kind: harness.EventThought, Message: "同一段思考"})
+	if len(m.lines) != 1 {
+		t.Fatalf("duplicate thought events were both retained: %#v", m.lines)
+	}
+
+	prompt := "请补充比赛题目\n请补充比赛题目\n题目文件在哪里？"
+	m.appendAskLine(prompt, nil)
+	got := m.lines[len(m.lines)-1].content
+	if strings.Count(got, "请补充比赛题目") != 1 {
+		t.Fatalf("duplicate ask display line was retained: %q", got)
+	}
+	if m.lines[len(m.lines)-1].raw != prompt {
+		t.Fatal("display deduplication modified the raw ask/checkpoint content")
+	}
+}
+
 func assertFocusedInputFooterVisible(t *testing.T, m AgentModel) {
 	t.Helper()
 	view := stripANSIForTest(m.View())
@@ -1672,7 +1727,7 @@ func TestConfirmPromptResolvesInline(t *testing.T) {
 	m := NewAgentModel(nil, "model", "local", 30, false, false, StartupInfo{})
 	m.width, m.height = 80, 20
 	m.recalcLayout()
-	ch := make(chan bool, 1)
+	ch := make(chan approvalDecision, 1)
 	updated, _ := m.Update(confirmMsg{prompt: "**高风险命令**\n\n`rm -rf /tmp/example`", respCh: ch})
 	m = updated.(AgentModel)
 	m.refreshViewport()
@@ -1682,7 +1737,7 @@ func TestConfirmPromptResolvesInline(t *testing.T) {
 
 	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
 	m = updated.(AgentModel)
-	if approved := <-ch; approved {
+	if decision := <-ch; decision != approvalDeny {
 		t.Fatal("n should reject confirmation")
 	}
 	view := stripANSIForTest(m.viewport.View())
@@ -1695,10 +1750,11 @@ func TestConfirmAcceptsUppercaseAndEnterSafelyRejects(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
 		key      tea.KeyMsg
-		approved bool
+		decision approvalDecision
 	}{
-		{name: "uppercase approve", key: tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'Y'}}, approved: true},
-		{name: "enter rejects", key: tea.KeyMsg{Type: tea.KeyEnter}, approved: false},
+		{name: "uppercase approve", key: tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'Y'}}, decision: approvalAllowOnce},
+		{name: "session approve", key: tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}}, decision: approvalAllowSession},
+		{name: "enter rejects", key: tea.KeyMsg{Type: tea.KeyEnter}, decision: approvalDeny},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			m := NewAgentModel(nil, "model", "local", 30, false, false, StartupInfo{})
@@ -1706,7 +1762,7 @@ func TestConfirmAcceptsUppercaseAndEnterSafelyRejects(t *testing.T) {
 			m.recalcLayout()
 			m.input.Focus()
 			m.input.SetValue("preserved draft")
-			ch := make(chan bool, 1)
+			ch := make(chan approvalDecision, 1)
 			updated, _ := m.Update(confirmMsg{prompt: "confirm", respCh: ch})
 			m = updated.(AgentModel)
 			if m.inputFocused() {
@@ -1714,8 +1770,8 @@ func TestConfirmAcceptsUppercaseAndEnterSafelyRejects(t *testing.T) {
 			}
 			updated, _ = m.Update(tc.key)
 			m = updated.(AgentModel)
-			if got := <-ch; got != tc.approved {
-				t.Fatalf("approval=%v want %v", got, tc.approved)
+			if got := <-ch; got != tc.decision {
+				t.Fatalf("approval decision=%v want %v", got, tc.decision)
 			}
 			if !m.inputFocused() || m.input.Value() != "preserved draft" {
 				t.Fatalf("previous input focus/draft was not restored: focused=%v value=%q", m.inputFocused(), m.input.Value())

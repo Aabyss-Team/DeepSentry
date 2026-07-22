@@ -90,6 +90,12 @@ func StripANSIIfPlain(s string) string {
 	if ColorEnabled() {
 		return s
 	}
+	return StripANSI(s)
+}
+
+// StripANSI removes CSI color/style sequences unconditionally. It is used by
+// non-TTY sinks whose output is consumed as logs rather than terminal frames.
+func StripANSI(s string) string {
 	var b strings.Builder
 	inSeq := false
 	for i := 0; i < len(s); i++ {
@@ -112,7 +118,7 @@ func StripANSIIfPlain(s string) string {
 
 func TerminalText(s string) string {
 	if !ColorEnabled() {
-		s = StripANSIIfPlain(s)
+		s = StripANSI(s)
 	}
 	if !PlainTextMode() {
 		return s

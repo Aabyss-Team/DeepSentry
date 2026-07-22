@@ -47,7 +47,7 @@ func encodeFooterFrameMarker(version uint64) string {
 // renderer output wrapper. This keeps macOS IME candidate placement aligned
 // without racing Bubble Tea with independent stdout writes.
 type inputCursorAnchorState struct {
-	position atomic.Uint64
+	position atomic.Pointer[renderedCursorAnchor]
 	mode     atomic.Int32
 }
 
@@ -67,7 +67,9 @@ func (s *inputCursorAnchorState) show(row, col int) {
 	if col < 1 {
 		col = 1
 	}
-	s.position.Store(uint64(uint32(row))<<32 | uint64(uint32(col)))
+	// Store both coordinates as one immutable value. Besides keeping the pair
+	// atomic, this avoids narrowing through uint32 on 32-bit release targets.
+	s.position.Store(&renderedCursorAnchor{row: row, col: col})
 	s.mode.Store(cursorAnchorVisible)
 }
 
@@ -89,7 +91,10 @@ func (s *inputCursorAnchorState) snapshot() (row, col int, mode int32) {
 	}
 	mode = s.mode.Load()
 	position := s.position.Load()
-	return int(uint32(position >> 32)), int(uint32(position)), mode
+	if position == nil {
+		return 0, 0, mode
+	}
+	return position.row, position.col, mode
 }
 
 // inputCursorOutput removes private frame metadata and appends the physical

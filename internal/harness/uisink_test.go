@@ -65,8 +65,8 @@ func TestWebShellSinkKeepsExecutionLog(t *testing.T) {
 		s := NewWebShellSink(NewStdoutSink())
 		s.Emit(UIEvent{Kind: EventThinking})
 		s.Emit(UIEvent{Kind: EventStepStart, Step: 1, MaxSteps: 30})
-		s.Emit(UIEvent{Kind: EventAction, Action: &AgentAction{Type: ActionExecute, Command: "id"}})
-		s.Emit(UIEvent{Kind: EventCommandOutput, Message: "uid=33(www-data)\n"})
+		s.Emit(UIEvent{Kind: EventAction, Action: &AgentAction{Type: ActionExecute, Command: "\033[36mid\033[0m"}})
+		s.Emit(UIEvent{Kind: EventCommandOutput, Message: "\033[32muid=33(www-data)\033[0m\n"})
 		s.Emit(UIEvent{Kind: EventCommandOutput, Message: "gid=33(www-data)\n"})
 		s.Emit(UIEvent{Kind: EventResult, Message: "uid=33...", Detail: full})
 	})
@@ -77,6 +77,9 @@ func TestWebShellSinkKeepsExecutionLog(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Fatalf("webshell sink should keep %q, got:\n%s", want, out)
 		}
+	}
+	if strings.Contains(out, "\033[") {
+		t.Fatalf("webshell sink must not emit ANSI control sequences:\n%q", out)
 	}
 }
 

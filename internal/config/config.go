@@ -1,13 +1,17 @@
 package config
 
 import (
+	"bufio"
 	"context"
+	"crypto/tls"
+	"encoding/base64"
 	"fmt"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -34,9 +38,23 @@ func setViperDefaults() {
 	viper.SetDefault("ssh_user", "root")
 	viper.SetDefault("ssh_host_key_policy", "accept-new")
 	viper.SetDefault("ssh_known_hosts_path", "~/.deepsentry/known_hosts")
+	viper.SetDefault("ssh_device_type", "auto")
 	viper.SetDefault("telnet_user", "root")
+	viper.SetDefault("telnet_device_type", "auto")
+	viper.SetDefault("telnet_connect_timeout_sec", 10)
+	viper.SetDefault("telnet_login_timeout_sec", 20)
+	viper.SetDefault("telnet_command_timeout_sec", 90)
 	viper.SetDefault("ftp_user", "anonymous")
+	viper.SetDefault("ftp_tls_mode", "plain")
+	viper.SetDefault("ftp_data_mode", "passive")
+	viper.SetDefault("ftp_connect_timeout_sec", 10)
+	viper.SetDefault("ftp_command_timeout_sec", 30)
+	viper.SetDefault("ftp_transfer_timeout_sec", 90)
 	viper.SetDefault("use_native_tools", true)
+	viper.SetDefault("agent_runtime", "v3")
+	viper.SetDefault("trace_enabled", true)
+	viper.SetDefault("trace_dir", "reports/traces")
+	viper.SetDefault("terminal_theme", "auto")
 	viper.SetDefault("llm_timeout_sec", 120)
 	viper.SetDefault("llm_retries", 3)
 	viper.SetDefault("ssh_command_timeout_sec", 90)
@@ -86,6 +104,15 @@ type Config struct {
 	ReservedOutputTokens int     `mapstructure:"reserved_output_tokens"`
 	NativeToolLimit      int     `mapstructure:"native_tool_limit"`
 
+	// Runtime v3 is additive and can be rolled back to legacy without changing
+	// model or target configuration.
+	AgentRuntime  string             `mapstructure:"agent_runtime"`
+	Models        []ModelConfig      `mapstructure:"models"`
+	ModelRouting  ModelRoutingConfig `mapstructure:"model_routing"`
+	TraceEnabled  bool               `mapstructure:"trace_enabled"`
+	TraceDir      string             `mapstructure:"trace_dir"`
+	TerminalTheme string             `mapstructure:"terminal_theme"` // auto|dark|light
+
 	LLMTimeoutSec        int `mapstructure:"llm_timeout_sec"`
 	LLMRetries           int `mapstructure:"llm_retries"`
 	SSHCommandTimeoutSec int `mapstructure:"ssh_command_timeout_sec"`
@@ -94,21 +121,39 @@ type Config struct {
 	SubAgentMaxSteps     int `mapstructure:"subagent_max_steps"`
 
 	// --- SSH 配置 ---
-	TargetProtocol    string         `mapstructure:"target_protocol"` // local|ssh|telnet|ftp，空值兼容旧 ssh_host
-	SSHHost           string         `mapstructure:"ssh_host"`
-	SSHUser           string         `mapstructure:"ssh_user"`
-	SSHPassword       string         `mapstructure:"ssh_password"`
-	SSHKeyPath        string         `mapstructure:"ssh_key_path"`
-	SSHHostKeyPolicy  string         `mapstructure:"ssh_host_key_policy"` // strict|accept-new|insecure
-	SSHKnownHostsPath string         `mapstructure:"ssh_known_hosts_path"`
-	TelnetHost        string         `mapstructure:"telnet_host"`
-	TelnetUser        string         `mapstructure:"telnet_user"`
-	TelnetPassword    string         `mapstructure:"telnet_password"`
-	TelnetPrompt      string         `mapstructure:"telnet_prompt"`
-	FTPHost           string         `mapstructure:"ftp_host"`
-	FTPUser           string         `mapstructure:"ftp_user"`
-	FTPPassword       string         `mapstructure:"ftp_password"`
-	Targets           []TargetConfig `mapstructure:"targets"`
+	TargetProtocol           string         `mapstructure:"target_protocol"` // local|ssh|telnet|ftp，空值兼容旧 ssh_host
+	SSHHost                  string         `mapstructure:"ssh_host"`
+	SSHUser                  string         `mapstructure:"ssh_user"`
+	SSHPassword              string         `mapstructure:"ssh_password"`
+	SSHKeyPath               string         `mapstructure:"ssh_key_path"`
+	SSHHostKeyPolicy         string         `mapstructure:"ssh_host_key_policy"` // strict|accept-new|insecure
+	SSHKnownHostsPath        string         `mapstructure:"ssh_known_hosts_path"`
+	SSHDeviceType            string         `mapstructure:"ssh_device_type"` // auto|huawei|h3c|ruijie|cisco|linux|generic
+	SSHPrompt                string         `mapstructure:"ssh_prompt"`      // 网络设备交互 CLI prompt；可空自动探测
+	SSHEnablePassword        string         `mapstructure:"ssh_enable_password"`
+	TelnetHost               string         `mapstructure:"telnet_host"`
+	TelnetUser               string         `mapstructure:"telnet_user"`
+	TelnetPassword           string         `mapstructure:"telnet_password"`
+	TelnetPrompt             string         `mapstructure:"telnet_prompt"` // 登录后的命令提示符；不参与用户名/密码阶段
+	TelnetAuthPromptRegex    string         `mapstructure:"telnet_auth_prompt_regex"`
+	TelnetDeviceType         string         `mapstructure:"telnet_device_type"` // auto|huawei|h3c|ruijie|cisco|linux
+	TelnetEnablePassword     string         `mapstructure:"telnet_enable_password"`
+	TelnetConnectTimeoutSec  int            `mapstructure:"telnet_connect_timeout_sec"`
+	TelnetLoginTimeoutSec    int            `mapstructure:"telnet_login_timeout_sec"`
+	TelnetCommandTimeoutSec  int            `mapstructure:"telnet_command_timeout_sec"`
+	FTPHost                  string         `mapstructure:"ftp_host"`
+	FTPUser                  string         `mapstructure:"ftp_user"`
+	FTPPassword              string         `mapstructure:"ftp_password"`
+	FTPTLSMode               string         `mapstructure:"ftp_tls_mode"` // plain|explicit|implicit
+	FTPTLSServerName         string         `mapstructure:"ftp_tls_server_name"`
+	FTPTLSCAFile             string         `mapstructure:"ftp_tls_ca_file"`
+	FTPTLSInsecureSkipVerify bool           `mapstructure:"ftp_tls_insecure_skip_verify"`
+	FTPDataMode              string         `mapstructure:"ftp_data_mode"` // passive|active|auto
+	FTPActiveAddress         string         `mapstructure:"ftp_active_address"`
+	FTPConnectTimeoutSec     int            `mapstructure:"ftp_connect_timeout_sec"`
+	FTPCommandTimeoutSec     int            `mapstructure:"ftp_command_timeout_sec"`
+	FTPTransferTimeoutSec    int            `mapstructure:"ftp_transfer_timeout_sec"`
+	Targets                  []TargetConfig `mapstructure:"targets"`
 
 	// --- Deep Agent Harness ---
 	UseNativeTools       bool              `mapstructure:"use_native_tools"`
@@ -150,6 +195,132 @@ type Config struct {
 	BenchmarkToken   string `mapstructure:"benchmark_token"`
 }
 
+// EffectiveAgentRuntime returns the runtime used when callers construct a
+// Config directly instead of loading it through Viper. Runtime v3 is the
+// default; legacy remains an explicit rollback mode for one release cycle.
+func (c Config) EffectiveAgentRuntime() string {
+	mode := strings.ToLower(strings.TrimSpace(c.AgentRuntime))
+	if mode == "" {
+		return "v3"
+	}
+	return mode
+}
+
+// ModelConfig describes one primary or fallback model. Empty tuning fields
+// inherit the legacy top-level configuration so existing config.yaml files
+// remain valid.
+type ModelConfig struct {
+	ID                   string  `mapstructure:"id" json:"id" yaml:"id"`
+	Role                 string  `mapstructure:"role" json:"role" yaml:"role"` // primary | fallback
+	Provider             string  `mapstructure:"provider" json:"provider" yaml:"provider"`
+	APIProtocol          string  `mapstructure:"api_protocol" json:"api_protocol" yaml:"api_protocol"`
+	APIURL               string  `mapstructure:"api_url" json:"api_url" yaml:"api_url"`
+	APIKey               string  `mapstructure:"api_key" json:"api_key" yaml:"api_key"`
+	ModelName            string  `mapstructure:"model_name" json:"model_name" yaml:"model_name"`
+	Temperature          float64 `mapstructure:"temperature" json:"temperature" yaml:"temperature"`
+	ModelProfile         string  `mapstructure:"model_profile" json:"model_profile" yaml:"model_profile"`
+	ContextWindowTokens  int     `mapstructure:"context_window_tokens" json:"context_window_tokens" yaml:"context_window_tokens"`
+	ReservedOutputTokens int     `mapstructure:"reserved_output_tokens" json:"reserved_output_tokens" yaml:"reserved_output_tokens"`
+	NativeToolLimit      int     `mapstructure:"native_tool_limit" json:"native_tool_limit" yaml:"native_tool_limit"`
+	MaxRetries           int     `mapstructure:"max_retries" json:"max_retries" yaml:"max_retries"`
+}
+
+type ModelRoutingConfig struct {
+	FailoverOn []string `mapstructure:"failover_on" json:"failover_on" yaml:"failover_on"`
+}
+
+// EffectiveModels returns a deterministic primary-first model chain. When the
+// additive models list is absent, the legacy top-level model becomes primary.
+func (c Config) EffectiveModels() []ModelConfig {
+	if len(c.Models) == 0 {
+		return []ModelConfig{{
+			ID:                   firstNonEmptyConfig(c.ModelName, "primary"),
+			Role:                 "primary",
+			Provider:             c.Provider,
+			APIProtocol:          c.APIProtocol,
+			APIURL:               c.ApiURL,
+			APIKey:               c.ApiKey,
+			ModelName:            c.ModelName,
+			Temperature:          c.Temperature,
+			ModelProfile:         c.ModelProfile,
+			ContextWindowTokens:  c.ContextWindowTokens,
+			ReservedOutputTokens: c.ReservedOutputTokens,
+			NativeToolLimit:      c.NativeToolLimit,
+			MaxRetries:           c.EffectiveLLMRetries(),
+		}}
+	}
+	primary := make([]ModelConfig, 0, len(c.Models))
+	fallback := make([]ModelConfig, 0, len(c.Models))
+	for index, model := range c.Models {
+		model = mergeModelConfig(c, model, index)
+		if strings.EqualFold(model.Role, "primary") || (strings.TrimSpace(model.Role) == "" && len(primary) == 0) {
+			model.Role = "primary"
+			primary = append(primary, model)
+		} else {
+			model.Role = "fallback"
+			fallback = append(fallback, model)
+		}
+	}
+	return append(primary, fallback...)
+}
+
+func mergeModelConfig(base Config, model ModelConfig, index int) ModelConfig {
+	model.Provider = firstNonEmptyConfig(model.Provider, base.Provider)
+	model.APIProtocol = firstNonEmptyConfig(model.APIProtocol, base.APIProtocol)
+	model.APIURL = firstNonEmptyConfig(model.APIURL, base.ApiURL)
+	model.APIKey = firstNonEmptyConfig(model.APIKey, base.ApiKey)
+	model.ModelName = firstNonEmptyConfig(model.ModelName, base.ModelName)
+	model.ModelProfile = firstNonEmptyConfig(model.ModelProfile, base.ModelProfile)
+	if model.Temperature == 0 {
+		model.Temperature = base.Temperature
+	}
+	if model.ContextWindowTokens == 0 {
+		model.ContextWindowTokens = base.ContextWindowTokens
+	}
+	if model.ReservedOutputTokens == 0 {
+		model.ReservedOutputTokens = base.ReservedOutputTokens
+	}
+	if model.NativeToolLimit == 0 {
+		model.NativeToolLimit = base.NativeToolLimit
+	}
+	if model.MaxRetries == 0 {
+		model.MaxRetries = base.EffectiveLLMRetries()
+	}
+	if strings.TrimSpace(model.ID) == "" {
+		model.ID = fmt.Sprintf("model_%d_%s", index+1, model.ModelName)
+	}
+	return model
+}
+
+// ConfigForModel materializes a model endpoint into the existing provider
+// configuration consumed by legacy adapters.
+func (c Config) ConfigForModel(model ModelConfig) Config {
+	out := c
+	out.Provider = model.Provider
+	out.APIProtocol = model.APIProtocol
+	out.ApiURL = model.APIURL
+	out.ApiKey = model.APIKey
+	out.ModelName = model.ModelName
+	out.Temperature = model.Temperature
+	out.ModelProfile = model.ModelProfile
+	out.ContextWindowTokens = model.ContextWindowTokens
+	out.ReservedOutputTokens = model.ReservedOutputTokens
+	out.NativeToolLimit = model.NativeToolLimit
+	out.LLMRetries = model.MaxRetries
+	out.Models = nil
+	ApplyProviderDefaults(&out)
+	return out
+}
+
+func firstNonEmptyConfig(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
 // EffectiveDisabledSkills returns the name denylist consumed by the live
 // catalog. "*" is an internal sentinel for the global /skill off switch.
 func (c Config) EffectiveDisabledSkills() []string {
@@ -161,14 +332,23 @@ func (c Config) EffectiveDisabledSkills() []string {
 }
 
 type TargetConfig struct {
-	Name     string   `mapstructure:"name" json:"name"`
-	Protocol string   `mapstructure:"protocol" json:"protocol"` // ssh|telnet|ftp
-	Host     string   `mapstructure:"host" json:"host"`
-	User     string   `mapstructure:"user" json:"user"`
-	Password string   `mapstructure:"password" json:"password"`
-	KeyPath  string   `mapstructure:"key_path" json:"key_path"`
-	Prompt   string   `mapstructure:"prompt" json:"prompt"`
-	Tags     []string `mapstructure:"tags" json:"tags"`
+	Name                     string   `mapstructure:"name" json:"name"`
+	Protocol                 string   `mapstructure:"protocol" json:"protocol"` // ssh|telnet|ftp
+	Host                     string   `mapstructure:"host" json:"host"`
+	User                     string   `mapstructure:"user" json:"user"`
+	Password                 string   `mapstructure:"password" json:"password"`
+	KeyPath                  string   `mapstructure:"key_path" json:"key_path"`
+	Prompt                   string   `mapstructure:"prompt" json:"prompt"`
+	AuthPromptRegex          string   `mapstructure:"auth_prompt_regex" json:"auth_prompt_regex"`
+	DeviceType               string   `mapstructure:"device_type" json:"device_type"`
+	EnablePassword           string   `mapstructure:"enable_password" json:"enable_password"`
+	FTPTLSMode               string   `mapstructure:"ftp_tls_mode" json:"ftp_tls_mode"`
+	FTPTLSServerName         string   `mapstructure:"ftp_tls_server_name" json:"ftp_tls_server_name"`
+	FTPTLSCAFile             string   `mapstructure:"ftp_tls_ca_file" json:"ftp_tls_ca_file"`
+	FTPTLSInsecureSkipVerify bool     `mapstructure:"ftp_tls_insecure_skip_verify" json:"ftp_tls_insecure_skip_verify"`
+	FTPDataMode              string   `mapstructure:"ftp_data_mode" json:"ftp_data_mode"`
+	FTPActiveAddress         string   `mapstructure:"ftp_active_address" json:"ftp_active_address"`
+	Tags                     []string `mapstructure:"tags" json:"tags"`
 }
 
 type MCPServerConfig struct {
@@ -205,9 +385,13 @@ func InitConfig(cfgFile string) error {
 		// 搜索路径优先级：
 		// 1. 当前目录 (.)
 		viper.AddConfigPath(".")
-		// 2. 用户主目录下的 .deepsentry 文件夹
+		// 2. 可执行文件所在目录（从其他 cwd 启动已打包二进制时仍能找到随包配置）
+		if executable, execErr := os.Executable(); execErr == nil {
+			viper.AddConfigPath(filepath.Dir(executable))
+		}
+		// 3. 用户主目录下的 .deepsentry 文件夹
 		viper.AddConfigPath(filepath.Join(home, ".deepsentry"))
-		// 3. 系统级配置 /etc/deepsentry
+		// 4. 系统级配置 /etc/deepsentry
 		viper.AddConfigPath("/etc/deepsentry")
 
 		viper.SetConfigName("config") // 查找 config.yaml, config.json 等
@@ -235,6 +419,7 @@ func InitConfig(cfgFile string) error {
 		return fmt.Errorf("配置解析失败: %w", err)
 	}
 	ApplyProviderDefaults(&loaded)
+	loaded.AgentRuntime = loaded.EffectiveAgentRuntime()
 	if err := applyRawCaseSensitiveConfig(viper.ConfigFileUsed(), &loaded); err != nil {
 		return fmt.Errorf("读取大小写敏感配置失败: %w", err)
 	}
@@ -299,6 +484,203 @@ func applyRawCaseSensitiveData(data []byte, cfg *Config) error {
 	return nil
 }
 
+// ResolveStartupProxy validates fscan-style startup proxy flags. The two flags
+// are intentionally mutually exclusive because DeepSentry has one controller
+// egress route per process.
+func ResolveStartupProxy(httpProxy, socks5Proxy string) (string, error) {
+	httpProxy = strings.TrimSpace(httpProxy)
+	socks5Proxy = strings.TrimSpace(socks5Proxy)
+	if httpProxy != "" && socks5Proxy != "" {
+		return "", fmt.Errorf("-proxy 与 -socks5 不能同时使用")
+	}
+	raw := httpProxy
+	want := "http"
+	if socks5Proxy != "" {
+		raw = socks5Proxy
+		want = "socks5"
+	}
+	if raw == "" {
+		return "", nil
+	}
+	u, err := ParseControllerProxy(raw)
+	if err != nil {
+		return "", err
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if want == "http" && scheme != "http" && scheme != "https" {
+		return "", fmt.Errorf("-proxy 仅接受 http:// 或 https://，SOCKS5 请使用 -socks5")
+	}
+	if want == "socks5" && scheme != "socks5" && scheme != "socks5h" {
+		return "", fmt.Errorf("-socks5 仅接受 socks5:// 或 socks5h://")
+	}
+	return u.String(), nil
+}
+
+// ParseControllerProxy validates a controller egress proxy URL.
+func ParseControllerProxy(raw string) (*url.URL, error) {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Hostname() == "" || u.Port() == "" {
+		return nil, fmt.Errorf("代理 URL 无效，格式示例: http://127.0.0.1:8080 或 socks5://127.0.0.1:1080")
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http", "https", "socks5", "socks5h":
+	default:
+		return nil, fmt.Errorf("代理仅支持 http|https|socks5|socks5h")
+	}
+	port, err := strconv.Atoi(u.Port())
+	if err != nil || port < 1 || port > 65535 {
+		return nil, fmt.Errorf("代理端口无效: %q", u.Port())
+	}
+	if (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
+		return nil, fmt.Errorf("代理 URL 不能包含路径、查询参数或 fragment")
+	}
+	return u, nil
+}
+
+// ControllerProxySummary returns a credential-free value suitable for UI and
+// logs. Proxy credentials must never be copied into the model context.
+func ControllerProxySummary(raw string) string {
+	u, err := ParseControllerProxy(raw)
+	if err != nil {
+		return "invalid"
+	}
+	return strings.ToLower(u.Scheme) + "://" + u.Host
+}
+
+// ControllerDialContext opens a controller-side TCP connection through the
+// configured HTTP CONNECT or SOCKS5 proxy. With no explicit proxy it dials
+// directly; environment HTTP_PROXY variables remain HTTP-only by design.
+func ControllerDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	raw := strings.TrimSpace(GlobalConfig.ControllerProxy)
+	if raw == "" {
+		return (&net.Dialer{}).DialContext(ctx, network, addr)
+	}
+	u, err := ParseControllerProxy(raw)
+	if err != nil {
+		return nil, err
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "socks5", "socks5h":
+		var auth *proxy.Auth
+		if u.User != nil {
+			password, _ := u.User.Password()
+			auth = &proxy.Auth{User: u.User.Username(), Password: password}
+		}
+		dialer, err := proxy.SOCKS5("tcp", u.Host, auth, &net.Dialer{})
+		if err != nil {
+			return nil, fmt.Errorf("创建 SOCKS5 dialer 失败: %w", err)
+		}
+		if contextDialer, ok := dialer.(proxy.ContextDialer); ok {
+			return contextDialer.DialContext(ctx, network, addr)
+		}
+		return dialWithContextFallback(ctx, dialer, network, addr)
+	case "http", "https":
+		return dialHTTPConnectProxy(ctx, u, addr)
+	default:
+		return nil, fmt.Errorf("不支持的代理协议: %s", u.Scheme)
+	}
+}
+
+func dialWithContextFallback(ctx context.Context, dialer proxy.Dialer, network, addr string) (net.Conn, error) {
+	type result struct {
+		conn net.Conn
+		err  error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		conn, err := dialer.Dial(network, addr)
+		ch <- result{conn: conn, err: err}
+	}()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case got := <-ch:
+		return got.conn, got.err
+	}
+}
+
+type bufferedProxyConn struct {
+	net.Conn
+	reader *bufio.Reader
+}
+
+func (c *bufferedProxyConn) Read(p []byte) (int, error) { return c.reader.Read(p) }
+
+func dialHTTPConnectProxy(ctx context.Context, proxyURL *url.URL, target string) (net.Conn, error) {
+	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", proxyURL.Host)
+	if err != nil {
+		return nil, fmt.Errorf("连接代理 %s 失败: %w", ControllerProxySummary(proxyURL.String()), err)
+	}
+	if strings.EqualFold(proxyURL.Scheme, "https") {
+		tlsConn := tls.Client(conn, &tls.Config{MinVersion: tls.VersionTLS12, ServerName: proxyURL.Hostname()})
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			_ = conn.Close()
+			return nil, fmt.Errorf("HTTPS 代理 TLS 握手失败: %w", err)
+		}
+		conn = tlsConn
+	}
+	req := &http.Request{Method: http.MethodConnect, URL: &url.URL{Opaque: target}, Host: target, Header: make(http.Header)}
+	req.Header.Set("User-Agent", "DeepSentry")
+	if proxyURL.User != nil {
+		password, _ := proxyURL.User.Password()
+		token := base64.StdEncoding.EncodeToString([]byte(proxyURL.User.Username() + ":" + password))
+		req.Header.Set("Proxy-Authorization", "Basic "+token)
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(deadline)
+	}
+	if err := req.Write(conn); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("发送 HTTP CONNECT 失败: %w", err)
+	}
+	reader := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(reader, req)
+	if err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("读取 HTTP CONNECT 响应失败: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		_ = resp.Body.Close()
+		_ = conn.Close()
+		return nil, fmt.Errorf("HTTP CONNECT 被代理拒绝: %s", resp.Status)
+	}
+	_ = conn.SetDeadline(time.Time{})
+	return &bufferedProxyConn{Conn: conn, reader: reader}, nil
+}
+
+// ControllerDialTimeout is the timeout-aware convenience used by native TCP
+// tools and SSH/Telnet/FTP executors.
+func ControllerDialTimeout(network, addr string, timeout time.Duration) (net.Conn, error) {
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return ControllerDialContext(ctx, network, addr)
+}
+
+// HTTPTransport returns a fresh controller-side transport honoring the same
+// startup/config proxy route as native TCP tools.
+func HTTPTransport() *http.Transport {
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	raw := strings.TrimSpace(GlobalConfig.ControllerProxy)
+	if raw == "" {
+		return tr
+	}
+	u, err := ParseControllerProxy(raw)
+	if err != nil {
+		return tr
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http", "https":
+		tr.Proxy = http.ProxyURL(u)
+	case "socks5", "socks5h":
+		tr.Proxy = nil
+		tr.DialContext = ControllerDialContext
+	}
+	return tr
+}
+
 // HTTPClient returns a controller-side HTTP client honoring controller_proxy.
 // Supported explicit proxy schemes: http, https, socks5, socks5h.
 // Empty controller_proxy falls back to the standard environment proxy behavior.
@@ -306,38 +688,7 @@ func HTTPClient(timeout time.Duration) *http.Client {
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
-	tr := http.DefaultTransport.(*http.Transport).Clone()
-	raw := strings.TrimSpace(GlobalConfig.ControllerProxy)
-	if raw != "" {
-		if u, err := url.Parse(raw); err == nil {
-			switch strings.ToLower(u.Scheme) {
-			case "http", "https":
-				tr.Proxy = http.ProxyURL(u)
-			case "socks5", "socks5h":
-				if d, err := proxy.FromURL(u, proxy.Direct); err == nil {
-					tr.Proxy = nil
-					tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-						type dialResult struct {
-							conn net.Conn
-							err  error
-						}
-						ch := make(chan dialResult, 1)
-						go func() {
-							c, err := d.Dial(network, addr)
-							ch <- dialResult{conn: c, err: err}
-						}()
-						select {
-						case <-ctx.Done():
-							return nil, ctx.Err()
-						case r := <-ch:
-							return r.conn, r.err
-						}
-					}
-				}
-			}
-		}
-	}
-	return &http.Client{Timeout: timeout, Transport: tr}
+	return &http.Client{Timeout: timeout, Transport: HTTPTransport()}
 }
 
 // SaveConfig 将当前 Viper 中的配置保存到文件 (默认保存到当前目录)

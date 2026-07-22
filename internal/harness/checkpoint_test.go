@@ -3,12 +3,18 @@ package harness
 import (
 	"ai-edr/internal/analyzer"
 	"ai-edr/internal/config"
+	"ai-edr/internal/runtimev3"
+	"context"
 	"encoding/json"
 	"os"
 	"strings"
 	"testing"
 	"time"
 )
+
+type discardCheckpointUISink struct{}
+
+func (discardCheckpointUISink) Emit(UIEvent) {}
 
 func TestCheckpointRejectsPathTraversalSessionID(t *testing.T) {
 	for _, id := range []string{"../outside", "session_../../outside", "session_/tmp/evil", "not-a-session"} {
@@ -110,6 +116,7 @@ func TestSessionSummariesSortNewestFirst(t *testing.T) {
 			t.Fatal(err)
 		}
 		data.SavedAt = tc.stamp
+		data.IntegritySHA256 = ""
 		raw, _ := json.Marshal(data)
 		if err := os.WriteFile(path, raw, 0o600); err != nil {
 			t.Fatal(err)
@@ -176,4 +183,154 @@ func TestCheckpointPersistsCoreClueBoard(t *testing.T) {
 	if !strings.Contains(prompt, "198.51.100.7") || !strings.Contains(prompt, "/var/www/html/x.php") {
 		t.Fatalf("checkpoint lost core clues:\n%s", prompt)
 	}
+}
+
+func TestCheckpointIntegrityFallsBackToPreviousSnapshot(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	store, err := NewCheckpointStore("session_integrity")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(CheckpointData{StepNum: 1, State: NewAgentState("")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(CheckpointData{StepNum: 2, State: NewAgentState("")}); err != nil {
+		t.Fatal(err)
+	}
+	path := store.SessionDir() + "/checkpoint.json"
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw[len(raw)/2] ^= 1
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadCheckpoint("session_integrity")
+	if err != nil || loaded.StepNum != 1 {
+		t.Fatalf("expected previous snapshot, loaded=%#v err=%v", loaded, err)
+	}
+}
+
+func TestCheckpointPersistsToolCallSafePoint(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	store, err := NewCheckpointStore("session_tool_calls")
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := NewAgentState("")
+	state.BeginToolCall(ToolCallRecord{ID: "call_pending", Name: "file_upload", Risk: "high"})
+	state.BeginToolCall(ToolCallRecord{ID: "call_done", Name: "config_manage", Risk: "high"})
+	state.CompleteToolCall("call_done")
+	if err := store.Save(CheckpointData{State: state}); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadCheckpoint("session_tool_calls")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !loaded.State.ToolCallCompleted("call_done") {
+		t.Fatal("completed modifying call was lost")
+	}
+	if pending, ok := loaded.State.ToolCallPending("call_pending"); !ok || pending.Risk != "high" {
+		t.Fatalf("pending call was lost: %#v %v", pending, ok)
+	}
+}
+
+func TestLegacyCheckpointMigratesAtTurnBoundary(t *testing.T) {
+	state := NewAgentState("")
+	state.Todos = []TodoItem{{Content: "保留待办"}}
+	state.CoreClues = []CoreClue{{Kind: "fact", Value: "保留线索"}}
+	state.BeginToolCall(ToolCallRecord{ID: "old_pending", Name: "file_upload", Risk: "high"})
+	state.BeginToolCall(ToolCallRecord{ID: "old_done", Name: "config_manage", Risk: "high"})
+	state.CompleteToolCall("old_done")
+	data := &CheckpointData{
+		SchemaVersion: 2,
+		RunID:         "old_run",
+		TurnID:        "old_turn",
+		EventCursor:   99,
+		StepNum:       6,
+		State:         state,
+		History:       []analyzer.Message{{Role: "user", Content: "保留历史"}},
+	}
+	initializeCheckpointState(data)
+	if data.RuntimeVersion != "legacy" {
+		t.Fatalf("old checkpoint runtime=%q want legacy", data.RuntimeVersion)
+	}
+	if data.RunID != "" || data.TurnID != "" || data.EventCursor != 0 || data.StepNum != 6 {
+		t.Fatalf("old checkpoint did not migrate to its turn boundary: %#v", data)
+	}
+	if len(data.State.PendingToolCalls) != 0 || len(data.State.CompletedToolCalls) != 0 {
+		t.Fatalf("old checkpoint fabricated tool safe points: pending=%#v completed=%#v", data.State.PendingToolCalls, data.State.CompletedToolCalls)
+	}
+	if len(data.State.Todos) != 1 || len(data.State.CoreClues) != 1 || len(data.History) != 1 {
+		t.Fatalf("boundary migration lost durable state: %#v", data)
+	}
+}
+
+func TestRuntimeV3FlushesSessionEventsBeforeCheckpointCursor(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	store, err := NewCheckpointStore("session_event_order")
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventPath := store.SessionDir() + "/events.jsonl"
+	logSink, err := runtimev3.NewJSONLTraceSink(eventPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent := &DeepAgent{
+		State:      NewAgentState(""),
+		SessionID:  "session_event_order",
+		Checkpoint: store,
+		RunID:      "run_test",
+		Events:     &runtimev3.SequenceSink{Sink: runtimev3.MultiSink{logSink}},
+	}
+	agent.emitRuntime(runtimev3.RunEvent{Kind: runtimev3.EventToolEnd, ToolCallID: "call_1"})
+	history := []analyzer.Message{{Role: "user", Content: "test"}}
+	agent.saveCheckpointUI(1, &history, discardCheckpointUISink{})
+	if err := logSink.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := LoadCheckpoint("session_event_order")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.EventCursor != 1 {
+		t.Fatalf("checkpoint cursor=%d want preceding durable event cursor 1", loaded.EventCursor)
+	}
+	raw, err := os.ReadFile(eventPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"kind":"tool.end"`) || !strings.Contains(string(raw), `"kind":"checkpoint.save"`) {
+		t.Fatalf("missing append-only session events: %s", raw)
+	}
+}
+
+func TestRestoreContinuesRunIDAndEventCursor(t *testing.T) {
+	capture := &runtimeEventCapture{}
+	sequence := &runtimev3.SequenceSink{Sink: capture}
+	agent := &DeepAgent{RunID: "new_process_run", Events: sequence, State: NewAgentState("")}
+	agent.RestoreFromCheckpoint(&CheckpointData{
+		RunID:       "persisted_run",
+		EventCursor: 41,
+		StepNum:     7,
+		State:       NewAgentState(""),
+	})
+	agent.emitRuntime(runtimev3.RunEvent{Kind: runtimev3.EventModelStart})
+	if agent.RunID != "persisted_run" || agent.StartStep != 7 {
+		t.Fatalf("run=%q step=%d", agent.RunID, agent.StartStep)
+	}
+	if len(capture.events) != 1 || capture.events[0].Sequence != 42 || capture.events[0].RunID != "persisted_run" {
+		t.Fatalf("resumed event=%#v", capture.events)
+	}
+}
+
+type runtimeEventCapture struct{ events []runtimev3.RunEvent }
+
+func (s *runtimeEventCapture) Emit(_ context.Context, event runtimev3.RunEvent) error {
+	s.events = append(s.events, event)
+	return nil
 }

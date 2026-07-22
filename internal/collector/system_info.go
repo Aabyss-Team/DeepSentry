@@ -24,11 +24,31 @@ type SystemContext struct {
 	Virtualization string
 	Shell          string
 	PackageManager string
+	DeviceType     string
+	DevicePrompt   string
+	DeviceProtocol string
 }
 
 // GetSystemContext 采集系统信息 (针对当前 Executor 指向的目标)
 func GetSystemContext() SystemContext {
 	ctx := SystemContext{}
+	if reporter, ok := executor.Current.(executor.NetworkDeviceReporter); ok {
+		info := reporter.NetworkDeviceInfo()
+		if info.Vendor != "" && info.Vendor != "linux" {
+			ctx.DeviceType = info.Vendor
+			ctx.DevicePrompt = info.Prompt
+			ctx.DeviceProtocol = executor.CurrentMode()
+			ctx.OS = networkDeviceOS(info.Vendor)
+			ctx.Arch = "Network Appliance"
+			ctx.Hostname = hostnameFromNetworkPrompt(info.Prompt)
+			ctx.Username = "CLI user"
+			ctx.Shell = "Network device CLI"
+			ctx.KernelVersion = "通过 display/show version 获取"
+			ctx.MemoryStatus = "通过 network_device_baseline 或厂商 display/show 命令获取"
+			ctx.PackageManager = "not-applicable"
+			return ctx
+		}
+	}
 
 	// 辅助函数：通过当前 Executor 执行命令
 	run := func(cmd string) string {
@@ -170,11 +190,20 @@ func (ctx SystemContext) GenerateSystemPrompt() string {
 
 	connectionType := "本地直连 (Local Mode)"
 	targetDesc := "当前目标即本机 (Target == Controller)"
+	networkGuidance := ""
 	if executor.Current != nil && executor.Current.IsRemote() {
 		switch executor.CurrentMode() {
 		case "telnet":
 			connectionType = "Telnet 远程连接 (Telnet Mode)"
 			targetDesc = "你正在通过 Telnet 操作远程主机；可执行命令，但文件桥能力弱于 SSH/SFTP"
+			if ctx.DeviceType != "" {
+				protocol := strings.ToUpper(strings.TrimSpace(ctx.DeviceProtocol))
+				if protocol == "" {
+					protocol = "交互式"
+				}
+				targetDesc = fmt.Sprintf("你正在通过 %s 操作 %s 网络设备，当前 prompt=%s", protocol, networkDeviceOS(ctx.DeviceType), ctx.DevicePrompt)
+				networkGuidance = networkDevicePromptGuidance(ctx.DeviceType)
+			}
 		case "ftp":
 			connectionType = "FTP 远程连接 (FTP Mode)"
 			targetDesc = "你正在通过 FTP 操作远程主机；仅适合目录/文件读取、上传、下载，不支持 shell 命令执行"
@@ -223,6 +252,7 @@ func (ctx SystemContext) GenerateSystemPrompt() string {
    - **上传**: 'upload <本机路径> <远程路径>'
    - **下载**: 'download <远程路径> <本机路径>'
    - FTP 模式下优先使用 file_download/file_upload/read_file/ls，不要执行 shell 命令。
+%s
 
 【AI 行为准则】
 1. **JSON 格式**: 必须严格返回 JSON，**严禁**使用 Markdown 代码块。
@@ -246,7 +276,54 @@ func (ctx SystemContext) GenerateSystemPrompt() string {
 		ctx.Username, userRole,
 		ctx.Hostname,
 		ctx.KernelVersion,
-		ctx.MemoryStatus)
+		ctx.MemoryStatus,
+		networkGuidance)
+}
+
+func networkDeviceOS(vendor string) string {
+	switch strings.ToLower(vendor) {
+	case "huawei":
+		return "Huawei VRP switch/router"
+	case "h3c":
+		return "H3C Comware switch/router"
+	case "ruijie":
+		return "Ruijie RGOS switch/router"
+	case "cisco":
+		return "Cisco IOS switch/router"
+	default:
+		return "Generic network switch/router"
+	}
+}
+
+func hostnameFromNetworkPrompt(prompt string) string {
+	prompt = strings.TrimSpace(prompt)
+	prompt = strings.Trim(prompt, "<>[]#$%")
+	if index := strings.Index(prompt, "("); index > 0 {
+		prompt = prompt[:index]
+	}
+	if prompt == "" {
+		return "network-device"
+	}
+	return prompt
+}
+
+func networkDevicePromptGuidance(vendor string) string {
+	commands := "优先使用 network_device_baseline；其他排查使用设备支持的 display/show 命令。"
+	switch strings.ToLower(vendor) {
+	case "huawei", "h3c":
+		commands = "优先使用 network_device_baseline；常用只读命令为 display version、display device、display interface brief、display ip routing-table、display logbuffer。"
+	case "ruijie", "cisco":
+		commands = "优先使用 network_device_baseline；常用只读命令为 show version、show interfaces status、show ip interface brief、show ip route、show logging。"
+	}
+	return `
+【网络设备 CLI 约束】
+- 目标不是 Linux/Windows Shell，禁止 uname、ls、cat、grep、sudo、分号、&&、$?、heredoc 和 Shell marker。
+- 单接口详情（如 display interface GigabitEthernet1/0/1）默认直接读取完整输出，不要先拼接长串 ` + "`| include a|b|c`" + `；include 是区分大小写的行投影，会丢失关联上下文。
+- 只有结果明确出现 output_truncated=true、命令超时或未找回 prompt 才称为“截断”；projection=filtered 表示设备主动过滤，TUI 的“展开完整结果”只是界面折叠。
+- ` + commands + `
+- 默认保持只读；进入 system-view/configure terminal、保存配置、重启端口/设备、修改 ACL/路由/VLAN 必须按中高风险操作审批。
+- Telnet 运行时会自动处理命令 prompt 和 More 分页；不要自行追加分页关闭命令或结束标记。
+`
 }
 
 // formatLocalTime 控制端本机当前时间（每次生成 Prompt 时刷新）

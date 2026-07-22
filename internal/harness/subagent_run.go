@@ -210,10 +210,13 @@ func (r *SubAgentRunner) Run(spec subagent.Spec, taskPrompt string, sysCtx colle
 		}
 
 		agent := &DeepAgent{Middleware: r.Middleware, State: r.State, MemoryStore: r.MemoryStore}
+		prepareToolCallExecution(r.State, &action)
 		result, err := agent.HandleAction(stepCtx, &action)
 		if err != nil {
+			failActionToolCalls(r.State, action)
 			return "", err
 		}
+		completeActionToolCalls(r.State, action)
 
 		if result.ShouldStop {
 			return result.FinalReport, nil
@@ -226,13 +229,8 @@ func (r *SubAgentRunner) Run(spec subagent.Spec, taskPrompt string, sysCtx colle
 		}
 		results = append(results, fmt.Sprintf("[步骤 %d] %s\n%s", step+1, action.Type, out))
 
-		subHistory = append(subHistory, analyzer.Message{
-			Role:    "assistant",
-			Content: security.RedactSensitiveText(actionToJSON(action)),
-		})
-		subHistory = append(subHistory, analyzer.Message{
-			Role: "user", Content: fmt.Sprintf("Output:\n%s", out),
-		})
+		result.Output = out
+		appendActionResultHistory(&subHistory, action, result)
 	}
 
 	summary := strings.Join(results, "\n---\n")
@@ -269,6 +267,16 @@ func authorizeSubAgentMutation(action *AgentAction, batchMode bool, ui UISink, c
 		needsConfirm = action.RiskLevel == tools.RiskHigh || action.RiskLevel == tools.RiskMedium
 		if !needsConfirm && ui != nil {
 			ui.Emit(UIEvent{Kind: EventRiskAuto, Message: fmt.Sprintf("%s子 Agent 工具 [%s] 低风险 -> 自动执行", termui.Prefix("🟢", "[LOW]"), action.ToolName)})
+		}
+	case ActionToolBatch:
+		for _, call := range action.ToolCalls {
+			risk, reason := classifyToolRisk(AgentAction{Type: ActionTool, ToolName: call.Name, ToolArgs: call.Args})
+			if risk == tools.RiskHigh || risk == tools.RiskMedium {
+				action.RiskLevel = risk
+				action.Reason = fmt.Sprintf("批量工具 %s: %s", call.Name, reason)
+				needsConfirm = true
+				break
+			}
 		}
 	default:
 		return true, ""
@@ -385,7 +393,6 @@ func authorizeSubAgentExecute(action *AgentAction, sysCtx collector.SystemContex
 
 	confirmAction := RedactedAction(*action)
 	if confirmFn != nil && confirmFn(&confirmAction) {
-		security.RecordApproval(action.Command)
 		return true, ""
 	}
 	if ui != nil {

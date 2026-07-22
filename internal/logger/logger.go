@@ -39,7 +39,9 @@ func NewReporterWithTitle(title string) (*Reporter, string, error) {
 		return nil, "", fmt.Errorf("无法创建日志目录: %v", err)
 	}
 	// #nosec G703 -- 与上述操作员指定的报告目录相同，此处只用于把其权限收紧为 0700。
-	_ = os.Chmod(filepath.Dir(fullPath), 0o700)
+	if err := os.Chmod(filepath.Dir(fullPath), 0o700); err != nil {
+		return nil, "", fmt.Errorf("无法收紧日志目录权限: %v", err)
+	}
 
 	// 3. 创建文件。默认路径使用 O_EXCL，避免同一秒启动的多个实例
 	// 互相截断报告；报告可能包含敏感取证信息，固定为 0600。

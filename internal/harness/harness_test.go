@@ -46,6 +46,27 @@ func TestBuildSystemPromptAdaptsDensityToModelProfile(t *testing.T) {
 	}
 }
 
+func TestBuildSystemPromptAddsCredentialFreeProxyRouting(t *testing.T) {
+	original := config.GlobalConfig
+	t.Cleanup(func() { config.GlobalConfig = original })
+	config.GlobalConfig = config.Config{
+		Provider:        "custom",
+		ModelName:       "test-model",
+		ControllerProxy: "socks5://proxy-user:proxy-secret@127.0.0.1:1080",
+	}
+	prompt := (&DeepAgent{}).BuildSystemPrompt("")
+	for _, want := range []string{"控制端代理路由", "socks5://127.0.0.1:1080", "原生 TCP 扫描", "不得改用 execute"} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("proxy prompt missing %q", want)
+		}
+	}
+	for _, secret := range []string{"proxy-user", "proxy-secret"} {
+		if strings.Contains(prompt, secret) {
+			t.Fatalf("proxy prompt leaked %q", secret)
+		}
+	}
+}
+
 func TestBasePromptDoesNotSuppressOrReshapeSummarySections(t *testing.T) {
 	prompt := (&DeepAgent{}).deepAgentBasePrompt()
 	for _, unwanted := range []string{
@@ -55,6 +76,15 @@ func TestBasePromptDoesNotSuppressOrReshapeSummarySections(t *testing.T) {
 	} {
 		if strings.Contains(prompt, unwanted) {
 			t.Fatalf("base prompt should leave summary content/shape to the model, found %q", unwanted)
+		}
+	}
+}
+
+func TestCompetitionModePromptEncodesScoringAndCorrectionContract(t *testing.T) {
+	prompt := competitionModePrompt()
+	for _, want := range []string{"10 分钟", "network_device_diagnose", "network_device_baseline", "AI 复核与纠错", "关键证据", "风险与回滚"} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("competition prompt missing %q", want)
 		}
 	}
 }

@@ -66,6 +66,34 @@ func TestValidateManagedModelAdaptationScalars(t *testing.T) {
 	}
 }
 
+func TestManagedRuntimeRollbackScalar(t *testing.T) {
+	for _, value := range []string{"v3", "legacy", " V3 "} {
+		if err := validateManagedScalar("agent_runtime", value); err != nil {
+			t.Fatalf("valid agent_runtime=%q rejected: %v", value, err)
+		}
+	}
+	if err := validateManagedScalar("agent_runtime", "v2"); err == nil {
+		t.Fatal("unsupported runtime accepted")
+	}
+	if !allowedScalarConfigKey("agent_runtime") {
+		t.Fatal("config_manage set cannot perform documented runtime rollback")
+	}
+}
+
+func TestManagedTerminalThemeScalar(t *testing.T) {
+	for _, value := range []string{"auto", "dark", "light", " LIGHT "} {
+		if err := validateManagedScalar("terminal_theme", value); err != nil {
+			t.Fatalf("valid terminal_theme=%q rejected: %v", value, err)
+		}
+	}
+	if err := validateManagedScalar("terminal_theme", "sepia"); err == nil {
+		t.Fatal("unsupported terminal theme accepted")
+	}
+	if !allowedScalarConfigKey("terminal_theme") {
+		t.Fatal("config_manage cannot update terminal_theme")
+	}
+}
+
 func TestManageConfigPathArgDoesNotOverrideConfigPath(t *testing.T) {
 	old := GlobalConfig
 	defer func() { GlobalConfig = old }()
@@ -237,6 +265,31 @@ func TestManageConfigAddTargetUpsertsByHost(t *testing.T) {
 	}
 }
 
+func TestManageConfigAddFTPTargetPreservesTLSAndDataMode(t *testing.T) {
+	old := GlobalConfig
+	defer func() { GlobalConfig = old }()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	_, err := ManageConfig(map[string]string{
+		"config_path": path,
+		"action":      "add_target", "protocol": "ftp", "host": "backup.example:990",
+		"user": "backup", "password": "secret", "ftp_tls_mode": "implicit",
+		"ftp_tls_server_name": "backup.example", "ftp_tls_ca_file": "/etc/deepsentry/backup-ca.pem",
+		"ftp_data_mode": "active", "ftp_active_address": "192.0.2.10",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(GlobalConfig.Targets) != 1 {
+		t.Fatalf("targets=%#v", GlobalConfig.Targets)
+	}
+	target := GlobalConfig.Targets[0]
+	if target.FTPTLSMode != "implicit" || target.FTPTLSServerName != "backup.example" ||
+		target.FTPTLSCAFile != "/etc/deepsentry/backup-ca.pem" || target.FTPDataMode != "active" ||
+		target.FTPActiveAddress != "192.0.2.10" {
+		t.Fatalf("FTP TLS/data fields lost: %#v", target)
+	}
+}
+
 func TestManageConfigAddTargetAcceptsSeparatePortAndRepairsLegacyHost(t *testing.T) {
 	old := GlobalConfig
 	defer func() { GlobalConfig = old }()
@@ -304,6 +357,9 @@ func TestManageConfigEnableFleetPromotesSingleTarget(t *testing.T) {
 ssh_host: 198.51.100.42:2222
 ssh_user: root
 ssh_password: single-secret
+ssh_device_type: huawei
+ssh_prompt: <Core-SSH>
+ssh_enable_password: enable-secret
 targets:
   - name: ssh-192.0.2.49
     protocol: ssh
@@ -338,6 +394,16 @@ targets:
 	targets, ok := root["targets"].([]any)
 	if !ok || len(targets) != 2 {
 		t.Fatalf("expected two fleet targets, got %#v", root["targets"])
+	}
+	foundNetworkSSH := false
+	for _, raw := range targets {
+		target, _ := raw.(map[string]any)
+		if target["host"] == "198.51.100.42:2222" {
+			foundNetworkSSH = target["device_type"] == "huawei" && target["prompt"] == "<Core-SSH>" && target["enable_password"] == "enable-secret"
+		}
+	}
+	if !foundNetworkSSH {
+		t.Fatalf("promoted SSH network-device fields missing: %#v", targets)
 	}
 	if len(GlobalConfig.Targets) != 2 || GlobalConfig.TargetProtocol != "local" {
 		t.Fatalf("GlobalConfig not reloaded as fleet: %#v", GlobalConfig)

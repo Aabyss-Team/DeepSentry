@@ -201,7 +201,9 @@ func runLLMConnectivity(ctx *Context) Result {
 		}
 	}
 	passed := err == nil && len(res.Content) > 0
-	return mkResult(passed, !passed && err == nil, score, lat, "LLM 响应正常", truncate(res.Content, 80))
+	result := mkResult(passed, !passed && err == nil, score, lat, "LLM 响应正常", truncate(res.Content, 80))
+	result.Metrics = llmUsageMetrics(res)
+	return result
 }
 
 func runLLMJSONProtocol(ctx *Context) Result {
@@ -232,7 +234,9 @@ func runLLMJSONProtocol(ctx *Context) Result {
 	} else if err == nil {
 		score = 40
 	}
-	return mkResult(passed, err == nil && !passed, score, lat, "JSON 可解析且含 finish", truncate(res.Content, 100))
+	result := mkResult(passed, err == nil && !passed, score, lat, "JSON 可解析且含 finish", truncate(res.Content, 100))
+	result.Metrics = llmUsageMetrics(res)
+	return result
 }
 
 func runLLMToolAction(ctx *Context) Result {
@@ -261,20 +265,34 @@ func runLLMToolAction(ctx *Context) Result {
 		lastAction = harness.ParseAction(parseLLMResponse(res))
 		if lastAction.Type == harness.ActionTool && lastAction.ToolName == "dns_lookup" {
 			lat := time.Since(start)
-			return mkResult(true, false, scorePass(lat, 45*time.Second), lat,
+			result := mkResult(true, false, scorePass(lat, 45*time.Second), lat,
 				fmt.Sprintf("action=%s tool=%s", lastAction.Type, lastAction.ToolName), truncate(res.Content, 100))
+			result.Metrics = llmUsageMetrics(res)
+			return result
 		}
 		lower := strings.ToLower(res.Content + res.ToolCallArgs)
 		if strings.Contains(lower, "dns_lookup") {
 			lat := time.Since(start)
 			score := scorePass(lat, 45*time.Second)
-			return mkResult(true, true, score, lat, "dns_lookup inferred", truncate(res.Content, 100))
+			result := mkResult(true, true, score, lat, "dns_lookup inferred", truncate(res.Content, 100))
+			result.Metrics = llmUsageMetrics(res)
+			return result
 		}
 		msgs = append(msgs, analyzer.Message{Role: "assistant", Content: res.Content})
 		msgs = append(msgs, analyzer.Message{Role: "user", Content: "格式错误。请严格输出: {\"action\":\"tool\",\"tool_name\":\"dns_lookup\",\"tool_args\":{\"host\":\"localhost\"}}"})
 	}
 	lat := time.Since(start)
 	return mkResult(false, false, 0, lat, fmt.Sprintf("action=%s tool=%s", lastAction.Type, lastAction.ToolName), truncate(lastContent, 100))
+}
+
+func llmUsageMetrics(result analyzer.LLMResult) map[string]float64 {
+	return map[string]float64{
+		"prompt_tokens":     float64(result.Usage.PromptTokens),
+		"completion_tokens": float64(result.Usage.CompletionTokens),
+		"total_tokens":      float64(result.Usage.TotalTokens),
+		"attempts":          float64(result.Attempts),
+		"failovers":         float64(result.Failovers),
+	}
 }
 
 func callLLMForBenchmark(msgs []analyzer.Message, useNativeTools bool) (analyzer.LLMResult, error) {

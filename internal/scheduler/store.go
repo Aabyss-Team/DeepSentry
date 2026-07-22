@@ -175,7 +175,9 @@ func (s *Store) saveUnlocked(tasks []Task) error {
 	if err := os.MkdirAll(filepath.Dir(s.Path), 0o700); err != nil {
 		return err
 	}
-	_ = os.Chmod(filepath.Dir(s.Path), 0o700)
+	if err := os.Chmod(filepath.Dir(s.Path), 0o700); err != nil {
+		return err
+	}
 	data, err := json.MarshalIndent(tasks, "", "  ")
 	if err != nil {
 		return err

@@ -14,7 +14,11 @@ DeepSentry — AI 安全应急 Agent
   deepsentry "排查服务器内存与监听端口"
   deepsentry --task "审计 SSH 登录日志"
   deepsentry --plan "配置每 10 分钟 CPU 监控并通知"
+  deepsentry --competition --task "排查本题网络故障并给出证据化答案"
+  deepsentry -proxy http://127.0.0.1:8080 --task "扫描 192.168.1.0/24 的 80 端口"
+  deepsentry -socks5 socks5://127.0.0.1:1080 --task "扫描 192.168.1.0/24"
   deepsentry --no-tui -c config.yaml "审计 SSH 登录日志"
+  deepsentry --theme light -c config.yaml  # 当前进程固定日间主题
   deepsentry --no-tui --json --task "自动巡检目标机 /proc"
   deepsentry --webshell --task "读取最近登录日志"
   deepsentry --batch -y "自动巡检目标机 /proc"
@@ -35,12 +39,16 @@ DeepSentry — AI 安全应急 Agent
   -task string      任务描述（agent/脚本推荐）
   -q string         任务描述（--task 简写）
   -plan             计划模式：必要时先追问，再生成 todo 计划并执行
+  -competition      比赛模式：按 10 分钟限时、证据闭环和评分规范执行
   -subagent-max-steps int
                     子 Agent 最大步数上限（覆盖 config.yaml 的 subagent_max_steps）
+  -proxy string      HTTP/HTTPS 出站代理（LLM、HTTP、扫描、SSH/Telnet/FTP）
+  -socks5 string     SOCKS5 出站代理（与 -proxy 互斥）
   -json             经典模式输出 JSONL 事件
   -quiet            经典模式仅输出关键结果和错误
   -webshell         WebShell/非 TTY 友好模式（提交后台执行，立即返回报告/进度路径）
   --no-color        禁用彩色输出（默认启用颜色）
+  --theme string    TUI 主题：auto（默认）| dark | light
   -scheduler        仅运行本地定时任务调度器
   -version          显示版本
   -pick-session     配合 --tui，图形化选择 checkpoint 会话
@@ -53,12 +61,17 @@ DeepSentry — AI 安全应急 Agent
 退出码:
   0                 正常结束
   1                 配置、会话、初始化或 Agent 创建失败
+  2                 命令行参数无效或包含未知选项
 
 环境变量:
   DEEPSENTRY_*      覆盖 config.yaml 中的配置项
+  DEEPSENTRY_AGENT_RUNTIME
+                    v3（默认）| legacy（兼容回滚）
+  DEEPSENTRY_TERMINAL_THEME
+                    auto（自动探测背景）| dark | light
   target_protocol   local | ssh | telnet | ftp
   telnet_host       Telnet 目标 (IP:Port，默认 23)
-  ftp_host          FTP 目标 (IP:Port，默认 21，仅文件/目录能力)
+  ftp_host          FTP/FTPS 目标 (FTP/Explicit FTPS 默认 21，Implicit FTPS 默认 990)
 
 文档:
   docs/操作手册.md   完整操作手册

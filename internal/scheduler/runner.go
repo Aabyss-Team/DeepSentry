@@ -129,7 +129,10 @@ func acquireRunLock(storePath string, now time.Time) (release func(), acquired b
 		now = time.Now()
 	}
 	lockPath := storePath + ".run.lock"
-	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o700); err != nil {
+		return nil, false, err
+	}
+	if err := os.Chmod(filepath.Dir(lockPath), 0o700); err != nil {
 		return nil, false, err
 	}
 	for attempt := 0; attempt < 2; attempt++ {
@@ -336,7 +339,9 @@ func writeScheduleReport(id string, now time.Time, content string) (string, erro
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
-	_ = os.Chmod(dir, 0o700)
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return "", err
+	}
 	path := filepath.Join(dir, fmt.Sprintf("report_%s_%s.md", id, now.Format("20060102_150405")))
 	return path, os.WriteFile(path, []byte(content), 0600)
 }

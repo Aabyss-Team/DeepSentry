@@ -83,7 +83,9 @@ func writeToolExecLog(tool, meta, output string, runErr error) string {
 	if err := os.MkdirAll("reports", 0o700); err != nil {
 		return ""
 	}
-	_ = os.Chmod("reports", 0o700)
+	if err := os.Chmod("reports", 0o700); err != nil {
+		return ""
+	}
 	meta = security.RedactSensitiveText(meta)
 	output = security.RedactSensitiveText(output)
 	path := filepath.Join("reports", fmt.Sprintf("tool_exec_%s_%d.log", tool, time.Now().UnixNano()))

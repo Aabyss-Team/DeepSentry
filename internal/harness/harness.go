@@ -8,17 +8,20 @@ import (
 	"ai-edr/internal/logger"
 	"ai-edr/internal/mcp"
 	"ai-edr/internal/memory"
+	"ai-edr/internal/runtimev3"
 	"ai-edr/internal/scheduler"
 	"ai-edr/internal/security"
 	"ai-edr/internal/skills"
 	"ai-edr/internal/tools"
 	termui "ai-edr/internal/ui"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 )
@@ -33,6 +36,10 @@ type DeepAgent struct {
 	SessionID      string
 	Checkpoint     *CheckpointStore
 	StartStep      int // resume 起始步数
+	RunID          string
+	Events         runtimev3.EventSink
+	trace          *runtimev3.JSONLTraceSink
+	sessionLog     *runtimev3.JSONLTraceSink
 }
 
 // Config Harness 配置
@@ -150,6 +157,33 @@ func NewDeepAgent(cfg Config, opts ...Option) (*DeepAgent, error) {
 		UseNativeTools: useNative,
 		SessionID:      sessionID,
 		Checkpoint:     cp,
+		RunID:          runtimev3.NewID("run"),
+	}
+	if config.GlobalConfig.EffectiveAgentRuntime() == "v3" {
+		// The session event log is part of recovery correctness, not optional
+		// observability. It therefore remains enabled even when trace_enabled is
+		// false; the optional trace is a second subscriber for operators.
+		sessionLog, logErr := runtimev3.NewJSONLTraceSink(filepath.Join(cp.SessionDir(), "events.jsonl"))
+		if logErr != nil {
+			return nil, fmt.Errorf("初始化 runtime v3 session event log 失败: %w", logErr)
+		}
+		agent.sessionLog = sessionLog
+		sinks := runtimev3.MultiSink{sessionLog}
+		if config.GlobalConfig.TraceEnabled {
+			traceDir := config.GlobalConfig.TraceDir
+			if traceDir == "" {
+				traceDir = filepath.Join(cfg.WorkspaceDir, "traces")
+			}
+			tracePath := filepath.Join(traceDir, sessionID+".jsonl")
+			trace, traceErr := runtimev3.NewJSONLTraceSink(tracePath)
+			if traceErr != nil {
+				_ = sessionLog.Close()
+				return nil, fmt.Errorf("初始化 runtime v3 trace 失败: %w", traceErr)
+			}
+			agent.trace = trace
+			sinks = append(sinks, trace)
+		}
+		agent.Events = &runtimev3.SequenceSink{Sink: sinks}
 	}
 	wireSubAgentParent(agent)
 	return agent, nil
@@ -217,6 +251,13 @@ func (a *DeepAgent) BuildSystemPrompt(base string) string {
 	default:
 		prompt += a.deepAgentBasePrompt()
 	}
+	if rawProxy := strings.TrimSpace(config.GlobalConfig.ControllerProxy); rawProxy != "" {
+		prompt += fmt.Sprintf(`
+【控制端代理路由】
+本进程已启用 %s。LLM、HTTP/Web、原生 TCP 扫描、数据库探测以及 SSH/Telnet/FTP 连接会自动走该代理。
+控制端不得改用 execute 运行 curl/nmap/ssh 等裸网络命令，因为它们不会自动继承此进程内代理；优先调用对应的 DeepSentry 原生工具。目标机内部执行的命令不经过控制端代理。
+`, config.ControllerProxySummary(rawProxy))
+	}
 	for _, mw := range a.Middleware {
 		prompt = mw.EnhancePrompt(prompt, a.State)
 	}
@@ -263,34 +304,46 @@ func balancedAgentExtension() string {
 // ParseAction 从 AgentResponse 解析为 AgentAction
 func ParseAction(resp analyzer.AgentResponse) AgentAction {
 	action := AgentAction{
-		Thought:        resp.Thought,
-		RiskLevel:      resp.RiskLevel,
-		Reason:         resp.Reason,
-		IsFinished:     resp.IsFinished,
-		FinalReport:    resp.FinalReport,
-		Question:       resp.Question,
-		Options:        resp.Options,
-		Command:        resp.Command,
-		TaskName:       resp.TaskName,
-		TaskPrompt:     resp.TaskPrompt,
-		TaskMaxSteps:   resp.TaskMaxSteps,
-		TargetSelector: resp.TargetSelector,
-		TargetName:     resp.TargetName,
-		TargetProtocol: resp.TargetProtocol,
-		TargetHost:     resp.TargetHost,
-		SkillName:      resp.SkillName,
-		Path:           resp.Path,
-		Content:        resp.Content,
-		Pattern:        resp.Pattern,
-		OldString:      resp.OldString,
-		NewString:      resp.NewString,
-		ReplaceAll:     resp.ReplaceAll,
-		GlobPattern:    resp.GlobPattern,
-		MemoryKey:      resp.MemoryKey,
-		MemoryValue:    resp.MemoryValue,
-		MemoryScope:    resp.MemoryScope,
-		ToolName:       resp.ToolName,
-		ToolArgs:       resp.ToolArgs,
+		Thought:          resp.Thought,
+		RiskLevel:        resp.RiskLevel,
+		Reason:           resp.Reason,
+		IsFinished:       resp.IsFinished,
+		FinalReport:      resp.FinalReport,
+		Question:         resp.Question,
+		Options:          resp.Options,
+		Command:          resp.Command,
+		TaskName:         resp.TaskName,
+		TaskPrompt:       resp.TaskPrompt,
+		TaskMaxSteps:     resp.TaskMaxSteps,
+		TargetSelector:   resp.TargetSelector,
+		TargetName:       resp.TargetName,
+		TargetProtocol:   resp.TargetProtocol,
+		TargetHost:       resp.TargetHost,
+		SkillName:        resp.SkillName,
+		Path:             resp.Path,
+		Content:          resp.Content,
+		Pattern:          resp.Pattern,
+		OldString:        resp.OldString,
+		NewString:        resp.NewString,
+		ReplaceAll:       resp.ReplaceAll,
+		GlobPattern:      resp.GlobPattern,
+		MemoryKey:        resp.MemoryKey,
+		MemoryValue:      resp.MemoryValue,
+		MemoryScope:      resp.MemoryScope,
+		ToolName:         resp.ToolName,
+		ToolArgs:         resp.ToolArgs,
+		ToolCallID:       resp.ToolCallID,
+		NativeCallName:   resp.ToolCallName,
+		ReasoningContent: resp.ReasoningContent,
+	}
+	if len(resp.NativeToolCalls) > 0 {
+		action.ToolCalls = make([]ToolCallAction, 0, len(resp.NativeToolCalls))
+		for _, call := range resp.NativeToolCalls {
+			args := parseNativeToolArgs(call.Arguments)
+			action.ToolCalls = append(action.ToolCalls, ToolCallAction{
+				ID: call.ID, Name: call.Name, Args: unwrapNativeToolEnvelope(call.Name, args),
+			})
+		}
 	}
 
 	if len(resp.Todos) > 0 {
@@ -327,6 +380,9 @@ func inferActionType(a AgentAction) ActionType {
 	}
 	if a.Question != "" {
 		return ActionAskUser
+	}
+	if len(a.ToolCalls) > 0 {
+		return ActionToolBatch
 	}
 	if a.ToolName != "" {
 		return ActionTool
@@ -367,6 +423,47 @@ func inferActionType(a AgentAction) ActionType {
 	return ""
 }
 
+func parseNativeToolArgs(raw string) map[string]string {
+	if strings.TrimSpace(raw) == "" {
+		return map[string]string{}
+	}
+	var values map[string]any
+	if json.Unmarshal([]byte(raw), &values) != nil {
+		return map[string]string{"_raw": raw}
+	}
+	out := make(map[string]string, len(values))
+	for key, value := range values {
+		switch typed := value.(type) {
+		case string:
+			out[key] = typed
+		default:
+			encoded, _ := json.Marshal(typed)
+			out[key] = string(encoded)
+		}
+	}
+	return out
+}
+
+// Some OpenAI-compatible providers occasionally invoke a concrete native
+// function while placing the legacy agent_action envelope in its arguments.
+// If the envelope explicitly names the same function, unwrap tool_args so a
+// valid call is not rejected and needlessly retried. Mismatched or malformed
+// envelopes remain untouched and fail normal schema validation.
+func unwrapNativeToolEnvelope(callName string, args map[string]string) map[string]string {
+	if !strings.EqualFold(strings.TrimSpace(args["tool_name"]), strings.TrimSpace(callName)) {
+		return args
+	}
+	raw := strings.TrimSpace(args["tool_args"])
+	if raw == "" {
+		return args
+	}
+	nested := parseNativeToolArgs(raw)
+	if len(nested) == 0 || nested["_raw"] != "" {
+		return args
+	}
+	return nested
+}
+
 // HandleAction 通过 middleware 链处理动作
 func (a *DeepAgent) HandleAction(ctx *StepContext, action *AgentAction) (*ActionResult, error) {
 	if action.Type == ActionFinish || action.IsFinished {
@@ -379,6 +476,9 @@ func (a *DeepAgent) HandleAction(ctx *StepContext, action *AgentAction) (*Action
 
 	if action.Type == ActionExecute || (action.Type == "" && action.Command != "") {
 		return a.handleExecute(ctx, action)
+	}
+	if action.Type == ActionToolBatch {
+		return a.handleToolBatch(ctx, action)
 	}
 
 	for _, mw := range a.Middleware {
@@ -396,6 +496,84 @@ func (a *DeepAgent) HandleAction(ctx *StepContext, action *AgentAction) (*Action
 	}
 
 	return &ActionResult{Output: unknownActionGuidance(*action)}, nil
+}
+
+func (a *DeepAgent) handleToolBatch(ctx *StepContext, action *AgentAction) (*ActionResult, error) {
+	results := make([]ToolCallResult, len(action.ToolCalls))
+	failed := make([]bool, len(action.ToolCalls))
+	parallel := true
+	for _, call := range action.ToolCalls {
+		risk, _ := classifyToolRisk(AgentAction{Type: ActionTool, ToolName: call.Name, ToolArgs: call.Args})
+		if risk != tools.RiskLow {
+			parallel = false
+			break
+		}
+	}
+	run := func(i int) {
+		call := action.ToolCalls[i]
+		if action.SkipToolCallIDs[call.ID] {
+			results[i] = ToolCallResult{ID: call.ID, Name: call.Name, Output: "已在 checkpoint 中完成或执行中；恢复时跳过以避免重复修改。"}
+			return
+		}
+		one := AgentAction{Type: ActionTool, ToolName: call.Name, ToolArgs: call.Args, ToolCallID: call.ID}
+		res, err := a.HandleAction(ctx, &one)
+		results[i] = ToolCallResult{ID: call.ID, Name: call.Name}
+		if res != nil {
+			results[i].Output = res.Output
+		}
+		if err != nil {
+			results[i].Error = security.RedactSensitiveText(err.Error())
+			failed[i] = true
+		}
+	}
+	if parallel {
+		limit := make(chan struct{}, 4)
+		var wg sync.WaitGroup
+		for i := range action.ToolCalls {
+			wg.Add(1)
+			go func(index int) {
+				defer wg.Done()
+				limit <- struct{}{}
+				defer func() { <-limit }()
+				run(index)
+			}(i)
+		}
+		wg.Wait()
+	} else {
+		for i := range action.ToolCalls {
+			run(i)
+		}
+	}
+	// HandleAction returns one aggregate result for the batch, so the outer
+	// run loop cannot infer which individual calls failed. Release failed
+	// low-risk calls (or retain uncertain modifying calls) here and exclude
+	// them from the aggregate completion step below.
+	for i, didFail := range failed {
+		if !didFail {
+			continue
+		}
+		call := action.ToolCalls[i]
+		state := ctx.State
+		if state == nil {
+			state = a.State
+		}
+		if state != nil {
+			state.FailToolCall(call.ID)
+		}
+		if action.SkipToolCallIDs == nil {
+			action.SkipToolCallIDs = make(map[string]bool)
+		}
+		action.SkipToolCallIDs[call.ID] = true
+	}
+	var combined strings.Builder
+	for _, result := range results {
+		fmt.Fprintf(&combined, "【工具 %s · call %s】\n%s", result.Name, result.ID, result.Output)
+		if result.Error != "" {
+			fmt.Fprintf(&combined, "\n错误: %s", result.Error)
+		}
+		combined.WriteString("\n")
+	}
+	return &ActionResult{Output: strings.TrimSpace(combined.String()), ToolResults: results}, nil
 }
 
 func unknownActionGuidance(action AgentAction) string {
@@ -616,7 +794,7 @@ AGENTS.md 可通过 write_file/edit_file 写入 ~/.deepsentry/AGENTS.md 实现�
    - config_manage 是控制端视角，会自动备份并重载配置；远程 execute 是目标机视角，会误改服务器文件。
    - skill_market 安装会做来源锁定、静态审查、原子落盘与当前会话热刷新。如果 skill_market 失败，禁止改用 execute/curl/wget/git/write_file 手工安装，严禁 curl -k/--insecure 跳过 TLS 验证。
 5. 文件操作用 read_file/grep/ls/edit_file/glob，复杂系统操作用 execute
-6. Shell-first 原则：默认优先使用 action="execute" 执行目标机原生 Shell 命令来解决排查问题。原生命令能稳定完成的事，不要上来就用 action="tool"；但 DeepSentry 自身配置管理和用户明确要求浏览/操作网页时例外，分别使用 config_manage 和浏览器工具。
+6. Shell/CLI-first 原则：Linux/Windows 默认优先使用 action="execute" 执行原生命令；如果系统上下文标记为 Huawei/H3C/Ruijie/Cisco 网络设备，目标是设备 CLI 而不是 Shell，优先 network_device_baseline 或厂商 display/show，只读命令不得追加分号、echo marker、$?、grep/cat/ls。DeepSentry 配置管理和用户明确要求浏览网页时分别使用 config_manage 和浏览器工具。
    - 适合优先 Shell：系统状态、进程、端口、磁盘、服务、日志 tail/grep/awk/sed、创建脚本、chmod、crontab/systemd、curl 发送通知等。
    - 需要写脚本到目标机时，优先用远程 shell heredoc/printf 创建文件并 chmod；不要输出 action="upload" 或 action="download"，这不是合法动作。确需传输控制端文件时，使用 action="execute" 且 command 为 upload/download 伪命令。
 7. 工具作为 fallback：只有目标机缺少常用命令、输出过大/格式复杂、需要跨平台结构化解析、控制端探测、文档/pcap 解析、定时任务编排、MCP 扩展或 DeepSentry 配置管理时，才先调用 tool_catalog 调研，再选择具体工具；注意 🎯目标机 vs 💻控制端 视角
@@ -682,6 +860,19 @@ func planModePrompt() string {
 `
 }
 
+func competitionModePrompt() string {
+	return `
+【AI 智运比赛模式】
+- 单题限时 10 分钟。先完成题目所有子要求，再做扩展；禁止无目的全量扫描、重复执行和大段原始输出。
+- 机房/Linux 题优先 host_incident_baseline；网络题已知方向时优先 network_device_diagnose 并选择 interfaces/routing/l2/logs，方向不明时再用 network_device_baseline；然后只针对异常补 1-3 个命令。
+- 每个关键结论必须绑定真实工具/命令证据。把“已验证事实”、“合理推断”、“尚未验证”明确分开；不得伪造设备型号、故障根因、命令输出或修复结果。
+- 对 AI 初始假设、题干诱导项或已否定的错误建议，在最终报告中明确写出“纠错”与证据；不得直接复制未验证的 AI 答案。
+- 如需修改配置，先采集现状与回滚点，只做最小修改，修改后必须用状态/连通性/日志复验；未获得高风险授权时只给出已验证的修复命令和回滚方案。
+- 20 分题或包含处置变更的题，在 finish 前用 competition_answer_check 对答案草稿做一次自检；工具分数只是格式护栏，不能当作技术结论已被验证。
+- final_report 固定顺序：【任务状态】→【结论】→【关键证据】→【处置/答案】→【复验】→【AI 复核与纠错】→【风险与回滚】。使用简短编号项，确保可直接邮件提交。
+`
+}
+
 func nonInteractivePrompt(_ bool) string {
 	return `
 【非交互模式】
@@ -711,6 +902,29 @@ func (a *DeepAgent) RunLoop(cfg RunLoopConfig) {
 	}
 	confirmFn := cfg.ConfirmFn
 	stop := cfg.Stop
+	modelStep := cfg.ModelStep
+	if modelStep == nil {
+		modelStep = analyzer.RunAgentStepWithOptions
+	}
+	targetExecutor := cfg.Executor
+	if targetExecutor == nil {
+		targetExecutor = executor.Current
+	}
+	actionHandler := cfg.ActionHandler
+	if actionHandler == nil {
+		actionHandler = a.HandleAction
+	}
+	a.emitRuntime(runtimev3.RunEvent{Kind: runtimev3.EventRunStart, Component: "harness"})
+	defer func() {
+		a.emitRuntime(runtimev3.RunEvent{Kind: runtimev3.EventRunEnd, Component: "harness"})
+		_ = a.flushRuntimeEvents(context.Background())
+		if a.trace != nil {
+			_ = a.trace.Close()
+		}
+		if a.sessionLog != nil {
+			_ = a.sessionLog.Close()
+		}
+	}()
 
 	stepCount := a.StartStep
 	consecutiveEmpty := 0
@@ -756,8 +970,16 @@ func (a *DeepAgent) RunLoop(cfg RunLoopConfig) {
 	if protocol == "ssh" && sshPolicy == "insecure" {
 		ui.Emit(UIEvent{Kind: EventError, Message: termui.Prefix("⚠️", "[WARN]") + "SSH 主机密钥校验已禁用，存在中间人风险；正式环境请使用 accept-new 或 strict"})
 	}
-	if protocol == "telnet" || protocol == "ftp" {
+	ftpTLSMode := strings.ToLower(strings.TrimSpace(config.GlobalConfig.FTPTLSMode))
+	if protocol == "telnet" || (protocol == "ftp" && (ftpTLSMode == "" || ftpTLSMode == "plain")) {
 		ui.Emit(UIEvent{Kind: EventError, Message: fmt.Sprintf("%s%s 会明文传输凭据和数据；仅限受控隔离网测试，正式环境请改用 SSH/SFTP", termui.Prefix("⚠️", "[WARN]"), strings.ToUpper(protocol))})
+	}
+	if protocol == "ftp" && ftpTLSMode != "" && ftpTLSMode != "plain" {
+		if config.GlobalConfig.FTPTLSInsecureSkipVerify {
+			ui.Emit(UIEvent{Kind: EventError, Message: fmt.Sprintf("%sFTPS %s TLS 已加密，但证书校验已禁用；存在中间人风险", termui.Prefix("⚠️", "[WARN]"), ftpTLSMode)})
+		} else {
+			ui.Emit(UIEvent{Kind: EventInfo, Message: fmt.Sprintf("%sFTPS %s TLS 已启用，证书校验已开启", termui.Prefix("🔐", "[TLS]"), ftpTLSMode)})
+		}
 	}
 	if modelCaps.DetectionSource == "local-safe-default" {
 		ui.Emit(UIEvent{Kind: EventInfo, Message: termui.Prefix("💡", "[HINT]") + "本地模型暂按 32K 安全窗口运行；请将 context_window_tokens 设为服务端实际 num_ctx/max_model_len，才能用满上下文"})
@@ -797,6 +1019,9 @@ func (a *DeepAgent) RunLoop(cfg RunLoopConfig) {
 		if cfg.PlanMode {
 			extraPrompt += planModePrompt()
 		}
+		if cfg.CompetitionMode {
+			extraPrompt += competitionModePrompt()
+		}
 		if cfg.NonInteractive {
 			extraPrompt += nonInteractivePrompt(cfg.PauseOnAskUser)
 		}
@@ -815,7 +1040,9 @@ func (a *DeepAgent) RunLoop(cfg RunLoopConfig) {
 		}
 
 		llmCtx, cancelLLM := contextFromStop(stop)
-		resp, err := analyzer.RunAgentStepWithOptions(analyzer.StepOptions{
+		modelStarted := time.Now()
+		a.emitRuntime(runtimev3.RunEvent{Kind: runtimev3.EventModelStart, Component: "analyzer", TurnID: fmt.Sprintf("turn_%d", stepCount), StepID: fmt.Sprintf("step_%d", stepCount)})
+		resp, err := modelStep(analyzer.StepOptions{
 			Context:        llmCtx,
 			SysCtx:         sysCtx,
 			History:        history,
@@ -824,6 +1051,8 @@ func (a *DeepAgent) RunLoop(cfg RunLoopConfig) {
 			UseNativeTools: a.UseNativeTools,
 			OnStream:       streamFn,
 			OnContextEvent: func(compacted, fallback bool, beforeTokens, afterTokens int) {
+				metadata, _ := json.Marshal(map[string]any{"compacted": compacted, "fallback": fallback, "before_tokens": beforeTokens, "after_tokens": afterTokens})
+				a.emitRuntime(runtimev3.RunEvent{Kind: runtimev3.EventContextCompact, Component: "context", TurnID: fmt.Sprintf("turn_%d", stepCount), SafeMetadata: metadata})
 				if fallback {
 					ui.Emit(UIEvent{Kind: EventInfo, Message: fmt.Sprintf("%s模型上下文不足或摘要失败，已机械保留目标/线索/最近步骤（约 %d → %d tokens）", termui.Prefix("🧠", "[MEM]"), beforeTokens, afterTokens)})
 					return
@@ -840,8 +1069,21 @@ func (a *DeepAgent) RunLoop(cfg RunLoopConfig) {
 					TotalTokens:      usage.TotalTokens,
 				})
 			},
+			OnModelRoute: func(route analyzer.ModelRouteInfo) {
+				if route.Attempts > 1 {
+					a.emitRuntime(runtimev3.RunEvent{Kind: runtimev3.EventModelRetry, Component: "model_router", TurnID: fmt.Sprintf("turn_%d", stepCount), ModelID: route.ModelID, Message: fmt.Sprintf("attempts=%d", route.Attempts)})
+				}
+				if route.Failovers > 0 {
+					a.emitRuntime(runtimev3.RunEvent{Kind: runtimev3.EventModelFailover, Component: "model_router", TurnID: fmt.Sprintf("turn_%d", stepCount), ModelID: route.ModelID, Message: fmt.Sprintf("failovers=%d", route.Failovers)})
+				}
+			},
 		})
 		cancelLLM()
+		if err != nil {
+			a.emitRuntime(runtimev3.RunEvent{Kind: runtimev3.EventModelError, Component: "analyzer", TurnID: fmt.Sprintf("turn_%d", stepCount), DurationMS: time.Since(modelStarted).Milliseconds(), ErrorClass: runtimev3.ClassifyError(err), Message: security.RedactSensitiveText(err.Error())})
+		} else {
+			a.emitRuntime(runtimev3.RunEvent{Kind: runtimev3.EventModelEnd, Component: "analyzer", TurnID: fmt.Sprintf("turn_%d", stepCount), DurationMS: time.Since(modelStarted).Milliseconds()})
+		}
 		if streamBuf.Len() > 0 {
 			ui.Emit(UIEvent{Kind: EventStreamEnd, Detail: streamBuf.String()})
 		}
@@ -864,6 +1106,7 @@ func (a *DeepAgent) RunLoop(cfg RunLoopConfig) {
 		action := ParseAction(resp)
 		action.Thought = security.RedactSensitiveText(action.Thought)
 		action.FinalReport = security.RedactSensitiveText(action.FinalReport)
+		markSelectedTools(a.State, action)
 
 		if reporter != nil {
 			reporter.Log("AI Thought", fmt.Sprintf("Idea: %s\nAction: %s", action.Thought, action.Type))
@@ -956,7 +1199,7 @@ func (a *DeepAgent) RunLoop(cfg RunLoopConfig) {
 		consecutiveEmpty = 0
 
 		actCopy := RedactedAction(action)
-		enrichActionExecutionTarget(&actCopy)
+		enrichActionExecutionTargetWithExecutor(&actCopy, targetExecutor)
 		ui.Emit(UIEvent{Kind: EventAction, Action: &actCopy})
 		if shouldStop(stop) {
 			a.saveCheckpointUI(stepCount, history, ui)
@@ -1016,6 +1259,20 @@ func (a *DeepAgent) RunLoop(cfg RunLoopConfig) {
 					ui.Emit(UIEvent{Kind: EventRiskAuto, Message: fmt.Sprintf("%s工具 [%s] 低风险 -> 自动执行", termui.Prefix("🟢", "[LOW]"), action.ToolName)})
 					shouldRun = true
 				}
+			case ActionToolBatch:
+				for _, call := range action.ToolCalls {
+					risk, reason := classifyToolRisk(AgentAction{Type: ActionTool, ToolName: call.Name, ToolArgs: call.Args})
+					if risk == tools.RiskHigh || risk == tools.RiskMedium {
+						action.RiskLevel = risk
+						action.Reason = fmt.Sprintf("批量工具 %s: %s", call.Name, reason)
+						needsConfirm = true
+						break
+					}
+				}
+				if !needsConfirm {
+					ui.Emit(UIEvent{Kind: EventRiskAuto, Message: fmt.Sprintf("%s%d 个只读工具受限并行执行", termui.Prefix("🟢", "[LOW]"), len(action.ToolCalls))})
+					shouldRun = true
+				}
 			default:
 				shouldRun = true
 			}
@@ -1024,9 +1281,6 @@ func (a *DeepAgent) RunLoop(cfg RunLoopConfig) {
 				confirmAction := RedactedAction(action)
 				if confirmFn != nil && confirmFn(&confirmAction) {
 					shouldRun = true
-					if action.Type == ActionExecute {
-						security.RecordApproval(action.Command)
-					}
 				} else {
 					ui.Emit(UIEvent{Kind: EventDenied})
 					*history = append(*history, analyzer.Message{
@@ -1041,6 +1295,10 @@ func (a *DeepAgent) RunLoop(cfg RunLoopConfig) {
 
 		if !shouldRun {
 			continue
+		}
+		prepareToolCallExecution(a.State, &action)
+		if action.ToolCallID != "" || len(action.ToolCalls) > 0 {
+			a.saveCheckpointUI(stepCount, history, ui)
 		}
 
 		stepCtx := &StepContext{
@@ -1059,10 +1317,29 @@ func (a *DeepAgent) RunLoop(cfg RunLoopConfig) {
 			ConfirmFn:        confirmFn,
 			SudoAuthFn:       cfg.SudoAuthFn,
 			Stop:             stop,
-			Executor:         executor.Current,
+			Executor:         targetExecutor,
 		}
 
-		result, err := a.HandleAction(stepCtx, &action)
+		var result *ActionResult
+		toolStarted := time.Now()
+		a.emitRuntime(runtimev3.RunEvent{Kind: runtimev3.EventToolStart, Component: "tool", TurnID: fmt.Sprintf("turn_%d", stepCount), StepID: fmt.Sprintf("step_%d", stepCount), ToolCallID: action.ToolCallID, ToolName: action.ToolName})
+		if action.ToolCallID != "" && action.SkipToolCallIDs[action.ToolCallID] {
+			result = &ActionResult{Output: "该修改型工具调用已在 checkpoint 中标记为完成或执行中；为避免重复修改，本次恢复不会再次执行。"}
+		} else {
+			result, err = actionHandler(stepCtx, &action)
+		}
+		if err != nil {
+			failActionToolCalls(a.State, action)
+		} else {
+			completeActionToolCalls(a.State, action)
+		}
+		toolEvent := runtimev3.RunEvent{Kind: runtimev3.EventToolEnd, Component: "tool", TurnID: fmt.Sprintf("turn_%d", stepCount), StepID: fmt.Sprintf("step_%d", stepCount), ToolCallID: action.ToolCallID, ToolName: action.ToolName, DurationMS: time.Since(toolStarted).Milliseconds()}
+		if err != nil {
+			toolEvent.Kind = runtimev3.EventToolError
+			toolEvent.ErrorClass = runtimev3.ClassifyError(err)
+			toolEvent.Message = security.RedactSensitiveText(err.Error())
+		}
+		a.emitRuntime(toolEvent)
 		if err != nil {
 			safeErr := security.RedactSensitiveText(err.Error())
 			ui.Emit(UIEvent{Kind: EventError, Message: fmt.Sprintf("%s执行出错: %s", termui.Prefix("⚠️", "[WARN]"), safeErr)})
@@ -1116,15 +1393,141 @@ func (a *DeepAgent) RunLoop(cfg RunLoopConfig) {
 			reporter.Log(string(action.Type), result.Output)
 		}
 
-		*history = append(*history, analyzer.Message{
-			Role:    "assistant",
-			Content: security.RedactSensitiveText(actionToJSON(action)),
-		})
-		*history = append(*history, analyzer.Message{
-			Role: "user", Content: fmt.Sprintf("Output:\n%s", result.Output),
-		})
+		appendActionResultHistory(history, action, result)
 
 		a.saveCheckpointUI(stepCount, history, ui)
+	}
+}
+
+func appendActionResultHistory(history *[]analyzer.Message, action AgentAction, result *ActionResult) {
+	if history == nil || result == nil {
+		return
+	}
+	if len(action.ToolCalls) > 0 {
+		calls := make([]analyzer.ToolCall, 0, len(action.ToolCalls))
+		for _, call := range action.ToolCalls {
+			args, _ := json.Marshal(call.Args)
+			calls = append(calls, analyzer.ToolCall{ID: call.ID, Type: "function", Function: struct {
+				Name      string `json:"name"`
+				Arguments string `json:"arguments"`
+			}{Name: call.Name, Arguments: string(args)}})
+		}
+		// Provider reasoning state can contain signatures and must round-trip
+		// byte-for-byte for the immediate next tool turn. It is never rendered;
+		// checkpoint serialization applies the repository-wide JSON redactor.
+		*history = append(*history, analyzer.Message{Role: "assistant", ReasoningContent: action.ReasoningContent, ToolCalls: calls})
+		for _, toolResult := range result.ToolResults {
+			content := toolResult.Output
+			if toolResult.Error != "" {
+				content += "\nerror: " + toolResult.Error
+			}
+			*history = append(*history, analyzer.Message{Role: "tool", ToolCallID: toolResult.ID, Name: toolResult.Name, Content: security.RedactSensitiveText(content)})
+		}
+		return
+	}
+	if action.ToolCallID != "" {
+		name := action.NativeCallName
+		if name == "" {
+			name = action.ToolName
+		}
+		if name == "" {
+			name = "agent_action"
+		}
+		call := analyzer.ToolCall{ID: action.ToolCallID, Type: "function", Function: struct {
+			Name      string `json:"name"`
+			Arguments string `json:"arguments"`
+		}{Name: name, Arguments: actionToJSON(action)}}
+		*history = append(*history, analyzer.Message{Role: "assistant", ReasoningContent: action.ReasoningContent, ToolCalls: []analyzer.ToolCall{call}})
+		*history = append(*history, analyzer.Message{Role: "tool", ToolCallID: action.ToolCallID, Name: name, Content: security.RedactSensitiveText(result.Output)})
+		return
+	}
+	*history = append(*history,
+		analyzer.Message{Role: "assistant", Content: security.RedactSensitiveText(actionToJSON(action))},
+		analyzer.Message{Role: "user", Content: fmt.Sprintf("Output:\n%s", result.Output)},
+	)
+}
+
+func markSelectedTools(state *AgentState, action AgentAction) {
+	if state == nil {
+		return
+	}
+	if action.Type == ActionTool && action.ToolName != "tool_catalog" {
+		state.MarkSelectedTool(action.ToolName)
+	}
+	if action.Type == ActionTool && action.ToolName == "tool_catalog" {
+		state.MarkSelectedTool(strings.TrimSpace(action.ToolArgs["name"]))
+	}
+	for _, call := range action.ToolCalls {
+		state.MarkSelectedTool(call.Name)
+	}
+}
+
+func prepareToolCallExecution(state *AgentState, action *AgentAction) {
+	if state == nil || action == nil {
+		return
+	}
+	if action.SkipToolCallIDs == nil {
+		action.SkipToolCallIDs = make(map[string]bool)
+	}
+	begin := func(id, name string, args map[string]string) {
+		if id == "" {
+			return
+		}
+		risk, _ := classifyToolRisk(AgentAction{Type: ActionTool, ToolName: name, ToolArgs: args})
+		if state.ToolCallCompleted(id) {
+			action.SkipToolCallIDs[id] = true
+			return
+		}
+		if pending, ok := state.ToolCallPending(id); ok && pending.Risk != tools.RiskLow {
+			action.SkipToolCallIDs[id] = true
+			return
+		}
+		encoded, _ := json.Marshal(args)
+		hash := sha256.Sum256(encoded)
+		argsHash := fmt.Sprintf("%x", hash[:])
+		if _, pending := state.PendingMutationByFingerprint(name, argsHash); pending && risk != tools.RiskLow {
+			action.SkipToolCallIDs[id] = true
+			return
+		}
+		state.BeginToolCall(ToolCallRecord{ID: id, Name: name, Risk: risk, ArgsHash: argsHash})
+	}
+	if action.ToolCallID != "" {
+		name := action.NativeCallName
+		if name == "" {
+			name = action.ToolName
+		}
+		begin(action.ToolCallID, name, action.ToolArgs)
+	}
+	for _, call := range action.ToolCalls {
+		begin(call.ID, call.Name, call.Args)
+	}
+}
+
+func completeActionToolCalls(state *AgentState, action AgentAction) {
+	if state == nil {
+		return
+	}
+	if action.ToolCallID != "" && !action.SkipToolCallIDs[action.ToolCallID] {
+		state.CompleteToolCall(action.ToolCallID)
+	}
+	for _, call := range action.ToolCalls {
+		if !action.SkipToolCallIDs[call.ID] {
+			state.CompleteToolCall(call.ID)
+		}
+	}
+}
+
+func failActionToolCalls(state *AgentState, action AgentAction) {
+	if state == nil {
+		return
+	}
+	if action.ToolCallID != "" && !action.SkipToolCallIDs[action.ToolCallID] {
+		state.FailToolCall(action.ToolCallID)
+	}
+	for _, call := range action.ToolCalls {
+		if !action.SkipToolCallIDs[call.ID] {
+			state.FailToolCall(call.ID)
+		}
 	}
 }
 
@@ -1243,6 +1646,10 @@ func classifyToolRisk(action AgentAction) (string, string) {
 }
 
 func enrichActionExecutionTarget(action *AgentAction) {
+	enrichActionExecutionTargetWithExecutor(action, executor.Current)
+}
+
+func enrichActionExecutionTargetWithExecutor(action *AgentAction, targetExecutor executor.Executor) {
 	if action == nil || action.Type != ActionExecute {
 		return
 	}
@@ -1255,7 +1662,10 @@ func enrichActionExecutionTarget(action *AgentAction) {
 	if strings.TrimSpace(action.TargetProtocol) != "" || strings.TrimSpace(action.TargetHost) != "" {
 		return
 	}
-	mode := executor.CurrentMode()
+	mode := strings.ToLower(strings.TrimSpace(config.GlobalConfig.TargetProtocol))
+	if mode == "" {
+		mode = executor.CurrentMode()
+	}
 	switch mode {
 	case "ssh":
 		action.TargetProtocol = "ssh"
@@ -1269,7 +1679,7 @@ func enrichActionExecutionTarget(action *AgentAction) {
 	case "local":
 		action.TargetProtocol = "local"
 	default:
-		if executor.Current != nil && executor.Current.IsRemote() {
+		if targetExecutor != nil && targetExecutor.IsRemote() {
 			action.TargetProtocol = "remote"
 		} else {
 			action.TargetProtocol = "local"
@@ -1477,15 +1887,61 @@ func (a *DeepAgent) saveCheckpointUI(step int, history *[]analyzer.Message, ui U
 	if a.Checkpoint == nil || history == nil {
 		return
 	}
+	// Persist the append-only timeline before a checkpoint references its
+	// cursor. If the event log cannot be made durable, skip this checkpoint so
+	// resume never sees state newer than its audit/recovery timeline.
+	if err := a.flushRuntimeEvents(context.Background()); err != nil {
+		ui.Emit(UIEvent{Kind: EventCheckpoint, Message: fmt.Sprintf("checkpoint 保存失败: session 事件落盘失败: %v", err)})
+		return
+	}
 	if err := a.Checkpoint.Save(CheckpointData{
-		SessionID: a.SessionID,
-		StepNum:   step,
-		UserGoal:  checkpointUserGoal(*history),
-		State:     a.State,
-		History:   *history,
+		SchemaVersion:  currentCheckpointSchemaVersion,
+		RuntimeVersion: config.GlobalConfig.EffectiveAgentRuntime(),
+		RunID:          a.RunID,
+		TurnID:         fmt.Sprintf("turn_%d", step),
+		EventCursor:    a.eventCursor(),
+		SessionID:      a.SessionID,
+		StepNum:        step,
+		UserGoal:       checkpointUserGoal(*history),
+		State:          a.State,
+		History:        *history,
 	}); err != nil {
 		ui.Emit(UIEvent{Kind: EventCheckpoint, Message: fmt.Sprintf("checkpoint 保存失败: %v", err)})
+		return
 	}
+	a.emitRuntime(runtimev3.RunEvent{Kind: runtimev3.EventCheckpoint, Component: "checkpoint", TurnID: fmt.Sprintf("turn_%d", step)})
+	if err := a.flushRuntimeEvents(context.Background()); err != nil {
+		ui.Emit(UIEvent{Kind: EventCheckpoint, Message: fmt.Sprintf("checkpoint 事件落盘失败: %v", err)})
+	}
+}
+
+func (a *DeepAgent) emitRuntime(event runtimev3.RunEvent) {
+	if a == nil || a.Events == nil {
+		return
+	}
+	event.RunID = a.RunID
+	event.Message = security.RedactSensitiveText(event.Message)
+	_ = a.Events.Emit(context.Background(), event)
+}
+
+func (a *DeepAgent) eventCursor() int64 {
+	if a == nil {
+		return 0
+	}
+	if sink, ok := a.Events.(*runtimev3.SequenceSink); ok {
+		return sink.Cursor()
+	}
+	return 0
+}
+
+func (a *DeepAgent) flushRuntimeEvents(ctx context.Context) error {
+	if a == nil || a.Events == nil {
+		return nil
+	}
+	if durable, ok := a.Events.(interface{ Flush(context.Context) error }); ok {
+		return durable.Flush(ctx)
+	}
+	return nil
 }
 
 func checkpointUserGoal(history []analyzer.Message) string {
@@ -1513,6 +1969,12 @@ func (a *DeepAgent) RestoreFromCheckpoint(data *CheckpointData) {
 		// A checkpoint must not resurrect a Skill that the user disabled after
 		// the checkpoint was created.
 		reconcileLoadedSkills(a.State, a.Catalog)
+	}
+	if strings.TrimSpace(data.RunID) != "" {
+		a.RunID = data.RunID
+	}
+	if sink, ok := a.Events.(*runtimev3.SequenceSink); ok {
+		sink.AdvanceTo(data.EventCursor)
 	}
 	a.StartStep = data.StepNum
 }

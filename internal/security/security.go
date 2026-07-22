@@ -2,44 +2,9 @@ package security
 
 import (
 	"ai-edr/internal/executor"
-	"crypto/sha256"
 	"fmt"
 	"strings"
-	"sync"
 )
-
-// approvedCache 用于记录用户已授权的高危命令哈希
-// 作用：一旦用户批准某条命令，本次运行期间不再重复询问
-var (
-	approvedCache = make(map[string]bool)
-	cacheMutex    sync.RWMutex
-)
-
-// RecordApproval 记录用户已批准的命令
-func RecordApproval(cmd string) {
-	cmd = strings.TrimSpace(cmd)
-	if cmd == "" {
-		return
-	}
-	hash := fmt.Sprintf("%x", sha256.Sum256([]byte(cmd)))
-
-	cacheMutex.Lock()
-	defer cacheMutex.Unlock()
-	approvedCache[hash] = true
-}
-
-// isApproved 检查命令是否已被批准过
-func isApproved(cmd string) bool {
-	cmd = strings.TrimSpace(cmd)
-	if cmd == "" {
-		return false
-	}
-	hash := fmt.Sprintf("%x", sha256.Sum256([]byte(cmd)))
-
-	cacheMutex.RLock()
-	defer cacheMutex.RUnlock()
-	return approvedCache[hash]
-}
 
 // CheckRisk 评估命令的风险等级。
 // 策略尽量贴近 Claude Code 的交互体验：只读观测命令默认放行，明确有副作用的操作才确认。
@@ -50,15 +15,13 @@ func CheckRisk(cmd string) (string, string) {
 		return "low", "空命令"
 	}
 
-	// 0. [Session Cache] 检查是否是用户已批准过的命令
-	if isApproved(cmd) {
-		return "low", "用户已授权 (Session)"
-	}
-
 	analyzeCmd := normalizeCommand(cmd)
 
 	if reason := dangerousShellPattern(analyzeCmd); reason != "" {
 		return "high", reason
+	}
+	if isReadOnlyNetworkCLI(analyzeCmd) {
+		return "low", "网络设备只读 display/show 命令"
 	}
 
 	subCmds := splitShellCommands(analyzeCmd)
@@ -72,6 +35,47 @@ func CheckRisk(cmd string) (string, string) {
 	return "low", "只读/低副作用操作"
 }
 
+func isReadOnlyNetworkCLI(command string) bool {
+	parts := strings.Split(command, "|")
+	if len(parts) == 0 {
+		return false
+	}
+	root := strings.Fields(strings.TrimSpace(parts[0]))
+	if len(root) == 0 || (strings.ToLower(root[0]) != "display" && strings.ToLower(root[0]) != "show") {
+		return false
+	}
+	seenFilter := false
+	for _, filter := range parts[1:] {
+		fields := strings.Fields(strings.TrimSpace(filter))
+		if len(fields) == 0 {
+			return false
+		}
+		switch strings.ToLower(fields[0]) {
+		case "include", "exclude", "begin", "section", "count", "no-more":
+			seenFilter = true
+		default:
+			// VRP/Comware regular expressions use an unescaped vertical bar
+			// for alternation: `| include rate|packets|bytes`. Once a filter
+			// begins, these segments are regex alternatives, not shell pipes.
+			if !seenFilter || looksLikeShellPipeline(fields[0]) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func looksLikeShellPipeline(first string) bool {
+	first = strings.ToLower(strings.TrimSpace(first))
+	first = strings.TrimPrefix(first, "sudo")
+	switch first {
+	case "sh", "bash", "zsh", "cmd", "powershell", "rm", "mv", "cp", "dd", "tee", "cat", "sed", "awk", "perl", "python", "python3", "curl", "wget", "nc", "ncat", "socat":
+		return true
+	default:
+		return false
+	}
+}
+
 // CanReviewHighRiskWithAI 表示规则引擎判高后是否进入 AI 二次复核。
 // 人工确认采用“双高危”策略：规则高危 + AI 高危才弹窗；
 // AI 明确判低则自动放行，AI 超时/失败/低置信度则失败关闭到人工确认。
@@ -81,7 +85,7 @@ func CanReviewHighRiskWithAI(cmd, reason string) bool {
 	if cmd == "" || reason == "" {
 		return false
 	}
-	return !isApproved(cmd)
+	return true
 }
 
 func normalizeCommand(cmd string) string {
@@ -272,6 +276,10 @@ func checkSingleCommand(subCmd string) (string, string) {
 		"ipconfig": true, "ifconfig": true, "ip": true, "netstat": true, "ss": true,
 		"ping": true, "arp": true, "route": true, "nslookup": true, "dig": true,
 		"host": true, "traceroute": true, "tracepath": true, "mtr": true,
+		// 交换机/路由器只读 CLI（Huawei/H3C display，Ruijie/Cisco show）
+		"display": true, "show": true,
+		// 仅退出当前网络设备视图，不修改配置。
+		"quit": true, "return": true, "exit": true,
 		"wmic": true, "ver": true, "scutil": true, "sw_vers": true,
 		"curl": true,
 
@@ -313,6 +321,9 @@ func checkSingleCommand(subCmd string) (string, string) {
 		"useradd": true, "usermod": true, "userdel": true, "passwd": true,
 		"groupadd": true, "groupmod": true, "groupdel": true,
 		"sudo": true, "su": true, "doas": true,
+		// 网络设备权限/配置视图。即使命令本身不写配置，也会扩大后续操作权限。
+		"super": true, "enable": true, "system-view": true, "configure": true,
+		"interface": true, "save": true, "reset": true,
 		"mount": true, "umount": true, "crontab": true,
 
 		// 进程与网络传输

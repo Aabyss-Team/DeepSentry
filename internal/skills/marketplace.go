@@ -4,7 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
-	"crypto/sha1"
+	"crypto/sha1" // #nosec G505 -- required only to reproduce Git SHA-1 blob object IDs
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -711,7 +711,9 @@ func verifyGitHubArchiveFiles(skillDir string, entries []githubTreeEntry, files 
 			return fmt.Errorf("文件大小不一致: %s", file.Path)
 		}
 		if len(entry.SHA) == 40 {
-			h := sha1.New() // GitHub's Git object ID is SHA-1 for current repositories.
+			// #nosec G401 -- this reproduces Git's blob object identifier for
+			// transport integrity; it is not used for a security signature.
+			h := sha1.New()
 			_, _ = fmt.Fprintf(h, "blob %d%c", len(file.Data), byte(0))
 			_, _ = h.Write(file.Data)
 			if !strings.EqualFold(hex.EncodeToString(h.Sum(nil)), entry.SHA) {
@@ -1023,8 +1025,12 @@ func newManagedBackupPath(root, name, label string) (string, error) {
 
 func AuditSkillDir(dir string) (SkillAudit, error) {
 	var audit SkillAudit
-	skillFile := filepath.Join(dir, "SKILL.md")
-	data, err := os.ReadFile(skillFile)
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return audit, fmt.Errorf("打开 Skill 根目录失败: %w", err)
+	}
+	defer root.Close()
+	data, err := root.ReadFile("SKILL.md")
 	if err != nil {
 		return audit, fmt.Errorf("缺少可读 SKILL.md: %w", err)
 	}
@@ -1078,7 +1084,13 @@ func AuditSkillDir(dir string) (SkillAudit, error) {
 		if info.Size() > 1<<20 {
 			return nil
 		}
-		body, err := os.ReadFile(path)
+		rel, err := filepath.Rel(dir, path)
+		if err != nil {
+			return err
+		}
+		// Root-scoped access prevents a local symlink swap from escaping the
+		// staged Skill directory between WalkDir and the content read.
+		body, err := root.ReadFile(rel)
 		if err != nil || bytes.IndexByte(body, 0) >= 0 {
 			return nil
 		}

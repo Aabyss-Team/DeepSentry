@@ -18,6 +18,7 @@ type SessionController struct {
 	sink                 *ChannelSink
 	mu                   sync.Mutex
 	confirmMu            sync.Mutex
+	sessionApprovals     map[string]string
 	sudoMu               sync.Mutex
 	running              bool
 	turn                 int
@@ -38,9 +39,10 @@ type SessionStats struct {
 
 func newSessionController(cfg SessionConfig) *SessionController {
 	return &SessionController{
-		cfg:    cfg,
-		sink:   NewChannelSink(2048),
-		stopCh: make(chan struct{}),
+		cfg:              cfg,
+		sink:             NewChannelSink(2048),
+		stopCh:           make(chan struct{}),
+		sessionApprovals: make(map[string]string),
 	}
 }
 
@@ -110,6 +112,14 @@ func (c *SessionController) confirmFn(action *harness.AgentAction) bool {
 	if stopped {
 		return false
 	}
+	scopeKey, scopeLabel := action.ApprovalScopeKey, action.ApprovalScopeLabel
+	if scopeKey == "" {
+		scopeKey, scopeLabel = harness.SessionApprovalScope(action)
+	}
+	if label, ok := c.sessionApprovals[scopeKey]; ok && scopeKey != "" {
+		c.program.Send(uiEventMsg(harness.UIEvent{Kind: harness.EventRiskAuto, Message: "已命中本会话授权：" + label}))
+		return true
+	}
 	prompt := fmt.Sprintf("**操作类型**：`%s`", action.Type)
 	if action.Type == harness.ActionExecute {
 		prompt = "**高风险命令**\n\n```sh\n" + action.Command + "\n```"
@@ -119,7 +129,20 @@ func (c *SessionController) confirmFn(action *harness.AgentAction) bool {
 	if reason := strings.TrimSpace(action.Reason); reason != "" {
 		prompt += "\n\n**确认原因**：" + reason
 	}
-	return WaitConfirm(c.program, action, prompt)
+	if scopeLabel != "" {
+		prompt += "\n\n**A 本会话允许**：" + scopeLabel
+	}
+	decision := WaitConfirm(c.program, action, prompt)
+	if decision == approvalAllowSession && scopeKey != "" {
+		c.sessionApprovals[scopeKey] = scopeLabel
+	}
+	return decision != approvalDeny
+}
+
+func (c *SessionController) clearSessionApprovals() {
+	c.confirmMu.Lock()
+	c.sessionApprovals = make(map[string]string)
+	c.confirmMu.Unlock()
 }
 
 func (c *SessionController) RequestStop() {
@@ -208,6 +231,7 @@ func (c *SessionController) beginRun() bool {
 			SubAgentMaxSteps: c.cfg.SubAgentMaxSteps,
 			MultiTurn:        c.cfg.MultiTurn,
 			PlanMode:         c.cfg.PlanMode,
+			CompetitionMode:  c.cfg.CompetitionMode,
 			ConfirmFn:        c.confirmFn,
 			AwaitUserFn:      c.awaitUserFn,
 			SudoAuthFn:       c.sudoAuthFn,
@@ -306,6 +330,7 @@ func (c *SessionController) StartNewSession(goal string) (string, bool, error) {
 	c.stopped = false
 	c.stopCh = make(chan struct{})
 	c.mu.Unlock()
+	c.clearSessionApprovals()
 
 	if goal == "" {
 		return agent.SessionID, false, nil
@@ -358,6 +383,7 @@ func (c *SessionController) ResumeSession(sessionID, supplement string) (int, er
 	c.stopped = false
 	c.stopCh = make(chan struct{})
 	c.mu.Unlock()
+	c.clearSessionApprovals()
 
 	return cp.StepNum, nil
 }

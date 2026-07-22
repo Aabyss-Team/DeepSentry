@@ -2,188 +2,223 @@ package builtin
 
 import (
 	"ai-edr/internal/config"
-	"context"
 	"fmt"
 	"net"
 	"net/http"
 	"regexp"
-	"sort"
+	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
-
-var defaultFlagPattern = regexp.MustCompile(`(?i)(flag|ctf|awd)\{[^}\s]{4,120}\}|[a-f0-9]{32}`)
-
-const (
-	maxFlagScanRead    = 2 << 20
-	maxFlagScanVisited = 3000
-	maxAWDCheckTargets = 100
-)
-
-type flagScanState struct {
-	hits      []string
-	visited   int
-	truncated bool
-}
 
 func FlagScan(rt Runtime, root, pattern string, limit int) (string, error) {
+	if rt.Exec == nil {
+		return "", fmt.Errorf("执行器未初始化")
+	}
 	if strings.TrimSpace(root) == "" {
 		root = "."
+	}
+	if strings.TrimSpace(pattern) == "" {
+		pattern = `flag\{[^}]{1,200}\}|ctf\{[^}]{1,200}\}|key\{[^}]{1,200}\}`
+	}
+	if _, err := regexp.Compile(pattern); err != nil {
+		return "", fmt.Errorf("pattern 正则无效: %w", err)
 	}
 	if limit <= 0 {
 		limit = 80
 	}
-	if limit > 500 {
-		limit = 500
+	cmd := fmt.Sprintf("find %s -type f -size -2M -print0 2>/dev/null | xargs -0 grep -HnE -m 3 %s 2>/dev/null | head -n %d", shellQuote(root), shellQuote(pattern), limit)
+	out, err := rt.Exec.Run(cmd)
+	if err != nil && strings.TrimSpace(out) == "" {
+		return "", err
 	}
-	re := defaultFlagPattern
-	if strings.TrimSpace(pattern) != "" {
-		compiled, err := regexp.Compile(pattern)
-		if err != nil {
-			return "", fmt.Errorf("pattern 非法: %w", err)
-		}
-		re = compiled
+	if strings.TrimSpace(out) == "" {
+		out = "未发现匹配的 flag 线索"
 	}
-
-	state := &flagScanState{}
-	scanPath(root, re, limit, 0, state)
-	var b strings.Builder
-	b.WriteString(fmt.Sprintf("%s CTF/AWD Flag Scan\nRoot: %s\nLimit: %d\n\n", rt.tag(), root, limit))
-	if len(state.hits) == 0 {
-		b.WriteString("(未发现匹配项)\n")
-		if state.truncated {
-			b.WriteString("\n...(扫描已达到资源上限，结果可能不完整)...\n")
-		}
-		return b.String(), nil
-	}
-	for _, h := range state.hits {
-		b.WriteString("- " + h + "\n")
-	}
-	if state.truncated {
-		b.WriteString("\n...(扫描已达到资源上限，结果可能不完整)...\n")
-	}
-	return b.String(), nil
+	return fmt.Sprintf("【Flag 只读扫描】root=%s limit=%d\n%s", root, limit, out), nil
 }
 
-func scanPath(path string, re *regexp.Regexp, limit, depth int, state *flagScanState) {
-	if len(state.hits) >= limit || depth > 4 || state.visited >= maxFlagScanVisited {
-		if state.visited >= maxFlagScanVisited {
-			state.truncated = true
-		}
-		return
-	}
-	state.visited++
-	data, err := readTargetLimited(path, maxFlagScanRead)
-	if err == nil && looksText(data) {
-		for _, m := range re.FindAllString(string(data), 20) {
-			state.hits = append(state.hits, fmt.Sprintf("%s: %s", path, truncateOneLine(m, 180)))
-			if len(state.hits) >= limit {
-				return
-			}
-		}
-		return
-	}
-	entries, err := listTarget(path)
-	if err != nil {
-		return
-	}
-	sort.Strings(entries)
-	for _, name := range entries {
-		if len(state.hits) >= limit || state.visited >= maxFlagScanVisited {
-			if state.visited >= maxFlagScanVisited {
-				state.truncated = true
-			}
-			return
-		}
-		if shouldSkipFlagScanName(name) {
-			continue
-		}
-		scanPath(joinTargetPath(path, name), re, limit, depth+1, state)
-	}
-}
-
-func shouldSkipFlagScanName(name string) bool {
-	lower := strings.ToLower(strings.Trim(strings.TrimSpace(name), "/"))
-	skips := map[string]bool{
-		"proc":         true,
-		"sys":          true,
-		"dev":          true,
-		".git":         true,
-		".svn":         true,
-		"node_modules": true,
-		"__pycache__":  true,
-		"vendor":       true,
-		".ds_store":    true,
-	}
-	return skips[lower]
-}
-
-func joinTargetPath(base, name string) string {
-	base = strings.TrimRight(base, "/")
-	if base == "" || base == "." {
-		return name
-	}
-	return base + "/" + name
-}
-
-func AWDServiceCheck(rt Runtime, targets string, timeoutSec int) (string, error) {
-	items := splitTargets(targets)
-	if len(items) == 0 {
-		return "", fmt.Errorf("targets 不能为空，支持逗号分隔 URL 或 host:port")
+func AWDServiceCheck(_ Runtime, targets string, timeoutSec int) (string, error) {
+	targetList := strings.FieldsFunc(targets, func(r rune) bool { return r == ',' || r == '\n' || r == ';' })
+	if len(targetList) == 0 {
+		return "", fmt.Errorf("targets 不能为空")
 	}
 	if timeoutSec <= 0 {
 		timeoutSec = 3
 	}
-	if timeoutSec > 15 {
-		timeoutSec = 15
-	}
-	truncated := false
-	if len(items) > maxAWDCheckTargets {
-		items = items[:maxAWDCheckTargets]
-		truncated = true
-	}
+	timeout := time.Duration(timeoutSec) * time.Second
+	client := config.HTTPClient(timeout)
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("%s AWD Service Check\nTimeout: %ds\n\n", rt.tag(), timeoutSec))
-	for _, item := range items {
-		status := checkService(item, time.Duration(timeoutSec)*time.Second)
-		b.WriteString(fmt.Sprintf("- %s  %s\n", item, status))
+	b.WriteString("【AWD 服务可用性】\n")
+	up := 0
+	for _, raw := range targetList {
+		target := strings.TrimSpace(raw)
+		if target == "" {
+			continue
+		}
+		started := time.Now()
+		if strings.HasPrefix(target, "http://") || strings.HasPrefix(target, "https://") {
+			request, _ := http.NewRequest(http.MethodGet, target, nil)
+			response, err := client.Do(request)
+			if err != nil {
+				fmt.Fprintf(&b, "- %s DOWN error=%v latency=%s\n", target, err, time.Since(started).Round(time.Millisecond))
+				continue
+			}
+			_ = response.Body.Close()
+			up++
+			fmt.Fprintf(&b, "- %s HTTP %d latency=%s\n", target, response.StatusCode, time.Since(started).Round(time.Millisecond))
+			continue
+		}
+		host, port, err := net.SplitHostPort(target)
+		if err != nil || strings.TrimSpace(host) == "" {
+			fmt.Fprintf(&b, "- %s INVALID（请使用 URL 或 host:port）\n", target)
+			continue
+		}
+		if parsedPort, parseErr := strconv.Atoi(port); parseErr != nil || parsedPort < 1 || parsedPort > 65535 {
+			fmt.Fprintf(&b, "- %s INVALID port\n", target)
+			continue
+		}
+		conn, err := config.ControllerDialTimeout("tcp", net.JoinHostPort(host, port), timeout)
+		if err != nil {
+			fmt.Fprintf(&b, "- %s DOWN error=%v latency=%s\n", target, err, time.Since(started).Round(time.Millisecond))
+			continue
+		}
+		_ = conn.Close()
+		up++
+		fmt.Fprintf(&b, "- %s TCP OPEN latency=%s\n", target, time.Since(started).Round(time.Millisecond))
 	}
-	if truncated {
-		b.WriteString(fmt.Sprintf("\n...(targets 超过 %d，仅检查前 %d 个)...\n", maxAWDCheckTargets, maxAWDCheckTargets))
-	}
-	return b.String(), nil
+	fmt.Fprintf(&b, "汇总: UP=%d TOTAL=%d", up, len(targetList))
+	return strings.TrimSpace(b.String()), nil
 }
 
-func splitTargets(raw string) []string {
-	var out []string
-	for _, part := range strings.FieldsFunc(raw, func(r rune) bool { return r == ',' || r == '\n' || r == ';' }) {
-		part = strings.TrimSpace(part)
-		if part != "" {
-			out = append(out, part)
-		}
+// CompetitionAnswerCheck is a deterministic pre-submit rubric check. It does
+// not certify technical truth; it makes missing evidence, verification, and
+// correction sections visible before the operator emails the answer.
+func CompetitionAnswerCheck(task, answer string) (string, error) {
+	task = strings.TrimSpace(task)
+	answer = strings.TrimSpace(answer)
+	if answer == "" {
+		return "", fmt.Errorf("answer 不能为空")
 	}
-	return out
+	sections := []struct {
+		name    string
+		aliases []string
+	}{
+		{"任务状态", []string{"任务状态"}},
+		{"结论", []string{"结论"}},
+		{"关键证据", []string{"关键证据", "证据"}},
+		{"处置/答案", []string{"处置", "答案"}},
+		{"复验", []string{"复验", "验证"}},
+		{"AI复核与纠错", []string{"ai复核", "ai 复核", "纠错"}},
+		{"风险与回滚", []string{"风险", "回滚"}},
+	}
+	lower := strings.ToLower(answer)
+	present := make([]string, 0, len(sections))
+	missing := make([]string, 0, len(sections))
+	lastIndex := -1
+	orderOK := true
+	for _, section := range sections {
+		index := -1
+		for _, alias := range section.aliases {
+			if candidate := strings.Index(lower, strings.ToLower(alias)); candidate >= 0 && (index < 0 || candidate < index) {
+				index = candidate
+			}
+		}
+		if index < 0 {
+			missing = append(missing, section.name)
+			continue
+		}
+		present = append(present, section.name)
+		if index < lastIndex {
+			orderOK = false
+		}
+		lastIndex = index
+	}
+
+	evidenceSignals := countEvidenceSignals(answer)
+	verificationPresent := containsAny(lower, "复验", "验证", "恢复正常", "状态正常")
+	correctionPresent := containsAny(lower, "纠错", "已否定", "未采纳", "尚未验证", "证据不足")
+	rollbackPresent := containsAny(lower, "回滚", "撤销", "恢复原配置", "无变更")
+
+	completeness := 40 * len(present) / len(sections)
+	accuracy := 0
+	if evidenceSignals >= 3 {
+		accuracy += 15
+	} else {
+		accuracy += evidenceSignals * 5
+	}
+	if verificationPresent {
+		accuracy += 8
+	}
+	if correctionPresent {
+		accuracy += 7
+	}
+	efficiency := 20
+	runes := utf8.RuneCountInString(answer)
+	if runes < 120 {
+		efficiency -= 8
+	}
+	if runes > 5000 {
+		efficiency -= 8
+	}
+	format := 0
+	if len(missing) == 0 {
+		format += 7
+	} else {
+		format += 7 * len(present) / len(sections)
+	}
+	if orderOK {
+		format += 3
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "【比赛答案提交前自检】估算=%d/100（仅检查结构与证据信号，不代替技术事实复核）\n", completeness+accuracy+efficiency+format)
+	fmt.Fprintf(&b, "- 任务完成度: %d/40；已有=%s；缺失=%s\n", completeness, valueOrCompetition(strings.Join(present, ", "), "无"), valueOrCompetition(strings.Join(missing, ", "), "无"))
+	fmt.Fprintf(&b, "- 技术准确性: %d/30；证据信号=%d，复验=%t，AI纠错=%t\n", accuracy, evidenceSignals, verificationPresent, correctionPresent)
+	fmt.Fprintf(&b, "- AI应用效率: %d/20；答案长度=%d字\n", efficiency, runes)
+	fmt.Fprintf(&b, "- 输出规范: %d/10；顺序正确=%t，风险/回滚=%t\n", format, orderOK, rollbackPresent)
+	if task != "" {
+		fmt.Fprintf(&b, "- 题干复核: 请逐项勾选原题要求，工具不会将文字相似度当作任务已完成。题干摘要=%s\n", truncate(task, 240))
+	}
+	if evidenceSignals < 3 {
+		b.WriteString("- 必修: 至少补齐 3 条“命令/工具 -> 关键输出/数值 -> 结论”证据。\n")
+	}
+	if !correctionPresent {
+		b.WriteString("- 加分机会: 写明被证据否定的 AI 初始假设；如无纠错，如实写“未发现可证实的 AI 错误”。\n")
+	}
+	return strings.TrimSpace(b.String()), nil
 }
 
-func checkService(target string, timeout time.Duration) string {
-	if strings.HasPrefix(target, "http://") || strings.HasPrefix(target, "https://") {
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		defer cancel()
-		req, err := http.NewRequestWithContext(ctx, "GET", target, nil)
-		if err != nil {
-			return "ERR " + err.Error()
+func countEvidenceSignals(answer string) int {
+	count := 0
+	for _, line := range strings.Split(answer, "\n") {
+		lower := strings.ToLower(strings.TrimSpace(line))
+		if lower == "" {
+			continue
 		}
-		resp, err := config.HTTPClient(timeout).Do(req)
-		if err != nil {
-			return "DOWN " + err.Error()
+		if containsAny(lower, "display ", "show ", "journalctl", "systemctl", "ip ", "ss ", "ping ", "工具", "输出", "日志", "%", "ms", "bps", "packets") {
+			count++
 		}
-		defer resp.Body.Close()
-		return fmt.Sprintf("HTTP %s", resp.Status)
 	}
-	conn, err := net.DialTimeout("tcp", target, timeout)
-	if err != nil {
-		return "DOWN " + err.Error()
+	if count > 6 {
+		return 6
 	}
-	_ = conn.Close()
-	return "TCP OPEN"
+	return count
+}
+
+func containsAny(text string, needles ...string) bool {
+	for _, needle := range needles {
+		if strings.Contains(text, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func valueOrCompetition(value, fallback string) string {
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	return value
 }

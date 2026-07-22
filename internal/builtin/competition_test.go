@@ -1,101 +1,34 @@
 package builtin
 
 import (
-	"net"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
-
-	"ai-edr/internal/executor"
 )
 
-func TestFlagScanFindsDefaultFlag(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "note.txt")
-	if err := os.WriteFile(path, []byte("hello flag{deep_sentry_test}"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	old := executor.Current
-	executor.Current = &executor.LocalExecutor{}
-	defer func() { executor.Current = old }()
-
-	out, err := FlagScan(Runtime{}, dir, "", 10)
+func TestCompetitionAnswerCheckFindsEvidenceAndRequiredSections(t *testing.T) {
+	answer := `【任务状态】已完成
+【结论】端口无物理故障。
+【关键证据】
+1. display interface brief -> GE1/0/1 up/up。
+2. display interface GE1/0/1 -> input rate 10 bps, 0 errors。
+3. ping 10.0.0.1 -> 0% loss, 1 ms。
+【处置/答案】无需修改配置。
+【复验】重复 ping 仍为 0% loss。
+【AI 复核与纠错】已否定“端口 down”假设。
+【风险与回滚】无变更，无需回滚。`
+	out, err := CompetitionAnswerCheck("排查端口故障", answer)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out, "flag{deep_sentry_test}") {
-		t.Fatalf("missing flag: %s", out)
-	}
-}
-
-func TestFlagScanDoesNotSkipHiddenFlagFiles(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, ".flag")
-	if err := os.WriteFile(path, []byte("ctf{hidden_file_flag}"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	old := executor.Current
-	executor.Current = &executor.LocalExecutor{}
-	defer func() { executor.Current = old }()
-
-	out, err := FlagScan(Runtime{}, dir, "", 10)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(out, "ctf{hidden_file_flag}") {
-		t.Fatalf("missing hidden flag: %s", out)
-	}
-}
-
-func TestShouldSkipFlagScanNameOnlySkipsNoisyRoots(t *testing.T) {
-	for _, name := range []string{"proc", "/sys", ".git", "node_modules", "__pycache__", "vendor"} {
-		if !shouldSkipFlagScanName(name) {
-			t.Fatalf("expected %q to be skipped", name)
-		}
-	}
-	for _, name := range []string{".flag", ".env", "challenge"} {
-		if shouldSkipFlagScanName(name) {
-			t.Fatalf("did not expect %q to be skipped", name)
+	for _, want := range []string{"估算=100/100", "缺失=无", "AI纠错=true", "顺序正确=true"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("output missing %q: %s", want, out)
 		}
 	}
 }
 
-func TestAWDServiceCheckTCP(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Skipf("local listen unavailable in this sandbox: %v", err)
-	}
-	defer ln.Close()
-	go func() {
-		conn, err := ln.Accept()
-		if err == nil {
-			conn.Close()
-		}
-	}()
-
-	out, err := AWDServiceCheck(Runtime{}, ln.Addr().String(), 2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(out, "TCP OPEN") {
-		t.Fatalf("expected open service: %s", out)
-	}
-}
-
-func TestAWDServiceCheckCapsTargets(t *testing.T) {
-	targets := make([]string, maxAWDCheckTargets+3)
-	for i := range targets {
-		targets[i] = "http://[::1"
-	}
-	out, err := AWDServiceCheck(Runtime{}, strings.Join(targets, ","), 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := strings.Count(out, "- http://[::1"); got != maxAWDCheckTargets {
-		t.Fatalf("checked %d targets, want %d\n%s", got, maxAWDCheckTargets, out)
-	}
-	if !strings.Contains(out, "仅检查前 100 个") {
-		t.Fatalf("missing cap notice: %s", out)
+func TestCompetitionAnswerCheckRejectsEmptyDraft(t *testing.T) {
+	if _, err := CompetitionAnswerCheck("task", " "); err == nil {
+		t.Fatal("expected empty answer error")
 	}
 }

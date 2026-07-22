@@ -324,7 +324,9 @@ func openPrivateArchiveDest(dest string) (*os.File, error) {
 	if err := os.MkdirAll(filepath.Dir(dest), 0o700); err != nil {
 		return nil, err
 	}
-	_ = os.Chmod(filepath.Dir(dest), 0o700)
+	if err := os.Chmod(filepath.Dir(dest), 0o700); err != nil {
+		return nil, err
+	}
 	out, err := os.OpenFile(dest, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
 		return nil, err

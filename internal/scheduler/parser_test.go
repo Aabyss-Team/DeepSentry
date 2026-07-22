@@ -136,7 +136,7 @@ func TestPlanTaskRejectsPastExplicitDateAndInvalidCalendarDate(t *testing.T) {
 	loc := time.FixedZone("test", 8*3600)
 	now := time.Date(2026, 7, 17, 15, 0, 0, 0, loc)
 	for _, input := range []string{"今天9点帮我巡检服务器", "2026-02-30 09:00 帮我检查服务器"} {
-		if _, err := PlanTask(PlanInput{Text: input, Timezone: "Local"}, now); err == nil {
+		if _, err := PlanTask(PlanInput{Text: input, Timezone: "Asia/Shanghai"}, now); err == nil {
 			t.Errorf("expected invalid schedule to fail: %q", input)
 		}
 	}

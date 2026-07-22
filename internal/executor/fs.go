@@ -20,7 +20,7 @@ type DirEntry struct {
 	ModTime time.Time
 }
 
-// WriteTargetFile 写入目标文件（本地或远程 SFTP）
+// WriteTargetFile 写入目标文件（本地、远程 SFTP 或 FTP STOR）
 func WriteTargetFile(path string, content []byte) error {
 	if Current == nil {
 		return fmt.Errorf("执行器未初始化")
@@ -40,13 +40,39 @@ func WriteFileWithExecutor(ex Executor, path string, content []byte) error {
 	if se, ok := ex.(*SSHExecutor); ok && ex.IsRemote() {
 		return se.writeTargetFile(path, content)
 	}
+	if fe, ok := ex.(*FTPExecutor); ok && ex.IsRemote() {
+		return fe.writeTargetFile(path, content)
+	}
 	if _, ok := ex.(*LocalExecutor); !ok && ex.IsRemote() {
 		return fmt.Errorf("%s 模式暂不支持写入目标文件", CurrentModeOf(ex))
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	return os.WriteFile(path, content, 0644)
+	return writeLocalFileSecureDefault(path, content)
+}
+
+func writeLocalFileSecureDefault(path string, content []byte) error {
+	// New Agent-created files are private, while an existing file keeps its
+	// operator-selected mode. Silently chmodding an existing web/config file can
+	// break a service that intentionally reads it through another account.
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	if err := f.Truncate(0); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if _, err := f.Write(content); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 func (s *SSHExecutor) writeTargetFile(path string, content []byte) error {
@@ -390,8 +416,8 @@ func ReadLocalFile(path string) ([]byte, error) {
 
 // WriteLocalFile 写入控制端本地文件
 func WriteLocalFile(path string, content []byte) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	return os.WriteFile(path, content, 0644)
+	return writeLocalFileSecureDefault(path, content)
 }

@@ -150,7 +150,7 @@ func robotLogoLines() []string {
 
 func brandTitleLine(version string) string {
 	title := styleBannerBrand.Render("DeepSentry")
-	badge := styleBannerBadge.Render(sanitizeTUIText(firstNonEmpty(version, "2.0.1")))
+	badge := styleBannerBadge.Render(sanitizeTUIText(firstNonEmpty(version, ui.Version)))
 	return title + " " + badge
 }
 

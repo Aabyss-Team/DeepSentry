@@ -200,6 +200,9 @@ func NewEphemeralExecutor(target config.TargetConfig) (Executor, error) {
 		cfg.SSHUser = firstNonEmpty(target.User, cfg.SSHUser, "root")
 		cfg.SSHPassword = target.Password
 		cfg.SSHKeyPath = target.KeyPath
+		cfg.SSHPrompt = target.Prompt
+		cfg.SSHDeviceType = target.DeviceType
+		cfg.SSHEnablePassword = target.EnablePassword
 		return newSSHExecutor(cfg)
 	case "telnet":
 		cfg.TargetProtocol = "telnet"
@@ -207,12 +210,21 @@ func NewEphemeralExecutor(target config.TargetConfig) (Executor, error) {
 		cfg.TelnetUser = firstNonEmpty(target.User, cfg.TelnetUser, "root")
 		cfg.TelnetPassword = target.Password
 		cfg.TelnetPrompt = target.Prompt
+		cfg.TelnetAuthPromptRegex = target.AuthPromptRegex
+		cfg.TelnetDeviceType = target.DeviceType
+		cfg.TelnetEnablePassword = target.EnablePassword
 		return newTelnetExecutor(cfg)
 	case "ftp":
 		cfg.TargetProtocol = "ftp"
 		cfg.FTPHost = target.Host
 		cfg.FTPUser = firstNonEmpty(target.User, cfg.FTPUser, "anonymous")
 		cfg.FTPPassword = target.Password
+		cfg.FTPTLSMode = target.FTPTLSMode
+		cfg.FTPTLSServerName = target.FTPTLSServerName
+		cfg.FTPTLSCAFile = target.FTPTLSCAFile
+		cfg.FTPTLSInsecureSkipVerify = target.FTPTLSInsecureSkipVerify
+		cfg.FTPDataMode = target.FTPDataMode
+		cfg.FTPActiveAddress = target.FTPActiveAddress
 		return newFTPExecutor(cfg)
 	default:
 		return nil, fmt.Errorf("目标 %s 协议不支持: %s", target.Name, target.Protocol)

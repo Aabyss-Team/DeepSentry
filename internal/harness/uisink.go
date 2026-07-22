@@ -227,6 +227,17 @@ func (s *WebShellSink) Emit(e UIEvent) {
 	case EventInfo, EventThinking, EventStreamDelta, EventStreamEnd, EventRiskAuto, EventBatchAuto, EventTokenUsage:
 		return
 	default:
+		e.Message = ui.StripANSI(e.Message)
+		e.Detail = ui.StripANSI(e.Detail)
+		if e.Action != nil {
+			action := *e.Action
+			action.Command = ui.StripANSI(action.Command)
+			action.TaskPrompt = ui.StripANSI(action.TaskPrompt)
+			action.Content = ui.StripANSI(action.Content)
+			action.FinalReport = ui.StripANSI(action.FinalReport)
+			action.Question = ui.StripANSI(action.Question)
+			e.Action = &action
+		}
 		s.inner.Emit(e)
 	}
 }
@@ -263,6 +274,8 @@ func printActionStdout(action AgentAction) {
 		fmt.Printf("%s删除记忆: %s\n", ui.Prefix("🧠", "[MEM]"), action.MemoryKey)
 	case ActionTool:
 		fmt.Printf("%s工具: %s %v\n", ui.Prefix("🔧", "[TOOL]"), action.ToolName, action.ToolArgs)
+	case ActionToolBatch:
+		fmt.Printf("%s并行工具: %d 项\n", ui.Prefix("🔧", "[TOOL]"), len(action.ToolCalls))
 	case ActionReadFile:
 		fmt.Printf("%s读取: %s\n", ui.Prefix("📄", "[READ]"), action.Path)
 	case ActionWriteFile:
@@ -277,7 +290,7 @@ func printActionStdout(action AgentAction) {
 		fmt.Printf("%s列出: %s\n", ui.Prefix("📁", "[LS]"), action.Path)
 	default:
 		if action.Command != "" {
-			fmt.Printf("%s命令[%s]: %s\n", ui.Prefix("💻", "[CMD]"), stdoutExecutionTargetLabel(action), ui.StripANSIIfPlain("\033[36m"+action.Command+"\033[0m"))
+			fmt.Printf("%s命令[%s]: %s\n", ui.Prefix("💻", "[CMD]"), stdoutExecutionTargetLabel(action), ui.TerminalText(action.Command))
 		}
 	}
 }

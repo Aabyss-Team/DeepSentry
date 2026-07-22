@@ -44,9 +44,17 @@ type logLine struct {
 type confirmState struct {
 	action       *harness.AgentAction
 	prompt       string
-	respCh       chan bool
+	respCh       chan approvalDecision
 	restoreInput bool
 }
+
+type approvalDecision uint8
+
+const (
+	approvalDeny approvalDecision = iota
+	approvalAllowOnce
+	approvalAllowSession
+)
 
 type askState struct {
 	action  *harness.AgentAction
@@ -168,6 +176,7 @@ type AgentModel struct {
 	slashSelected  int
 	cursorAnchor   *inputCursorAnchorState
 	footerVersion  uint64
+	frameVersion   uint64
 
 	pendingConfirm *confirmState
 	pendingAsk     *askState
@@ -545,9 +554,25 @@ func (m AgentModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				ch := m.pendingConfirm.respCh
 				restoreInput := m.pendingConfirm.restoreInput
 				m.pendingConfirm = nil
-				m.resolveLastConfirm(true)
+				m.resolveLastConfirm(approvalAllowOnce)
 				if ch != nil {
-					ch <- true
+					ch <- approvalAllowOnce
+				}
+				if restoreInput {
+					m.input.Focus()
+				}
+				m.recalcLayout()
+				m.refreshViewport()
+				if restoreInput {
+					m.scheduleInputCursorAnchor()
+				}
+			case key == "a" || key == "A":
+				ch := m.pendingConfirm.respCh
+				restoreInput := m.pendingConfirm.restoreInput
+				m.pendingConfirm = nil
+				m.resolveLastConfirm(approvalAllowSession)
+				if ch != nil {
+					ch <- approvalAllowSession
 				}
 				if restoreInput {
 					m.input.Focus()
@@ -561,9 +586,9 @@ func (m AgentModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				ch := m.pendingConfirm.respCh
 				restoreInput := m.pendingConfirm.restoreInput
 				m.pendingConfirm = nil
-				m.resolveLastConfirm(false)
+				m.resolveLastConfirm(approvalDeny)
 				if ch != nil {
-					ch <- false
+					ch <- approvalDeny
 				}
 				if restoreInput {
 					m.input.Focus()
@@ -575,7 +600,7 @@ func (m AgentModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			case key == "ctrl+c":
 				if ch := m.pendingConfirm.respCh; ch != nil {
-					ch <- false
+					ch <- approvalDeny
 				}
 				m.pendingConfirm = nil
 				if m.ctrl != nil {
@@ -2329,7 +2354,7 @@ func (m *AgentModel) moveInputCursorLine(delta int) bool {
 	points := make([]cursorPoint, len(runes)+1)
 	row, col := 0, 0
 	if prefix := m.draftDisplayPrefix(); prefix != "" {
-		for _, r := range []rune(prefix) {
+		for _, r := range prefix {
 			if r == '\n' || r == '\r' {
 				row++
 				col = 0
@@ -2616,7 +2641,7 @@ func (m *AgentModel) applyEvent(e harness.UIEvent) {
 	case harness.EventStreamEnd:
 		m.finalizeStream(e.Detail)
 	case harness.EventThought:
-		m.appendLine("thought", e.Message, e.Message)
+		m.appendThoughtLine(e.Message)
 	case harness.EventTokenUsage:
 		m.recordTokenUsage(e)
 	case harness.EventAction:
@@ -2914,6 +2939,24 @@ func (m *AgentModel) appendLine(kind, display, raw string) {
 	m.trimLogLines()
 }
 
+// appendThoughtLine suppresses provider/runtime duplicate thought events. Some
+// streaming-compatible APIs repeat the final thought once as a completed
+// message; rendering both copies looks like a broken terminal even though the
+// underlying event stream is the source of the duplication.
+func (m *AgentModel) appendThoughtLine(message string) {
+	message = strings.TrimSpace(sanitizeTUIText(message))
+	if message == "" {
+		return
+	}
+	if len(m.lines) > 0 {
+		last := m.lines[len(m.lines)-1]
+		if last.kind == "thought" && last.step == m.currentStep && strings.TrimSpace(last.raw) == message {
+			return
+		}
+	}
+	m.appendLine("thought", message, message)
+}
+
 func (m *AgentModel) restoreConversationHistory(history []analyzer.Message) {
 	if len(history) == 0 {
 		return
@@ -3094,7 +3137,10 @@ func (m *AgentModel) appendAskLine(prompt string, options []string) {
 	if prompt == "" {
 		return
 	}
-	rendered := renderAskPrompt(prompt, options)
+	// Keep raw intact for the Agent/checkpoint, but avoid showing an identical
+	// adjacent paragraph twice when a model repeats the question while forming
+	// an ask action.
+	rendered := renderAskPrompt(dedupeAdjacentDisplayLines(prompt), options)
 	now := time.Now()
 	for i := len(m.lines) - 1; i >= 0; i-- {
 		line := m.lines[i]
@@ -3118,6 +3164,25 @@ func (m *AgentModel) appendAskLine(prompt string, options []string) {
 	m.appendLine("ask", rendered, prompt)
 }
 
+func dedupeAdjacentDisplayLines(text string) string {
+	lines := strings.Split(normalizeInputNewlines(text), "\n")
+	out := make([]string, 0, len(lines))
+	lastNonEmpty := ""
+	for _, line := range lines {
+		normalized := strings.Join(strings.Fields(line), " ")
+		if normalized != "" && normalized == lastNonEmpty {
+			continue
+		}
+		out = append(out, line)
+		if normalized == "" {
+			lastNonEmpty = ""
+		} else {
+			lastNonEmpty = normalized
+		}
+	}
+	return strings.TrimSpace(strings.Join(out, "\n"))
+}
+
 func (m *AgentModel) appendConfirmLine(prompt string) {
 	prompt = strings.TrimSpace(sanitizeTUIText(prompt))
 	if prompt == "" {
@@ -3132,15 +3197,18 @@ func (m *AgentModel) appendConfirmLine(prompt string) {
 	m.appendLine("confirm", prompt, prompt)
 }
 
-func (m *AgentModel) resolveLastConfirm(approved bool) {
+func (m *AgentModel) resolveLastConfirm(decision approvalDecision) {
 	for i := len(m.lines) - 1; i >= 0; i-- {
 		if m.lines[i].kind != "confirm" {
 			continue
 		}
 		m.lines[i].kind = "confirm_result"
 		m.lines[i].content = "✗ 已拒绝高风险操作"
-		if approved {
-			m.lines[i].content = "✓ 已批准高风险操作"
+		switch decision {
+		case approvalAllowOnce:
+			m.lines[i].content = "✓ 已批准本次操作"
+		case approvalAllowSession:
+			m.lines[i].content = "✓ 已允许本会话同类操作"
 		}
 		return
 	}
@@ -3169,6 +3237,13 @@ func renderAskPrompt(prompt string, options []string) string {
 }
 
 func (m *AgentModel) refreshViewport() {
+	// Bubble Tea normally repaints only rows whose strings changed. Complex
+	// wide glyphs, styled borders and fast viewport/footer movement can leave a
+	// terminal's physical rows out of sync with that cache. A private marker on
+	// every row makes the next content refresh an atomic full-frame repaint;
+	// inputCursorOutput strips the marker before stdout, so it cannot affect
+	// width calculations or the macOS IME cursor anchor.
+	m.frameVersion++
 	shouldStick := m.autoScroll || m.viewport.AtBottom()
 	var b strings.Builder
 	contentW := max(4, m.viewport.Width)
@@ -3479,7 +3554,7 @@ func (m AgentModel) View() string {
 	if m.copyToast != "" {
 		help = m.copyToast
 	} else if m.pendingConfirm != nil {
-		help = "Y 批准 · N/Esc 拒绝 · Enter 不会批准高风险操作"
+		help = "Y 仅本次 · A 本会话同类允许 · N/Esc 拒绝 · Enter 不批准"
 	} else if m.pendingAsk != nil {
 		help = "输入补充内容或选项编号 · Enter 继续 · Shift+Enter 换行"
 	} else {
@@ -3551,6 +3626,10 @@ func (m AgentModel) View() string {
 
 func (m *AgentModel) invalidateFooter() {
 	m.footerVersion++
+	// Scrolling moves viewport rows while leaving much of the footer text
+	// unchanged. Invalidate the whole physical frame so wide glyphs and panel
+	// borders cannot leave stale cells behind.
+	m.frameVersion++
 }
 
 func tagRenderedLines(block, marker string) string {
@@ -3565,6 +3644,7 @@ func tagRenderedLines(block, marker string) string {
 }
 
 func (m AgentModel) withCursorFrameMarker(view string) string {
+	view = tagRenderedLines(view, encodeFooterFrameMarker(m.frameVersion))
 	row, col, mode := 0, 0, cursorAnchorPassthrough
 	if m.cursorAnchor != nil {
 		row, col, mode = m.cursorAnchor.snapshot()
@@ -3629,6 +3709,9 @@ func (m AgentModel) frameLayout() agentFrameLayout {
 }
 
 func (m *AgentModel) recalcLayout() {
+	// Input wrapping, suggestion menus and terminal resize all move fixed
+	// regions vertically. Force the next renderer diff to repaint those rows.
+	m.frameVersion++
 	w := m.width
 	if w <= 0 {
 		w = 80
@@ -3709,7 +3792,7 @@ func (m AgentModel) renderInputLine() string {
 	case m.running && !m.awaitGoal:
 		hint := "Agent 执行中..."
 		if m.pendingConfirm != nil {
-			hint = "等待确认 · Y 批准 / N 拒绝"
+			hint = "等待确认 · Y 仅本次 / A 本会话 / N 拒绝"
 		} else if m.pendingAsk != nil {
 			hint = "等待补充信息 · Tab 输入"
 		}
@@ -3792,14 +3875,6 @@ func (m AgentModel) renderSlashSuggestions() string {
 func (m AgentModel) renderFocusedInputContent(width int) string {
 	rows, _, _ := m.focusedInputRows(width)
 	return strings.Join(rows, "\n")
-}
-
-func (m AgentModel) inputContentRowCount(width int) int {
-	if !m.inputFocused() {
-		return 1
-	}
-	rows, _, _ := m.focusedInputRows(width)
-	return max(1, len(rows))
 }
 
 func (m AgentModel) maxInputContentRows() int {
@@ -4000,8 +4075,8 @@ func NewModel(title, status string, maxSteps int) AgentModel {
 	return NewAgentModel(nil, title, status, maxSteps, false, false, StartupInfo{})
 }
 
-func WaitConfirm(program *tea.Program, action *harness.AgentAction, prompt string) bool {
-	ch := make(chan bool, 1)
+func WaitConfirm(program *tea.Program, action *harness.AgentAction, prompt string) approvalDecision {
+	ch := make(chan approvalDecision, 1)
 	program.Send(confirmMsg{action: action, prompt: prompt, respCh: ch})
 	return <-ch
 }

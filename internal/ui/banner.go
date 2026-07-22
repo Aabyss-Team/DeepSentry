@@ -6,7 +6,7 @@ import (
 
 // 可通过 -ldflags "-X ai-edr/internal/ui.Version=... -X ai-edr/internal/ui.BuildTime=..." 注入
 var (
-	Version   = "2.0.1"
+	Version   = "2.0.2"
 	BuildTime = "dev"
 )
 

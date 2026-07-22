@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"net/url"
 	"regexp"
 	"strings"
@@ -12,6 +13,18 @@ import (
 // it can reach an executor. Zero-valued tuning fields retain their documented
 // auto/default semantics.
 func ValidateRuntimeConfig(cfg Config) error {
+	runtimeMode := cfg.EffectiveAgentRuntime()
+	if runtimeMode != "legacy" && runtimeMode != "v3" {
+		return fmt.Errorf("agent_runtime=%q 无效；可选 legacy|v3", cfg.AgentRuntime)
+	}
+	switch strings.ToLower(strings.TrimSpace(cfg.TerminalTheme)) {
+	case "", "auto", "dark", "light":
+	default:
+		return fmt.Errorf("terminal_theme=%q 无效；可选 auto|dark|light", cfg.TerminalTheme)
+	}
+	if strings.TrimSpace(cfg.TraceDir) == "." || strings.TrimSpace(cfg.TraceDir) == "/" {
+		return fmt.Errorf("trace_dir 不能是当前目录或根目录")
+	}
 	provider := strings.ToLower(strings.TrimSpace(cfg.Provider))
 	if provider == "" {
 		return fmt.Errorf("provider 不能为空")
@@ -29,6 +42,9 @@ func ValidateRuntimeConfig(cfg Config) error {
 	}
 	if strings.TrimSpace(cfg.ModelName) == "" {
 		return fmt.Errorf("model_name 不能为空")
+	}
+	if cfg.Temperature < 0 || cfg.Temperature > 2 {
+		return fmt.Errorf("temperature 必须在 0~2 之间")
 	}
 	if err := validateHTTPURL("api_url", cfg.ApiURL); err != nil {
 		return err
@@ -55,8 +71,58 @@ func ValidateRuntimeConfig(cfg Config) error {
 	if cfg.LLMTimeoutSec < 0 || cfg.LLMRetries < 0 || cfg.SSHCommandTimeoutSec < 0 || cfg.SSHMaxOutputBytes < 0 || cfg.MaxSteps < 0 || cfg.SubAgentMaxSteps < 0 {
 		return fmt.Errorf("timeout/retries/output/max_steps 配置不能为负数")
 	}
+	deviceType := strings.ToLower(strings.TrimSpace(cfg.TelnetDeviceType))
+	switch deviceType {
+	case "", "auto", "huawei", "h3c", "ruijie", "cisco", "linux", "generic":
+	default:
+		return fmt.Errorf("telnet_device_type=%q 无效；可选 auto|huawei|h3c|ruijie|cisco|linux|generic", cfg.TelnetDeviceType)
+	}
+	sshDeviceType := strings.ToLower(strings.TrimSpace(cfg.SSHDeviceType))
+	switch sshDeviceType {
+	case "", "auto", "huawei", "h3c", "ruijie", "cisco", "linux", "generic":
+	default:
+		return fmt.Errorf("ssh_device_type=%q 无效；可选 auto|huawei|h3c|ruijie|cisco|linux|generic", cfg.SSHDeviceType)
+	}
+	if raw := strings.TrimSpace(cfg.SSHPrompt); strings.HasPrefix(strings.ToLower(raw), "regex:") {
+		if _, err := regexp.Compile(strings.TrimSpace(raw[len("regex:"):])); err != nil {
+			return fmt.Errorf("ssh_prompt 正则无效: %w", err)
+		}
+	}
+	if cfg.TelnetConnectTimeoutSec < 0 || cfg.TelnetLoginTimeoutSec < 0 || cfg.TelnetCommandTimeoutSec < 0 {
+		return fmt.Errorf("telnet 超时配置不能为负数")
+	}
+	if cfg.TelnetConnectTimeoutSec > 300 || cfg.TelnetLoginTimeoutSec > 600 || cfg.TelnetCommandTimeoutSec > 3600 {
+		return fmt.Errorf("telnet 超时配置超过安全上限")
+	}
+	if cfg.FTPConnectTimeoutSec < 0 || cfg.FTPCommandTimeoutSec < 0 || cfg.FTPTransferTimeoutSec < 0 {
+		return fmt.Errorf("ftp 超时配置不能为负数")
+	}
+	if cfg.FTPConnectTimeoutSec > 300 || cfg.FTPCommandTimeoutSec > 600 || cfg.FTPTransferTimeoutSec > 86400 {
+		return fmt.Errorf("ftp 超时配置超过安全上限")
+	}
+	switch strings.ToLower(strings.TrimSpace(cfg.FTPTLSMode)) {
+	case "", "plain", "explicit", "implicit":
+	default:
+		return fmt.Errorf("ftp_tls_mode=%q 无效；可选 plain|explicit|implicit", cfg.FTPTLSMode)
+	}
+	switch strings.ToLower(strings.TrimSpace(cfg.FTPDataMode)) {
+	case "", "passive", "active", "auto":
+	default:
+		return fmt.Errorf("ftp_data_mode=%q 无效；可选 passive|active|auto", cfg.FTPDataMode)
+	}
+	if raw := strings.TrimSpace(cfg.FTPActiveAddress); raw != "" && net.ParseIP(raw) == nil {
+		return fmt.Errorf("ftp_active_address=%q 必须是 IP 地址", cfg.FTPActiveAddress)
+	}
+	if raw := strings.TrimSpace(cfg.TelnetAuthPromptRegex); raw != "" {
+		if _, err := regexp.Compile(raw); err != nil {
+			return fmt.Errorf("telnet_auth_prompt_regex 无效: %w", err)
+		}
+	}
 	if cfg.LLMRetries > 10 {
 		return fmt.Errorf("llm_retries 最大为 10")
+	}
+	if err := validateModelChain(cfg); err != nil {
+		return err
 	}
 	if cfg.MaxSteps > 1_000 || cfg.SubAgentMaxSteps > 200 {
 		return fmt.Errorf("max_steps 最大 1000，subagent_max_steps 最大 200")
@@ -84,14 +150,8 @@ func ValidateRuntimeConfig(cfg Config) error {
 		return fmt.Errorf("archive_max_file_bytes 不能大于 archive_max_total_bytes")
 	}
 	if raw := strings.TrimSpace(cfg.ControllerProxy); raw != "" {
-		u, err := url.Parse(raw)
-		if err != nil || u.Host == "" {
-			return fmt.Errorf("controller_proxy URL 无效")
-		}
-		switch strings.ToLower(u.Scheme) {
-		case "http", "https", "socks5", "socks5h":
-		default:
-			return fmt.Errorf("controller_proxy 仅支持 http|https|socks5|socks5h")
+		if _, err := ParseControllerProxy(raw); err != nil {
+			return fmt.Errorf("controller_proxy 无效: %w", err)
 		}
 	}
 	if tz := strings.TrimSpace(cfg.SchedulerTimezone); tz != "" && !strings.EqualFold(tz, "local") {
@@ -104,6 +164,50 @@ func ValidateRuntimeConfig(cfg Config) error {
 	}
 	if err := validateMCPServers(cfg.MCPServerConfigs); err != nil {
 		return err
+	}
+	return nil
+}
+
+func validateModelChain(cfg Config) error {
+	models := cfg.EffectiveModels()
+	if len(models) == 0 {
+		return fmt.Errorf("至少需要一个模型")
+	}
+	seen := make(map[string]bool, len(models))
+	primary := 0
+	for index, model := range models {
+		if seen[model.ID] {
+			return fmt.Errorf("models[%d].id=%q 重复", index, model.ID)
+		}
+		seen[model.ID] = true
+		if strings.EqualFold(model.Role, "primary") {
+			primary++
+		}
+		endpoint := cfg.ConfigForModel(model)
+		provider := strings.ToLower(strings.TrimSpace(endpoint.Provider))
+		if provider != string(ProviderCustom) {
+			if _, ok := FindProvider(provider); !ok {
+				return fmt.Errorf("models[%d].provider=%q 无效", index, endpoint.Provider)
+			}
+		}
+		if strings.TrimSpace(endpoint.ModelName) == "" {
+			return fmt.Errorf("models[%d].model_name 不能为空", index)
+		}
+		if err := validateHTTPURL(fmt.Sprintf("models[%d].api_url", index), endpoint.ApiURL); err != nil {
+			return err
+		}
+		if model.MaxRetries < 0 || model.MaxRetries > 10 {
+			return fmt.Errorf("models[%d].max_retries 必须为 0~10", index)
+		}
+	}
+	if primary != 1 {
+		return fmt.Errorf("models 必须且只能包含一个 primary，当前为 %d", primary)
+	}
+	allowed := map[string]bool{"rate_limit": true, "timeout": true, "server_error": true, "connection": true, "invalid_output": true}
+	for _, kind := range cfg.ModelRouting.FailoverOn {
+		if !allowed[strings.ToLower(strings.TrimSpace(kind))] {
+			return fmt.Errorf("model_routing.failover_on 包含未知错误类型 %q", kind)
+		}
 	}
 	return nil
 }
@@ -130,6 +234,43 @@ func validateTargets(targets []TargetConfig) error {
 		}
 		if strings.TrimSpace(target.Host) == "" {
 			return fmt.Errorf("targets[%d].host 不能为空", i)
+		}
+		if protocol == "telnet" || protocol == "ssh" {
+			deviceType := strings.ToLower(strings.TrimSpace(target.DeviceType))
+			switch deviceType {
+			case "", "auto", "huawei", "h3c", "ruijie", "cisco", "linux", "generic":
+			default:
+				return fmt.Errorf("targets[%d].device_type=%q 无效", i, target.DeviceType)
+			}
+			if protocol == "ssh" {
+				if raw := strings.TrimSpace(target.Prompt); strings.HasPrefix(strings.ToLower(raw), "regex:") {
+					if _, err := regexp.Compile(strings.TrimSpace(raw[len("regex:"):])); err != nil {
+						return fmt.Errorf("targets[%d].prompt 正则无效: %w", i, err)
+					}
+				}
+			}
+			if protocol == "telnet" {
+				if raw := strings.TrimSpace(target.AuthPromptRegex); raw != "" {
+					if _, err := regexp.Compile(raw); err != nil {
+						return fmt.Errorf("targets[%d].auth_prompt_regex 无效: %w", i, err)
+					}
+				}
+			}
+		}
+		if protocol == "ftp" {
+			switch strings.ToLower(strings.TrimSpace(target.FTPTLSMode)) {
+			case "", "plain", "explicit", "implicit":
+			default:
+				return fmt.Errorf("targets[%d].ftp_tls_mode=%q 无效", i, target.FTPTLSMode)
+			}
+			switch strings.ToLower(strings.TrimSpace(target.FTPDataMode)) {
+			case "", "passive", "active", "auto":
+			default:
+				return fmt.Errorf("targets[%d].ftp_data_mode=%q 无效", i, target.FTPDataMode)
+			}
+			if raw := strings.TrimSpace(target.FTPActiveAddress); raw != "" && net.ParseIP(raw) == nil {
+				return fmt.Errorf("targets[%d].ftp_active_address=%q 必须是 IP 地址", i, target.FTPActiveAddress)
+			}
 		}
 		identity := strings.ToLower(strings.TrimSpace(target.Name))
 		if identity == "" {

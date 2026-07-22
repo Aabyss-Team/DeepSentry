@@ -30,6 +30,7 @@ type SessionConfig struct {
 	AwaitGoal        bool
 	MultiTurn        bool // Claude Code 式多轮追问（默认开启）
 	PlanMode         bool
+	CompetitionMode  bool
 }
 
 // Run 启动全屏 Agent TUI（支持多轮 follow-up）

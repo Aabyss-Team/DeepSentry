@@ -3,8 +3,20 @@ package harness
 import (
 	"ai-edr/internal/analyzer"
 	"ai-edr/internal/collector"
+	"ai-edr/internal/executor"
 	"ai-edr/internal/logger"
 )
+
+// ModelStepFunc is the model boundary owned by the runtime. Production uses
+// analyzer.RunAgentStepWithOptions; deterministic fixtures inject a scripted
+// provider without mutating global configuration or starting an HTTP server.
+type ModelStepFunc func(analyzer.StepOptions) (analyzer.AgentResponse, error)
+
+// ActionHandlerFunc is the tool/action execution boundary owned by the
+// runtime. Production delegates to DeepAgent.HandleAction; controlled outcome
+// fixtures inject deterministic target responses while exercising the same
+// approvals, history, event and checkpoint lifecycle.
+type ActionHandlerFunc func(*StepContext, *AgentAction) (*ActionResult, error)
 
 // RunLoopConfig Agent 主循环配置
 type RunLoopConfig struct {
@@ -19,9 +31,13 @@ type RunLoopConfig struct {
 	SubAgentMaxSteps int
 	MultiTurn        bool // TUI 等多轮会话：finish 后保留上下文，支持追问
 	PlanMode         bool // 先澄清/规划，再按计划执行
+	CompetitionMode  bool // 10 分钟运维比赛：快速取证、交叉验证、规范答题
 	ConfirmFn        func(*AgentAction) bool
 	AwaitUserFn      func(*AgentAction) (string, bool)
 	SudoAuthFn       func() bool // TUI 暂停渲染并由系统 sudo 安全读取密码
 	UI               UISink
 	Stop             <-chan struct{}
+	ModelStep        ModelStepFunc
+	Executor         executor.Executor
+	ActionHandler    ActionHandlerFunc
 }

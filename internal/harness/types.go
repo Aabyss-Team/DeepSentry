@@ -27,6 +27,7 @@ const (
 	ActionRemember  ActionType = "remember" // 跨会话保存记忆
 	ActionForget    ActionType = "forget"   // 删除记忆
 	ActionTool      ActionType = "tool"     // 内置场景工具
+	ActionToolBatch ActionType = "tool_batch"
 	ActionAskUser   ActionType = "ask_user" // 暂停并等待用户补充信息
 	ActionFinish    ActionType = "finish"
 )
@@ -76,20 +77,33 @@ type AgentAction struct {
 	MemoryScope string `json:"memory_scope"` // target | global
 
 	// tool (内置场景工具)
-	ToolName string            `json:"tool_name"`
-	ToolArgs map[string]string `json:"tool_args"`
+	ToolName         string            `json:"tool_name"`
+	ToolArgs         map[string]string `json:"tool_args"`
+	ToolCallID       string            `json:"tool_call_id,omitempty"`
+	NativeCallName   string            `json:"-"`
+	ReasoningContent string            `json:"-"`
+	ToolCalls        []ToolCallAction  `json:"tool_calls,omitempty"`
+	SkipToolCallIDs  map[string]bool   `json:"-"`
 
 	// common
 	Thought    string `json:"thought"`
 	RiskLevel  string `json:"risk_level"`
 	Reason     string `json:"reason"`
 	IsFinished bool   `json:"is_finished"`
+
+	// Approval scope is derived from the original action before UI redaction.
+	// It is process-local metadata and is never sent to the model/checkpoint.
+	ApprovalScopeKey   string `json:"-"`
+	ApprovalScopeLabel string `json:"-"`
 }
 
 // RedactedAction returns a deep-enough copy that is safe for UI, reports and
 // confirmation dialogs while leaving the executable action untouched.
 func RedactedAction(action AgentAction) AgentAction {
+	scopeKey, scopeLabel := SessionApprovalScope(&action)
 	out := action
+	out.ApprovalScopeKey = scopeKey
+	out.ApprovalScopeLabel = scopeLabel
 	out.Command = security.RedactSensitiveText(out.Command)
 	out.TaskPrompt = security.RedactSensitiveText(out.TaskPrompt)
 	out.Content = security.RedactSensitiveText(out.Content)
@@ -100,6 +114,7 @@ func RedactedAction(action AgentAction) AgentAction {
 	out.Question = security.RedactSensitiveText(out.Question)
 	out.MemoryValue = security.RedactSensitiveText(out.MemoryValue)
 	out.Thought = security.RedactSensitiveText(out.Thought)
+	out.ReasoningContent = security.RedactSensitiveText(out.ReasoningContent)
 	out.ToolArgs = make(map[string]string, len(action.ToolArgs))
 	for key, value := range action.ToolArgs {
 		tagged := key + "=" + value
@@ -114,6 +129,10 @@ func RedactedAction(action AgentAction) AgentAction {
 		}
 		out.ToolArgs[key] = security.RedactSensitiveText(value)
 	}
+	out.ToolCalls = append([]ToolCallAction(nil), action.ToolCalls...)
+	for i := range out.ToolCalls {
+		out.ToolCalls[i].Args = redactToolArgs(out.ToolCalls[i].Args)
+	}
 	out.ParallelTasks = append([]SubAgentTaskAction(nil), action.ParallelTasks...)
 	for i := range out.ParallelTasks {
 		out.ParallelTasks[i].TaskPrompt = security.RedactSensitiveText(out.ParallelTasks[i].TaskPrompt)
@@ -121,6 +140,30 @@ func RedactedAction(action AgentAction) AgentAction {
 	out.Options = append([]string(nil), action.Options...)
 	for i := range out.Options {
 		out.Options[i] = security.RedactSensitiveText(out.Options[i])
+	}
+	return out
+}
+
+type ToolCallAction struct {
+	ID   string            `json:"id"`
+	Name string            `json:"name"`
+	Args map[string]string `json:"args"`
+}
+
+func redactToolArgs(args map[string]string) map[string]string {
+	out := make(map[string]string, len(args))
+	for key, value := range args {
+		tagged := key + "=" + value
+		redacted := security.RedactSensitiveText(tagged)
+		if redacted != tagged {
+			if i := strings.IndexByte(redacted, '='); i >= 0 {
+				out[key] = redacted[i+1:]
+			} else {
+				out[key] = "***"
+			}
+			continue
+		}
+		out[key] = security.RedactSensitiveText(value)
 	}
 	return out
 }
@@ -169,6 +212,14 @@ type ActionResult struct {
 	FinalReport  string
 	SkipApproval bool // filesystem read/ls 等低风险操作
 	Streamed     bool // execute 已经实时输出过，经典 stdout 结束时只显示摘要
+	ToolResults  []ToolCallResult
+}
+
+type ToolCallResult struct {
+	ID     string
+	Name   string
+	Output string
+	Error  string
 }
 
 // Middleware 中间件接口（对标 deepagents middleware stack）

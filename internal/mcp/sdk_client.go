@@ -16,6 +16,9 @@ import (
 	"sync"
 	"time"
 
+	"ai-edr/internal/config"
+	"ai-edr/internal/ui"
+
 	sdkauth "github.com/modelcontextprotocol/go-sdk/auth"
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -68,6 +71,7 @@ type sdkConnection struct {
 	transport   string
 	fingerprint string
 	session     *sdkmcp.ClientSession
+	ctx         context.Context
 	cancel      context.CancelFunc
 	toolTimeout time.Duration
 	status      ServerStatus
@@ -203,21 +207,25 @@ func connectWithOAuthHandler(cfg ServerConfig, oauthHandler sdkauth.OAuthHandler
 	defer connectCancel()
 
 	var conn *sdkConnection
-	client := sdkmcp.NewClient(&sdkmcp.Implementation{Name: "deepsentry", Version: "2.0.1"}, &sdkmcp.ClientOptions{
+	client := sdkmcp.NewClient(&sdkmcp.Implementation{Name: "deepsentry", Version: ui.Version}, &sdkmcp.ClientOptions{
 		Capabilities: &sdkmcp.ClientCapabilities{},
 		KeepAlive:    30 * time.Second,
 		ToolListChangedHandler: func(context.Context, *sdkmcp.ToolListChangedRequest) {
 			if conn != nil {
+				// #nosec G118 -- capability refresh must outlive the notification
+				// callback and uses conn.ctx, which Disconnect cancels.
 				go conn.refreshCapabilities()
 			}
 		},
 		PromptListChangedHandler: func(context.Context, *sdkmcp.PromptListChangedRequest) {
 			if conn != nil {
+				// #nosec G118 -- see ToolListChangedHandler above.
 				go conn.refreshCapabilities()
 			}
 		},
 		ResourceListChangedHandler: func(context.Context, *sdkmcp.ResourceListChangedRequest) {
 			if conn != nil {
+				// #nosec G118 -- see ToolListChangedHandler above.
 				go conn.refreshCapabilities()
 			}
 		},
@@ -264,6 +272,7 @@ func connectWithOAuthHandler(cfg ServerConfig, oauthHandler sdkauth.OAuthHandler
 		transport:   transportName,
 		fingerprint: fingerprint,
 		session:     session,
+		ctx:         baseCtx,
 		cancel:      cancel,
 		toolTimeout: toolTimeout,
 		config:      cfg,
@@ -313,7 +322,11 @@ func openOAuthBrowser(target string) error {
 func (conn *sdkConnection) refreshCapabilities() error {
 	conn.refreshMu.Lock()
 	defer conn.refreshMu.Unlock()
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	baseCtx := conn.ctx
+	if baseCtx == nil {
+		baseCtx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(baseCtx, 30*time.Second)
 	defer cancel()
 
 	toolCount := 0
@@ -389,7 +402,11 @@ func (conn *sdkConnection) callTool(name string, schema map[string]interface{}, 
 	if err != nil {
 		return "", fmt.Errorf("MCP 工具 %s 参数无效: %w", name, err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), conn.toolTimeout)
+	baseCtx := conn.ctx
+	if baseCtx == nil {
+		baseCtx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(baseCtx, conn.toolTimeout)
 	defer cancel()
 	result, err := conn.session.CallTool(ctx, &sdkmcp.CallToolParams{Name: name, Arguments: coerced})
 	if err != nil {
@@ -530,7 +547,11 @@ func ReadResource(server, uri string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), conn.toolTimeout)
+	baseCtx := conn.ctx
+	if baseCtx == nil {
+		baseCtx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(baseCtx, conn.toolTimeout)
 	defer cancel()
 	result, err := conn.session.ReadResource(ctx, &sdkmcp.ReadResourceParams{URI: uri})
 	if err != nil {
@@ -574,7 +595,11 @@ func GetPrompt(server, name string, args map[string]string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), conn.toolTimeout)
+	baseCtx := conn.ctx
+	if baseCtx == nil {
+		baseCtx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(baseCtx, conn.toolTimeout)
 	defer cancel()
 	result, err := conn.session.GetPrompt(ctx, &sdkmcp.GetPromptParams{Name: name, Arguments: args})
 	if err != nil {
@@ -729,10 +754,7 @@ func (t headerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 }
 
 func mcpHTTPClient(cfg ServerConfig) *http.Client {
-	base := http.DefaultTransport
-	if transport, ok := http.DefaultTransport.(*http.Transport); ok {
-		base = transport.Clone()
-	}
+	base := http.RoundTripper(config.HTTPTransport())
 	token := ""
 	if name := strings.TrimSpace(cfg.BearerTokenEnvVar); name != "" {
 		token = os.Getenv(name)

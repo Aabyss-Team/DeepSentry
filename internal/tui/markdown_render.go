@@ -55,7 +55,7 @@ func renderMarkdownConfirm(markdown, timestamp string, width int) string {
 	innerW := max(1, width-styleConfirmBox.GetHorizontalFrameSize())
 	header := mdH2Style.Render(sanitizeTUIText(timestamp) + "⚠ 需要确认")
 	body := renderMarkdownBlocks(markdown, innerW)
-	footer := mdBoldStyle.Render("Y 批准  ·  N / Esc 拒绝  ·  Enter 不执行")
+	footer := mdBoldStyle.Render("Y 本次 · A 会话同类 · N/Esc 拒绝 · Enter 拒绝")
 	return styleConfirmBox.Width(styleRenderWidth(styleConfirmBox, width)).Render(fitRenderedBlock(header+"\n\n"+body+"\n\n"+footer, innerW))
 }
 
@@ -211,6 +211,7 @@ func renderMarkdownListItem(marker, text string, width int) string {
 }
 
 func renderInlineMarkdown(line string) string {
+	line = normalizeEmojiSpacing(line)
 	var b strings.Builder
 	for len(line) > 0 {
 		codeStart := strings.Index(line, "`")
@@ -247,7 +248,7 @@ func renderInlineMarkdown(line string) string {
 func markdownInlinePlain(line string) string {
 	line = strings.ReplaceAll(line, "**", "")
 	line = strings.ReplaceAll(line, "`", "")
-	return ui.TerminalText(line)
+	return normalizeEmojiSpacing(ui.TerminalText(line))
 }
 
 func renderCodeBlock(lines []string, width int) string {

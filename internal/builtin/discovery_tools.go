@@ -48,7 +48,7 @@ func CIDRScan(rt Runtime, cidr, portsSpec string, timeoutSec, limit int) (string
 				defer wg.Done()
 				sem <- struct{}{}
 				defer func() { <-sem }()
-				conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, strconv.Itoa(port)), timeout)
+				conn, err := config.ControllerDialTimeout("tcp", net.JoinHostPort(ip, strconv.Itoa(port)), timeout)
 				if err == nil {
 					_ = conn.Close()
 					mu.Lock()

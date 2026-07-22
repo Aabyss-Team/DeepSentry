@@ -63,23 +63,32 @@ func main() {
 	taskFlag := flag.String("task", "", "任务描述（agent/脚本推荐）")
 	taskShort := flag.String("q", "", "任务描述（--task 简写）")
 	planMode := flag.Bool("plan", false, "计划模式：必要时先追问，再生成 todo 计划并执行")
+	competitionMode := flag.Bool("competition", false, "比赛模式：按 10 分钟限时、证据闭环和评分规范优化执行/输出")
 	subAgentMaxStepsFlag := flag.Int("subagent-max-steps", 0, "子 Agent 最大步数上限（默认读取 config.yaml: subagent_max_steps，未配置为 15）")
+	httpProxyFlag := flag.String("proxy", "", "控制端 HTTP/HTTPS 代理，例如 http://127.0.0.1:8080")
+	socks5ProxyFlag := flag.String("socks5", "", "控制端 SOCKS5 代理，例如 socks5://127.0.0.1:1080")
 	jsonOutput := flag.Bool("json", false, "经典模式输出 JSONL 事件")
 	quiet := flag.Bool("quiet", false, "经典模式仅输出关键结果和错误")
 	webshellMode := flag.Bool("webshell", false, "WebShell/非 TTY 友好模式（提交后台执行，立即返回报告/进度路径）")
 	noColor := flag.Bool("no-color", false, "禁用彩色输出（也可设置 NO_COLOR=1 或 DEEPSENTRY_NO_COLOR=1）")
+	themeFlag := flag.String("theme", "", "TUI 主题 auto|dark|light（默认自动适应终端背景）")
 	schedulerMode := flag.Bool("scheduler", false, "仅运行本地定时任务调度器")
 	showVersion := flag.Bool("version", false, "显示版本")
 	showHelp := flag.Bool("h", false, "显示帮助")
 	showHelpLong := flag.Bool("help", false, "显示帮助")
 	flag.Usage = printUsage
 	flag.Parse()
+	if _, ok := tui.NormalizeTerminalTheme(*themeFlag); !ok {
+		fmt.Printf("%s--theme 只支持 auto|dark|light，当前为 %q\n", ui.Prefix("❌", "[ERR]"), *themeFlag)
+		ui.Exit(1)
+		return
+	}
 	if *noColor {
 		_ = os.Setenv("DEEPSENTRY_NO_COLOR", "1")
 		_ = os.Setenv("NO_COLOR", "1")
 	}
 	configureSurveyCompatibility()
-	tui.ConfigureTerminalPreferences()
+	tui.ConfigureTerminalPreferences(*themeFlag)
 	if *webshellMode {
 		*noTUI = true
 		*quiet = true
@@ -106,6 +115,12 @@ func main() {
 	}
 	if *showVersion {
 		fmt.Printf("DeepSentry v%s Ultimate (build %s)\n", ui.Version, ui.BuildTime)
+		return
+	}
+	startupProxy, proxyErr := config.ResolveStartupProxy(*httpProxyFlag, *socks5ProxyFlag)
+	if proxyErr != nil {
+		fmt.Printf("%s代理参数无效: %v\n", ui.Prefix("❌", "[ERR]"), proxyErr)
+		ui.Exit(1)
 		return
 	}
 
@@ -188,6 +203,17 @@ func main() {
 		} else if !*jsonOutput && !*quiet {
 			fmt.Printf("%s%s\n", ui.Prefix("📂", "[CFG]"), ui.StripANSIIfPlain("\033[1;32m"+msg+"\033[0m"))
 		}
+	}
+	effectiveTheme := config.GlobalConfig.TerminalTheme
+	if strings.TrimSpace(*themeFlag) != "" {
+		// CLI 覆盖仅对当前进程生效，不改写 config.yaml。
+		effectiveTheme = *themeFlag
+	}
+	tui.ConfigureTerminalPreferences(effectiveTheme)
+	if startupProxy != "" {
+		// Command-line proxy is process-scoped and deliberately does not rewrite
+		// config.yaml. Detached WebShell children receive the original args.
+		config.GlobalConfig.ControllerProxy = startupProxy
 	}
 
 	// 4. 获取用户需求 / 恢复会话
@@ -313,6 +339,14 @@ func main() {
 		executor.SetModeOutputEnabled(false)
 	}
 	for {
+		isTelnetTarget := strings.EqualFold(strings.TrimSpace(config.GlobalConfig.TargetProtocol), "telnet") || (config.GlobalConfig.TargetProtocol == "" && config.GlobalConfig.TelnetHost != "")
+		if isTelnetTarget && !*jsonOutput && !*quiet {
+			loginTimeout := config.GlobalConfig.TelnetLoginTimeoutSec
+			if loginTimeout <= 0 {
+				loginTimeout = 20
+			}
+			fmt.Printf("%s正在连接 Telnet %s（登录超时 %ds）...\n", ui.Prefix("🔌", "[TELNET]"), config.GlobalConfig.TelnetHost, loginTimeout)
+		}
 		if *tuiMode {
 			out := captureStdout(func() {
 				err = executor.Init(config.GlobalConfig)
@@ -323,6 +357,37 @@ func main() {
 		}
 		if err == nil {
 			break
+		}
+		if isTelnetTarget {
+			if nonInteractive || !isInteractiveTerminal() {
+				emitInitFailure(*jsonOutput, "telnet_connect_failed", fmt.Sprintf("Telnet 连接/认证失败: %v", err))
+				ui.Exit(1)
+			}
+			fmt.Printf("\n%sTelnet 连接/认证失败: %v\n", ui.Prefix("❌", "[ERR]"), err)
+			choice := ""
+			if askErr := askOne(&survey.Select{Message: "请选择处理方式:", Options: []string{
+				ui.Prefix("🔧", "[CFG]") + "修改 Telnet/网络设备配置",
+				ui.Prefix("💻", "[LOCAL]") + "切换为本地模式",
+				ui.Prefix("❌", "[EXIT]") + "退出程序",
+			}}, &choice); askErr != nil {
+				emitInitFailure(false, "telnet_connect_failed", err.Error())
+				ui.Exit(1)
+			}
+			ui.ResetTerminalState()
+			switch {
+			case strings.Contains(choice, "修改 Telnet"):
+				if wizardErr := runTelnetWizard(); wizardErr != nil {
+					fmt.Printf("%sTelnet 配置向导已中止: %v\n", ui.Prefix("❌", "[ERR]"), wizardErr)
+					ui.Exit(1)
+					return
+				}
+				continue
+			case strings.Contains(choice, "本地模式"):
+				switchToLocalMode()
+				continue
+			default:
+				ui.Exit(1)
+			}
 		}
 
 		if config.GlobalConfig.SSHHost != "" {
@@ -346,7 +411,11 @@ func main() {
 			}
 			ui.ResetTerminalState()
 			if strings.Contains(choice, "修改 SSH 配置") {
-				runSSHWizard(false)
+				if wizardErr := runSSHWizard(false); wizardErr != nil {
+					fmt.Printf("%sSSH 配置向导已中止: %v\n", ui.Prefix("❌", "[ERR]"), wizardErr)
+					ui.Exit(1)
+					return
+				}
 				continue
 			} else if strings.Contains(choice, "切换为 本地模式") {
 				switchToLocalMode()
@@ -427,13 +496,24 @@ func main() {
 	switch executor.CurrentMode() {
 	case "ssh":
 		connInfo = fmt.Sprintf("SSH -> %s", config.GlobalConfig.SSHHost)
+		if deviceReporter, ok := executor.Current.(executor.NetworkDeviceReporter); ok {
+			info := deviceReporter.NetworkDeviceInfo()
+			connInfo = fmt.Sprintf("SSH -> %s · %s · prompt %s", config.GlobalConfig.SSHHost, info.Vendor, info.Prompt)
+		}
 	case "telnet":
 		connInfo = fmt.Sprintf("Telnet -> %s", config.GlobalConfig.TelnetHost)
+		if reporter, ok := executor.Current.(executor.NetworkDeviceReporter); ok {
+			info := reporter.NetworkDeviceInfo()
+			connInfo = fmt.Sprintf("Telnet -> %s · %s · prompt %s", config.GlobalConfig.TelnetHost, info.Vendor, info.Prompt)
+		}
 	case "ftp":
 		connInfo = fmt.Sprintf("FTP -> %s", config.GlobalConfig.FTPHost)
 	}
 	if len(config.GlobalConfig.Targets) > 0 && executor.CurrentMode() == "local" {
 		connInfo = fmt.Sprintf("Fleet 多目标: %d 台", len(config.GlobalConfig.Targets))
+	}
+	if rawProxy := strings.TrimSpace(config.GlobalConfig.ControllerProxy); rawProxy != "" {
+		connInfo += " · proxy " + config.ControllerProxySummary(rawProxy)
 	}
 
 	if *tuiMode {
@@ -506,32 +586,37 @@ func main() {
 	}
 
 	var confirmationMu sync.Mutex
+	sessionApprovals := make(map[string]string)
 	confirmFn := func(action *harness.AgentAction) bool {
 		confirmationMu.Lock()
 		defer confirmationMu.Unlock()
-		confirm := false
-		reason := action.Reason
-		if action.Type == harness.ActionExecute {
-			prompt := &survey.Confirm{
-				Message: fmt.Sprintf("%s风险: 高 (%s) -> 是否执行?", ui.Prefix("🔴", "[HIGH]"), reason),
-				Default: false,
-			}
-			_ = askOne(prompt, &confirm)
-		} else if action.Type == harness.ActionTool {
-			prompt := &survey.Confirm{
-				Message: fmt.Sprintf("%s确认执行工具 %s（风险: %s，原因: %s）?", ui.Prefix("🔴", "[HIGH]"), action.ToolName, action.RiskLevel, reason),
-				Default: false,
-			}
-			_ = askOne(prompt, &confirm)
-		} else {
-			prompt := &survey.Confirm{
-				Message: fmt.Sprintf("%s确认执行 %s（%s）?", ui.Prefix("🔴", "[HIGH]"), action.Type, reason),
-				Default: false,
-			}
-			_ = askOne(prompt, &confirm)
+		scopeKey, scopeLabel := action.ApprovalScopeKey, action.ApprovalScopeLabel
+		if scopeKey == "" {
+			scopeKey, scopeLabel = harness.SessionApprovalScope(action)
 		}
+		if label, ok := sessionApprovals[scopeKey]; ok && scopeKey != "" {
+			fmt.Printf("✅ 已命中本会话授权：%s\n", label)
+			return true
+		}
+		reason := action.Reason
+		message := fmt.Sprintf("%s确认执行 %s（%s）", ui.Prefix("🔴", "[HIGH]"), action.Type, reason)
+		if action.Type == harness.ActionExecute {
+			message = fmt.Sprintf("%s风险: 高 (%s) -> 如何处理?", ui.Prefix("🔴", "[HIGH]"), reason)
+		} else if action.Type == harness.ActionTool {
+			message = fmt.Sprintf("%s工具 %s（风险: %s，原因: %s）", ui.Prefix("🔴", "[HIGH]"), action.ToolName, action.RiskLevel, reason)
+		}
+		choice := "拒绝"
+		_ = askOne(&survey.Select{
+			Message: message,
+			Options: []string{"仅允许本次", "本会话允许同类操作", "拒绝"},
+			Default: "拒绝",
+			Help:    "会话授权使用保守指纹；文件修改仅匹配同一动作和同一文件。新会话自动失效。",
+		}, &choice)
 		ui.ResetTerminalState()
-		return confirm
+		if choice == "本会话允许同类操作" && scopeKey != "" {
+			sessionApprovals[scopeKey] = scopeLabel
+		}
+		return choice != "拒绝"
 	}
 
 	loopCfg := harness.RunLoopConfig{
@@ -545,6 +630,7 @@ func main() {
 		MaxSteps:         maxSteps,
 		SubAgentMaxSteps: subAgentMaxSteps,
 		PlanMode:         *planMode,
+		CompetitionMode:  *competitionMode,
 		ConfirmFn:        confirmFn,
 	}
 	if !*tuiMode && !nonInteractive {
@@ -593,6 +679,7 @@ func main() {
 			AwaitGoal:        awaitGoal,
 			MultiTurn:        true,
 			PlanMode:         *planMode,
+			CompetitionMode:  *competitionMode,
 		}); err != nil {
 			fmt.Printf("%sTUI 退出: %v\n", ui.Prefix("❌", "[ERR]"), err)
 			ui.Exit(1)
@@ -678,7 +765,10 @@ func emitInitFailure(jsonOutput bool, code, message string) {
 }
 
 func launchDetachedWebShell(title string) (string, string, string, error) {
-	if err := os.MkdirAll("reports", 0755); err != nil {
+	if err := os.MkdirAll("reports", 0o700); err != nil {
+		return "", "", "", err
+	}
+	if err := os.Chmod("reports", 0o700); err != nil {
 		return "", "", "", err
 	}
 	stamp := time.Now().Format("20060102_150405_000000000")
@@ -889,7 +979,7 @@ func waitForSignal() {
 // ---------------------------------------------------------------------
 
 // runSSHWizard 统一的 SSH 配置向导
-func runSSHWizard(skipHostName bool) {
+func runSSHWizard(skipHostName bool) error {
 	// 🟢 动态标题：根据场景显示不同标题，体验更流畅
 	if skipHostName {
 		fmt.Println("\n" + ui.Prefix("🔐", "[SSH]") + ui.StripANSIIfPlain("\033[1;34mSSH 身份认证\033[0m")) // 初次设置显示这个
@@ -900,10 +990,12 @@ func runSSHWizard(skipHostName bool) {
 	// 🟢 只有在"非跳过"模式下，才询问主机名
 	if !skipHostName {
 		var host string
-		askOne(&survey.Input{
+		if err := askOne(&survey.Input{
 			Message: "SSH 主机 (IP:Port):",
 			Default: config.GlobalConfig.SSHHost,
-		}, &host)
+		}, &host); err != nil {
+			return err
+		}
 		viper.Set("target_protocol", "ssh")
 		viper.Set("ssh_host", host)
 		config.GlobalConfig.TargetProtocol = "ssh"
@@ -911,22 +1003,28 @@ func runSSHWizard(skipHostName bool) {
 	}
 
 	var user string
-	askOne(&survey.Input{
+	if err := askOne(&survey.Input{
 		Message: "SSH 用户名:",
 		Default: "root", // 给个默认值 root，方便一点
-	}, &user)
+	}, &user); err != nil {
+		return err
+	}
 	viper.Set("ssh_user", user)
 
 	authMethod := ""
-	askOne(&survey.Select{
+	if err := askOne(&survey.Select{
 		Message: "认证方式:",
 		Options: []string{"Password", "Private Key"},
 		Default: "Password",
-	}, &authMethod)
+	}, &authMethod); err != nil {
+		return err
+	}
 
 	if authMethod == "Password" {
 		var pwd string
-		askOne(&survey.Password{Message: "密码:"}, &pwd)
+		if err := askOne(&survey.Password{Message: "密码:"}, &pwd); err != nil {
+			return err
+		}
 		viper.Set("ssh_password", pwd)
 		viper.Set("ssh_key_path", "")
 	} else {
@@ -939,9 +1037,34 @@ func runSSHWizard(skipHostName bool) {
 				defKey = filepath.Join(".ssh", "id_rsa")
 			}
 		}
-		askOne(&survey.Input{Message: "私钥路径:", Default: defKey}, &keyPath)
+		if err := askOne(&survey.Input{Message: "私钥路径:", Default: defKey}, &keyPath); err != nil {
+			return err
+		}
 		viper.Set("ssh_key_path", keyPath)
 		viper.Set("ssh_password", "")
+	}
+
+	deviceType := firstNonEmptyString(config.GlobalConfig.SSHDeviceType, "auto")
+	if err := askOne(&survey.Select{
+		Message: "SSH 目标类型:",
+		Options: []string{"auto", "linux", "huawei", "h3c", "ruijie", "cisco", "generic"},
+		Default: deviceType,
+		Help:    "auto 会先识别 Linux/SFTP，不支持时切换到交互式网络设备 CLI。",
+	}, &deviceType); err != nil {
+		return err
+	}
+	prompt := config.GlobalConfig.SSHPrompt
+	if err := askOne(&survey.Input{Message: "网络设备命令 Prompt（可空自动探测）:", Default: prompt}, &prompt); err != nil {
+		return err
+	}
+	enablePassword := ""
+	if err := askOne(&survey.Password{Message: "特权密码（华为/H3C super，Cisco/锐捷 enable；留空保持原值）:"}, &enablePassword); err != nil {
+		return err
+	}
+	viper.Set("ssh_device_type", deviceType)
+	viper.Set("ssh_prompt", prompt)
+	if enablePassword != "" {
+		viper.Set("ssh_enable_password", enablePassword)
 	}
 
 	// 保存并刷新配置
@@ -953,7 +1076,61 @@ func runSSHWizard(skipHostName bool) {
 	config.GlobalConfig.SSHUser = viper.GetString("ssh_user")
 	config.GlobalConfig.SSHPassword = viper.GetString("ssh_password")
 	config.GlobalConfig.SSHKeyPath = viper.GetString("ssh_key_path")
+	config.GlobalConfig.SSHDeviceType = viper.GetString("ssh_device_type")
+	config.GlobalConfig.SSHPrompt = viper.GetString("ssh_prompt")
+	config.GlobalConfig.SSHEnablePassword = viper.GetString("ssh_enable_password")
 	ui.ResetTerminalState()
+	return nil
+}
+
+func runTelnetWizard() error {
+	fmt.Println("\n" + ui.Prefix("🛠️", "[TELNET]") + "Telnet / 网络设备配置修正")
+	var target config.TargetConfig
+	target.Protocol = "telnet"
+	target.Host = config.GlobalConfig.TelnetHost
+	target.User = firstNonEmptyString(config.GlobalConfig.TelnetUser, "root")
+	target.Prompt = config.GlobalConfig.TelnetPrompt
+	target.AuthPromptRegex = config.GlobalConfig.TelnetAuthPromptRegex
+	target.DeviceType = firstNonEmptyString(config.GlobalConfig.TelnetDeviceType, "auto")
+	target.EnablePassword = config.GlobalConfig.TelnetEnablePassword
+	if err := ask([]*survey.Question{
+		{Name: "host", Prompt: &survey.Input{Message: "主机 (IP[:Port]):", Default: target.Host}, Validate: survey.Required},
+		{Name: "user", Prompt: &survey.Input{Message: "用户名:", Default: target.User}},
+		{Name: "device_type", Prompt: &survey.Select{Message: "设备类型:", Options: []string{"auto", "huawei", "h3c", "ruijie", "cisco", "linux", "generic"}, Default: target.DeviceType}},
+	}, &target); err != nil {
+		return err
+	}
+	if err := askOne(&survey.Password{Message: "Telnet 密码（留空会清除旧密码）:"}, &target.Password); err != nil {
+		return err
+	}
+	if err := askOne(&survey.Input{Message: "命令 Prompt（可空自动探测）:", Default: target.Prompt}, &target.Prompt); err != nil {
+		return err
+	}
+	if err := askOne(&survey.Input{Message: "认证 Prompt 正则（可空）:", Default: target.AuthPromptRegex}, &target.AuthPromptRegex); err != nil {
+		return err
+	}
+	var privilegePassword string
+	if err := askOne(&survey.Password{Message: "特权密码（华为/H3C super，Cisco/锐捷 enable；留空保持原值）:"}, &privilegePassword); err != nil {
+		return err
+	}
+	if privilegePassword != "" {
+		target.EnablePassword = privilegePassword
+	}
+	target.Host = normalizeTargetHost("telnet", target.Host)
+	applySingleTargetConfig(target)
+	if err := saveCurrentConfig(); err != nil {
+		fmt.Printf("%sTelnet 配置保存失败: %v\n", ui.Prefix("⚠️", "[WARN]"), err)
+	}
+	config.GlobalConfig.TargetProtocol = "telnet"
+	config.GlobalConfig.TelnetHost = target.Host
+	config.GlobalConfig.TelnetUser = target.User
+	config.GlobalConfig.TelnetPassword = target.Password
+	config.GlobalConfig.TelnetPrompt = target.Prompt
+	config.GlobalConfig.TelnetAuthPromptRegex = target.AuthPromptRegex
+	config.GlobalConfig.TelnetDeviceType = target.DeviceType
+	config.GlobalConfig.TelnetEnablePassword = viper.GetString("telnet_enable_password")
+	ui.ResetTerminalState()
+	return nil
 }
 
 func switchToLocalMode() {
@@ -962,26 +1139,50 @@ func switchToLocalMode() {
 	viper.Set("ssh_user", "")
 	viper.Set("ssh_password", "")
 	viper.Set("ssh_key_path", "")
+	viper.Set("ssh_device_type", "auto")
+	viper.Set("ssh_prompt", "")
+	viper.Set("ssh_enable_password", "")
 	viper.Set("telnet_host", "")
 	viper.Set("telnet_user", "")
 	viper.Set("telnet_password", "")
 	viper.Set("telnet_prompt", "")
+	viper.Set("telnet_auth_prompt_regex", "")
+	viper.Set("telnet_device_type", "auto")
+	viper.Set("telnet_enable_password", "")
 	viper.Set("ftp_host", "")
 	viper.Set("ftp_user", "")
 	viper.Set("ftp_password", "")
+	viper.Set("ftp_tls_mode", "plain")
+	viper.Set("ftp_tls_server_name", "")
+	viper.Set("ftp_tls_ca_file", "")
+	viper.Set("ftp_tls_insecure_skip_verify", false)
+	viper.Set("ftp_data_mode", "passive")
+	viper.Set("ftp_active_address", "")
 
 	config.GlobalConfig.TargetProtocol = "local"
 	config.GlobalConfig.SSHHost = ""
 	config.GlobalConfig.SSHUser = ""
 	config.GlobalConfig.SSHPassword = ""
 	config.GlobalConfig.SSHKeyPath = ""
+	config.GlobalConfig.SSHDeviceType = "auto"
+	config.GlobalConfig.SSHPrompt = ""
+	config.GlobalConfig.SSHEnablePassword = ""
 	config.GlobalConfig.TelnetHost = ""
 	config.GlobalConfig.TelnetUser = ""
 	config.GlobalConfig.TelnetPassword = ""
 	config.GlobalConfig.TelnetPrompt = ""
+	config.GlobalConfig.TelnetAuthPromptRegex = ""
+	config.GlobalConfig.TelnetDeviceType = "auto"
+	config.GlobalConfig.TelnetEnablePassword = ""
 	config.GlobalConfig.FTPHost = ""
 	config.GlobalConfig.FTPUser = ""
 	config.GlobalConfig.FTPPassword = ""
+	config.GlobalConfig.FTPTLSMode = "plain"
+	config.GlobalConfig.FTPTLSServerName = ""
+	config.GlobalConfig.FTPTLSCAFile = ""
+	config.GlobalConfig.FTPTLSInsecureSkipVerify = false
+	config.GlobalConfig.FTPDataMode = "passive"
+	config.GlobalConfig.FTPActiveAddress = ""
 
 	if err := saveCurrentConfig(); err != nil {
 		fmt.Printf("%s已切换为本地模式，但配置保存失败: %v\n", ui.Prefix("⚠️", "[WARN]"), err)
@@ -997,22 +1198,29 @@ func saveCurrentConfig() error {
 	return config.SaveConfig()
 }
 
-func runSingleTargetWizard() config.TargetConfig {
-	targets := runTargetEntriesWizard(1)
-	if len(targets) == 0 {
-		return config.TargetConfig{Protocol: "ssh"}
+func runSingleTargetWizard() (config.TargetConfig, error) {
+	targets, err := runTargetEntriesWizard(1)
+	if err != nil {
+		return config.TargetConfig{}, err
 	}
-	return targets[0]
+	if len(targets) == 0 {
+		return config.TargetConfig{Protocol: "ssh"}, nil
+	}
+	return targets[0], nil
 }
 
-func runTargetsWizard() []config.TargetConfig {
+func runTargetsWizard() ([]config.TargetConfig, error) {
 	countText := "3"
-	_ = askOne(&survey.Input{
+	if err := askOne(&survey.Input{
 		Message: "要录入几台服务器:",
 		Default: "3",
-	}, &countText)
+	}, &countText); err != nil {
+		return nil, err
+	}
 	count := 3
-	fmt.Sscanf(countText, "%d", &count)
+	if parsed, err := strconv.Atoi(strings.TrimSpace(countText)); err == nil {
+		count = parsed
+	}
 	if count <= 0 {
 		count = 1
 	}
@@ -1022,48 +1230,106 @@ func runTargetsWizard() []config.TargetConfig {
 	return runTargetEntriesWizard(count)
 }
 
-func runTargetEntriesWizard(count int) []config.TargetConfig {
+func runTargetEntriesWizard(count int) ([]config.TargetConfig, error) {
 	targets := make([]config.TargetConfig, 0, count)
 	used := map[string]bool{}
 	for i := 1; i <= count; i++ {
 		var t config.TargetConfig
 		defaultName := fmt.Sprintf("target-%02d", i)
-		_ = ask([]*survey.Question{
+		if err := ask([]*survey.Question{
 			{Name: "name", Prompt: &survey.Input{Message: fmt.Sprintf("第 %d 台名称:", i), Default: defaultName}},
 			{Name: "protocol", Prompt: &survey.Select{Message: "连接协议:", Options: []string{"ssh", "telnet", "ftp"}, Default: "ssh"}},
 			{Name: "host", Prompt: &survey.Input{Message: "主机 (IP[:Port]):"}, Validate: survey.Required},
 			{Name: "user", Prompt: &survey.Input{Message: "用户名:", Default: "root"}},
-		}, &t)
+		}, &t); err != nil {
+			return nil, err
+		}
 		t.Name = uniqueTargetName(firstNonEmptyString(t.Name, defaultName), used)
-		t.Host = normalizeTargetHost(t.Protocol, t.Host)
+		// FTP's default port depends on the TLS mode selected below (:21 for
+		// plain/explicit, :990 for implicit), so leave a portless FTP host for
+		// the executor to normalize after that choice is known.
+		if t.Protocol != "ftp" {
+			t.Host = normalizeTargetHost(t.Protocol, t.Host)
+		}
 		switch t.Protocol {
 		case "ssh":
 			auth := ""
-			_ = askOne(&survey.Select{Message: "SSH 认证方式:", Options: []string{"Password", "Private Key"}, Default: "Password"}, &auth)
+			if err := askOne(&survey.Select{Message: "SSH 认证方式:", Options: []string{"Password", "Private Key"}, Default: "Password"}, &auth); err != nil {
+				return nil, err
+			}
 			if auth == "Private Key" {
 				defKey := ""
 				if home, err := os.UserHomeDir(); err == nil {
 					defKey = filepath.Join(home, ".ssh", "id_rsa")
 				}
-				_ = askOne(&survey.Input{Message: "私钥路径:", Default: defKey}, &t.KeyPath)
+				if err := askOne(&survey.Input{Message: "私钥路径:", Default: defKey}, &t.KeyPath); err != nil {
+					return nil, err
+				}
 			} else {
-				_ = askOne(&survey.Password{Message: "密码:"}, &t.Password)
+				if err := askOne(&survey.Password{Message: "密码:"}, &t.Password); err != nil {
+					return nil, err
+				}
+			}
+			if err := askOne(&survey.Select{Message: "SSH 目标类型:", Options: []string{"auto", "linux", "huawei", "h3c", "ruijie", "cisco", "generic"}, Default: "auto", Help: "网络设备将使用 PTY 交互 CLI，不会拼接 Linux shell marker。"}, &t.DeviceType); err != nil {
+				return nil, err
+			}
+			if err := askOne(&survey.Input{Message: "网络设备命令 Prompt（可空自动探测）:", Help: "例如 <Core-Switch> 或 RG-S5750#；正则请用 regex: 前缀。"}, &t.Prompt); err != nil {
+				return nil, err
+			}
+			if err := askOne(&survey.Password{Message: "特权密码（华为/H3C super，Cisco/锐捷 enable；可选）:"}, &t.EnablePassword); err != nil {
+				return nil, err
 			}
 		case "telnet":
-			_ = askOne(&survey.Password{Message: "Telnet 密码:"}, &t.Password)
-			_ = askOne(&survey.Input{Message: "Telnet Prompt (可空):"}, &t.Prompt)
+			if err := askOne(&survey.Password{Message: "Telnet 密码:"}, &t.Password); err != nil {
+				return nil, err
+			}
+			if err := askOne(&survey.Select{Message: "网络设备类型:", Options: []string{"auto", "huawei", "h3c", "ruijie", "cisco", "linux", "generic"}, Default: "auto", Help: "推荐 auto；华为 VRP/H3C Comware/锐捷 RGOS 可显式指定以自动关闭分页。"}, &t.DeviceType); err != nil {
+				return nil, err
+			}
+			if err := askOne(&survey.Input{Message: "命令 Prompt (可空，自动探测):", Help: "只用于登录完成后的命令边界，例如 <Hexin_S12708>；正则请用 regex: 前缀。"}, &t.Prompt); err != nil {
+				return nil, err
+			}
+			if err := askOne(&survey.Input{Message: "认证 Prompt 正则 (可空):", Help: "仅在设备密码提示非常规时填写，例如 (?i)passcode[:：]；不会用于命令结束判断。"}, &t.AuthPromptRegex); err != nil {
+				return nil, err
+			}
+			if err := askOne(&survey.Password{Message: "特权密码（华为/H3C super，Cisco/锐捷 enable；可选）:"}, &t.EnablePassword); err != nil {
+				return nil, err
+			}
 		case "ftp":
 			if t.User == "" {
 				t.User = "anonymous"
 			}
-			_ = askOne(&survey.Password{Message: "FTP 密码 (匿名可空):"}, &t.Password)
+			if err := askOne(&survey.Password{Message: "FTP 密码 (匿名可空):"}, &t.Password); err != nil {
+				return nil, err
+			}
+			if err := askOne(&survey.Select{Message: "FTP TLS 模式:", Options: []string{"plain", "explicit", "implicit"}, Default: "plain", Help: "生产环境建议 explicit；implicit 通常使用 990 端口。"}, &t.FTPTLSMode); err != nil {
+				return nil, err
+			}
+			if t.FTPTLSMode != "plain" {
+				if err := askOne(&survey.Input{Message: "TLS 证书主机名 (可空):", Help: "留空使用 FTP host；连接 IP 但证书签发给域名时填证书域名。"}, &t.FTPTLSServerName); err != nil {
+					return nil, err
+				}
+				if err := askOne(&survey.Input{Message: "私有 CA PEM 路径 (可空):"}, &t.FTPTLSCAFile); err != nil {
+					return nil, err
+				}
+			}
+			if err := askOne(&survey.Select{Message: "FTP 数据通道:", Options: []string{"passive", "active", "auto"}, Default: "passive", Help: "被动模式对 NAT/防火墙更友好；主动模式需允许服务端回连。"}, &t.FTPDataMode); err != nil {
+				return nil, err
+			}
+			if t.FTPDataMode == "active" {
+				if err := askOne(&survey.Input{Message: "主动模式对外 IP (可空自动):"}, &t.FTPActiveAddress); err != nil {
+					return nil, err
+				}
+			}
 		}
 		tags := ""
-		_ = askOne(&survey.Input{Message: "标签 (逗号分隔，可空):"}, &tags)
+		if err := askOne(&survey.Input{Message: "标签 (逗号分隔，可空):"}, &tags); err != nil {
+			return nil, err
+		}
 		t.Tags = splitTags(tags)
 		targets = append(targets, t)
 	}
-	return targets
+	return targets, nil
 }
 
 func applySingleTargetConfig(t config.TargetConfig) {
@@ -1075,27 +1341,40 @@ func applySingleTargetConfig(t config.TargetConfig) {
 		viper.Set("telnet_user", firstNonEmptyString(t.User, "root"))
 		viper.Set("telnet_password", t.Password)
 		viper.Set("telnet_prompt", t.Prompt)
+		viper.Set("telnet_auth_prompt_regex", t.AuthPromptRegex)
+		viper.Set("telnet_device_type", firstNonEmptyString(t.DeviceType, "auto"))
+		viper.Set("telnet_enable_password", t.EnablePassword)
 	case "ftp":
 		viper.Set("ftp_host", t.Host)
 		viper.Set("ftp_user", firstNonEmptyString(t.User, "anonymous"))
 		viper.Set("ftp_password", t.Password)
+		viper.Set("ftp_tls_mode", firstNonEmptyString(t.FTPTLSMode, "plain"))
+		viper.Set("ftp_tls_server_name", t.FTPTLSServerName)
+		viper.Set("ftp_tls_ca_file", t.FTPTLSCAFile)
+		viper.Set("ftp_tls_insecure_skip_verify", t.FTPTLSInsecureSkipVerify)
+		viper.Set("ftp_data_mode", firstNonEmptyString(t.FTPDataMode, "passive"))
+		viper.Set("ftp_active_address", t.FTPActiveAddress)
 	default:
 		viper.Set("target_protocol", "ssh")
 		viper.Set("ssh_host", t.Host)
 		viper.Set("ssh_user", firstNonEmptyString(t.User, "root"))
 		viper.Set("ssh_password", t.Password)
 		viper.Set("ssh_key_path", t.KeyPath)
+		viper.Set("ssh_device_type", firstNonEmptyString(t.DeviceType, "auto"))
+		viper.Set("ssh_prompt", t.Prompt)
+		viper.Set("ssh_enable_password", t.EnablePassword)
 	}
 }
 
 func clearSingleTargetConfig() {
 	for _, key := range []string{
-		"ssh_host", "ssh_user", "ssh_password", "ssh_key_path",
-		"telnet_host", "telnet_user", "telnet_password", "telnet_prompt",
-		"ftp_host", "ftp_user", "ftp_password",
+		"ssh_host", "ssh_user", "ssh_password", "ssh_key_path", "ssh_device_type", "ssh_prompt", "ssh_enable_password",
+		"telnet_host", "telnet_user", "telnet_password", "telnet_prompt", "telnet_auth_prompt_regex", "telnet_device_type", "telnet_enable_password",
+		"ftp_host", "ftp_user", "ftp_password", "ftp_tls_mode", "ftp_tls_server_name", "ftp_tls_ca_file", "ftp_data_mode", "ftp_active_address",
 	} {
 		viper.Set(key, "")
 	}
+	viper.Set("ftp_tls_insecure_skip_verify", false)
 }
 
 func normalizeTargetHost(protocol, host string) string {
@@ -1270,10 +1549,51 @@ func wizardProviderID(providerLabel string) string {
 	}
 }
 
+var wizardThemeOptions = []string{
+	"自动适应终端背景（推荐）",
+	"深色主题（固定）",
+	"日间主题（固定）",
+}
+
+func wizardTerminalTheme(choice string) string {
+	switch {
+	case strings.Contains(choice, "日间"):
+		return "light"
+	case strings.Contains(choice, "深色"):
+		return "dark"
+	default:
+		return "auto"
+	}
+}
+
+func wizardThemeDefault(theme string) string {
+	switch strings.ToLower(strings.TrimSpace(theme)) {
+	case "light":
+		return wizardThemeOptions[2]
+	case "dark":
+		return wizardThemeOptions[1]
+	default:
+		return wizardThemeOptions[0]
+	}
+}
+
 // runElegantWizard 完整初始化向导
 func runElegantWizard() error {
 	fmt.Println("\n" + ui.Prefix("🛠️", "[INIT]") + ui.StripANSIIfPlain("\033[1;34mDeepSentry 初始化向导\033[0m"))
 	fmt.Println("-------------------------------------------")
+
+	var themeChoice string
+	if err := askOne(&survey.Select{
+		Message: ui.Prefix("🎨", "[THEME]") + "终端主题:",
+		Options: wizardThemeOptions,
+		Default: wizardThemeDefault(viper.GetString("terminal_theme")),
+		Help:    "auto 会探测终端背景明暗；远程终端探测不准时可固定 dark/light。",
+	}, &themeChoice); err != nil {
+		return err
+	}
+	terminalTheme := wizardTerminalTheme(themeChoice)
+	viper.Set("terminal_theme", terminalTheme)
+	tui.ConfigureTerminalPreferences(terminalTheme)
 
 	// 1. 第一步：选择 AI 提供商 (用于生成智能默认值)
 	var providerLabel string
@@ -1464,7 +1784,10 @@ func runElegantWizard() error {
 	var saveErr error
 	switch {
 	case strings.Contains(mode, "多台"):
-		targets := runTargetsWizard()
+		targets, wizardErr := runTargetsWizard()
+		if wizardErr != nil {
+			return wizardErr
+		}
 		viper.Set("targets", targets)
 		viper.Set("target_protocol", "local")
 		clearSingleTargetConfig()
@@ -1474,7 +1797,10 @@ func runElegantWizard() error {
 			fmt.Printf("%s已保存 %d 台 Fleet 目标至 config.yaml\n", ui.Prefix("✅", "[OK]"), len(targets))
 		}
 	case strings.Contains(mode, "1 台"):
-		target := runSingleTargetWizard()
+		target, wizardErr := runSingleTargetWizard()
+		if wizardErr != nil {
+			return wizardErr
+		}
 		viper.Set("targets", []config.TargetConfig(nil))
 		applySingleTargetConfig(target)
 		if saveErr = config.SaveConfig(); saveErr != nil {

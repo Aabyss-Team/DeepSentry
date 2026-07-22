@@ -74,6 +74,49 @@ func TestRenderMarkdownHeadingKeepsEmojiGraphemeTogether(t *testing.T) {
 	}
 }
 
+func TestNormalizeEmojiSpacingKeepsClustersAndAddsReadableGap(t *testing.T) {
+	tests := map[string]string{
+		"1️⃣重命名": "1️⃣ 重命名",
+		"✅本机搞定":  "✅ 本机搞定",
+		"完成✅验证":  "完成 ✅ 验证",
+		"完成🎭✨":   "完成 🎭✨",
+		"👩‍💻排查":  "👩‍💻 排查",
+		"✅ 已有间距": "✅ 已有间距",
+		"✅，已完成":  "✅，已完成",
+	}
+	for input, want := range tests {
+		if got := normalizeEmojiSpacing(input); got != want {
+			t.Fatalf("normalizeEmojiSpacing(%q)=%q want %q", input, got, want)
+		}
+		if got := normalizeEmojiSpacing(want); got != want {
+			t.Fatalf("emoji spacing must be idempotent: %q -> %q", want, got)
+		}
+	}
+}
+
+func TestMarkdownTableSeparatesEmojiAndTextWithoutBreakingWidth(t *testing.T) {
+	t.Setenv("DEEPSENTRY_FANCY", "1")
+	t.Setenv("TERM", "xterm-256color")
+	md := strings.Join([]string{
+		"| 步骤 | 操作 | 结果 |",
+		"|---|---|---|",
+		"| 1️⃣重命名 | 修改文件 | ✅本机搞定 |",
+		"| 2️⃣上传 | 传送文件 | ✅原汁原味 |",
+	}, "\n")
+	rendered := renderMarkdownReport(md, 64)
+	plain := stripANSIForTest(rendered)
+	for _, want := range []string{"1️⃣ 重命名", "2️⃣ 上传", "✅ 本机搞定", "✅ 原汁原味"} {
+		if !strings.Contains(plain, want) {
+			t.Fatalf("rendered table missing spaced value %q:\n%s", want, plain)
+		}
+	}
+	for _, line := range strings.Split(rendered, "\n") {
+		if got := displayWidth(line); got > 64 {
+			t.Fatalf("emoji table overflow width=%d: %q", got, line)
+		}
+	}
+}
+
 func TestRenderMarkdownAskRendersRichQuestionInsideViewport(t *testing.T) {
 	md := strings.Join([]string{
 		"📊 **当前战况：**",
@@ -158,6 +201,15 @@ func TestMarkdownCodeBlockWrapsWithoutLosingCommand(t *testing.T) {
 	for _, line := range strings.Split(rendered, "\n") {
 		if got := lipgloss.Width(line); got > 24 {
 			t.Fatalf("wrapped code line width=%d: %q", got, line)
+		}
+	}
+}
+
+func TestMarkdownConfirmationShowsOnceSessionAndDenyChoices(t *testing.T) {
+	rendered := stripANSIForTest(renderMarkdownConfirm("编辑文件", "[08:15:00] ", 80))
+	for _, want := range []string{"Y 本次", "A 会话同类", "N/Esc 拒绝", "Enter 拒绝"} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("confirmation panel missing %q:\n%s", want, rendered)
 		}
 	}
 }

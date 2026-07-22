@@ -11,10 +11,13 @@ import (
 	"ai-edr/internal/skills"
 	"ai-edr/internal/tools"
 	"ai-edr/internal/ui"
+	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -403,7 +406,11 @@ func (m *ToolsMiddleware) fleetExec(ctx *StepContext, action *AgentAction) *Acti
 	}
 	concurrency := 5
 	if raw := firstToolArg(action.ToolArgs, "concurrency"); raw != "" {
-		fmt.Sscanf(raw, "%d", &concurrency)
+		parsed, err := strconv.Atoi(strings.TrimSpace(raw))
+		if err != nil || parsed < 1 || parsed > 50 {
+			return &ActionResult{Output: "fleet_exec concurrency 必须是 1~50 的整数", SkipApproval: true}
+		}
+		concurrency = parsed
 	}
 	safeCommand := security.RedactSensitiveText(command)
 	results := executor.RunFleetWithProgressAndStop(config.GlobalConfig.Targets, selector, command, concurrency, func(p executor.FleetProgress) {
@@ -1161,7 +1168,12 @@ func (m *ContextMiddleware) EnhancePrompt(base string, state *AgentState) string
 	case config.ModelProfileBalanced:
 		budget = 4000
 	}
-	return base + state.CoreCluesPrompt(budget)
+	selected := state.SelectedToolNames()
+	verified := ""
+	if len(selected) > 0 {
+		verified = "\n【本任务已验证工具】后续轮次优先保留这些工具的完整 schema: " + strings.Join(selected, ", ") + "\n"
+	}
+	return base + state.CoreCluesPrompt(budget) + verified
 }
 
 func compactPromptText(text string, maxBytes int) string {
@@ -1187,12 +1199,13 @@ func (m *ContextMiddleware) OffloadOutput(state *AgentState, label, output strin
 
 	outputDir := sessionOutputDir(state)
 	_ = os.MkdirAll(outputDir, 0700)
-	filename := fmt.Sprintf("output_%s.txt", label)
+	filename := fmt.Sprintf("output_%s.txt", safeArtifactLabel(label))
 	fullPath := filepath.Join(outputDir, filename)
 
 	if err := os.WriteFile(fullPath, []byte(output), 0600); err != nil {
 		return output[:m.OutputThreshold] + "\n...(输出过长已截断)..."
 	}
+	digest := sha256.Sum256([]byte(output))
 
 	previewLen := 500
 	if len(output) < previewLen {
@@ -1200,8 +1213,36 @@ func (m *ContextMiddleware) OffloadOutput(state *AgentState, label, output strin
 	}
 	preview := output[:previewLen]
 	absPath, _ := filepath.Abs(fullPath)
-	return fmt.Sprintf("%s\n\n...(完整输出 %d 字节已保存至 %s，可用 read_file 查看)...",
-		preview, len(output), absPath)
+	record := ArtifactRecord{
+		Path: absPath, SHA256: fmt.Sprintf("%x", digest[:]), Source: label,
+		Size: int64(len(output)), Summary: security.RedactSensitiveText(strings.TrimSpace(preview)), RecordedAt: time.Now().UTC(),
+	}
+	state.AddArtifact(record)
+	if metadata, err := json.MarshalIndent(record, "", "  "); err == nil {
+		_ = os.WriteFile(fullPath+".artifact.json", metadata, 0600)
+	}
+	return fmt.Sprintf("%s\n\n...(完整输出 %d 字节已保存为 artifact %s，sha256=%s，可用 read_file 查看)...",
+		preview, len(output), absPath, record.SHA256)
+}
+
+func safeArtifactLabel(label string) string {
+	label = strings.TrimSpace(label)
+	if label == "" {
+		return "result"
+	}
+	label = strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_', r == '.':
+			return r
+		default:
+			return '_'
+		}
+	}, label)
+	label = strings.Trim(label, ".")
+	if label == "" {
+		return "result"
+	}
+	return mwTruncate(label, 80)
 }
 
 func sessionOutputDir(state *AgentState) string {

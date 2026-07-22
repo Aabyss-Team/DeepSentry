@@ -23,8 +23,10 @@ func TestFormatCatalog(t *testing.T) {
 }
 
 func TestRegistryCount(t *testing.T) {
-	if CountEnabled() < 43 {
-		t.Fatalf("expected at least 43 enabled tools, got %d", CountEnabled())
+	ConfigureEnabled(nil, nil)
+	const releaseToolCount = 70
+	if got := CountEnabled(); got != releaseToolCount {
+		t.Fatalf("enabled tool count = %d, want release count %d; update the release docs and this gate together", got, releaseToolCount)
 	}
 }
 
@@ -80,6 +82,36 @@ func TestFormatCatalogDetail(t *testing.T) {
 	configSearch := FormatCatalogDetail("配置管理", "add ssh target config_manage")
 	if !strings.Contains(configSearch, "config_manage") || !strings.Contains(configSearch, "port (integer") {
 		t.Fatalf("multi-keyword search should find config_manage with structured help:\n%s", configSearch)
+	}
+}
+
+func TestFormatCatalogDetailUsesChineseSemanticAliases(t *testing.T) {
+	tests := []struct {
+		query string
+		want  []string
+	}{
+		{"识别伪装二进制", []string{"file_ident", "file_hash"}},
+		{"提取网页表单与脚本", []string{"web_snapshot"}},
+		{"跟进分页安全公告", []string{"browser_browse"}},
+		{"检查 AWD 服务可用性", []string{"awd_service_check"}},
+		{"核查异常自启动", []string{"service_unit_audit"}},
+	}
+	for _, test := range tests {
+		detail := FormatCatalogDetail("all", test.query)
+		for _, name := range test.want {
+			if !strings.Contains(detail, "**"+name+"**") {
+				t.Errorf("query %q catalog did not retrieve %s:\n%s", test.query, name, detail)
+			}
+		}
+	}
+	awd := FormatCatalogDetail("all", "检查 AWD 服务可用性")
+	awdIndex := strings.Index(awd, "**awd_service_check**")
+	configIndex := strings.Index(awd, "**config_manage**")
+	if awdIndex < 0 || (configIndex >= 0 && awdIndex > configIndex) {
+		t.Fatalf("semantic catalog did not rank AWD tool first:\n%s", awd)
+	}
+	if !strings.Contains(awd, "不得再次调用 tool_catalog") {
+		t.Fatalf("semantic catalog missing one-shot discovery guidance:\n%s", awd)
 	}
 }
 

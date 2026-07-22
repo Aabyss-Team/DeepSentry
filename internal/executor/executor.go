@@ -37,6 +37,75 @@ type outputCollector struct {
 	maxBytes  int
 }
 
+// streamingOutputWriter lets os/exec drain stdout and stderr before Wait
+// returns, while preserving line-oriented callbacks. Cmd.WaitDelay bounds the
+// case where a deliberately backgrounded child inherits the shell pipes.
+type streamingOutputWriter struct {
+	mu        sync.Mutex
+	pending   []byte
+	collector *outputCollector
+	onLine    func(string)
+}
+
+func newStreamingOutputWriter(collector *outputCollector, onLine func(string)) *streamingOutputWriter {
+	return &streamingOutputWriter{collector: collector, onLine: onLine}
+}
+
+func (w *streamingOutputWriter) Write(p []byte) (int, error) {
+	n := len(p)
+	w.consume(p, false)
+	return n, nil
+}
+
+func (w *streamingOutputWriter) flush() {
+	w.consume(nil, true)
+}
+
+func (w *streamingOutputWriter) consume(p []byte, flush bool) {
+	w.mu.Lock()
+	w.pending = append(w.pending, p...)
+	var emitted []string
+	for {
+		end := bytes.IndexByte(w.pending, '\n')
+		if end < 0 {
+			break
+		}
+		raw := append([]byte(nil), w.pending[:end+1]...)
+		w.pending = w.pending[end+1:]
+		if line := normalizeLocalOutputLine(raw); line != "" {
+			w.collector.appendLine(line)
+			emitted = append(emitted, line)
+		}
+	}
+	if flush && len(w.pending) > 0 {
+		raw := append([]byte(nil), w.pending...)
+		w.pending = nil
+		if line := normalizeLocalOutputLine(raw); line != "" {
+			w.collector.appendLine(line)
+			emitted = append(emitted, line)
+		}
+	}
+	w.mu.Unlock()
+
+	if w.onLine != nil {
+		for _, line := range emitted {
+			w.onLine(line)
+		}
+	}
+}
+
+func normalizeLocalOutputLine(raw []byte) string {
+	line := string(raw)
+	if runtime.GOOS == "windows" {
+		if utf8Out, err := GbkToUtf8(raw); err == nil {
+			line = string(utf8Out)
+		}
+	}
+	line = strings.ReplaceAll(line, "Active code page: 65001\r\n", "")
+	line = strings.ReplaceAll(line, "Active code page: 65001\n", "")
+	return line
+}
+
 func newOutputCollector(maxBytes int) *outputCollector {
 	if maxBytes <= 0 {
 		maxBytes = 512 * 1024
@@ -553,44 +622,24 @@ func runLocalShellCommandWithStop(cmdStr string, onLine func(string), stop <-cha
 		}
 	}
 
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return "", err
-	}
-	cmd.Stderr = cmd.Stdout
+	collector := newOutputCollector(effectiveMaxOutputBytes())
+	stream := newStreamingOutputWriter(collector, onLine)
+	cmd.Stdout = stream
+	cmd.Stderr = stream
+	// A background service may inherit stdout/stderr after the foreground shell
+	// has exited. Give normal commands time to drain, then close inherited pipes
+	// instead of blocking the Agent forever.
+	cmd.WaitDelay = 250 * time.Millisecond
 	if err := cmd.Start(); err != nil {
 		return "", err
 	}
-
-	collector := newOutputCollector(effectiveMaxOutputBytes())
-	reader := bufio.NewReader(stdout)
-	for {
-		line, readErr := reader.ReadString('\n')
-		if line != "" {
-			if runtime.GOOS == "windows" {
-				if utf8Out, transformErr := GbkToUtf8([]byte(line)); transformErr == nil {
-					line = string(utf8Out)
-				}
-			}
-			line = strings.ReplaceAll(line, "Active code page: 65001\r\n", "")
-			line = strings.ReplaceAll(line, "Active code page: 65001\n", "")
-			if line != "" {
-				collector.appendLine(line)
-				if onLine != nil {
-					onLine(line)
-				}
-			}
-		}
-		if readErr != nil {
-			if readErr != io.EOF {
-				_ = cmd.Wait()
-				return strings.TrimSpace(collector.result()), readErr
-			}
-			break
-		}
+	err := cmd.Wait()
+	stream.flush()
+	if errors.Is(err, exec.ErrWaitDelay) {
+		// The foreground shell exited successfully; only an inherited pipe from
+		// a background child exceeded the bounded drain window.
+		err = nil
 	}
-
-	err = cmd.Wait()
 	if ctx.Err() != nil {
 		return strings.TrimSpace(collector.result()), fmt.Errorf("命令已按用户请求中断")
 	}
@@ -677,7 +726,7 @@ func (l *LocalExecutor) Close()         {}
 func (l *LocalExecutor) Mode() string   { return "local" }
 
 func (l *LocalExecutor) ReadTargetFile(path string) ([]byte, error) {
-	return os.ReadFile(path)
+	return ReadLocalFile(path)
 }
 
 func (l *LocalExecutor) ListTargetDir(path string) ([]string, error) {
@@ -702,10 +751,9 @@ func copyLocalFile(src, dst string) (string, error) {
 	}
 	defer sourceFile.Close()
 
-	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
 		return "", fmt.Errorf("创建目录失败: %v", err)
 	}
-
 	destFile, err := createPrivateOutputFile(dst)
 	if err != nil {
 		return "", fmt.Errorf("创建目标文件失败: %v", err)
@@ -736,12 +784,13 @@ func createPrivateOutputFile(path string) (*os.File, error) {
 // ==========================================
 
 type SSHExecutor struct {
-	client     *ssh.Client
-	session    *ssh.Session
-	sftpClient *sftp.Client
-	stdin      io.WriteCloser
-	stdout     *bufio.Reader
-	mu         sync.Mutex
+	client         *ssh.Client
+	session        *ssh.Session
+	sftpClient     *sftp.Client
+	stdin          io.WriteCloser
+	stdout         *bufio.Reader
+	commandTimeout time.Duration
+	mu             sync.Mutex
 }
 
 var knownHostsMu sync.Mutex
@@ -797,6 +846,8 @@ func sshHostKeyCallback(cfg config.Config) (ssh.HostKeyCallback, error) {
 		policy = "accept-new"
 	}
 	if policy == "insecure" {
+		// #nosec G106 -- explicit operator-selected compatibility mode. The
+		// secure default is accept-new and public docs reject insecure in prod.
 		return ssh.InsecureIgnoreHostKey(), nil
 	}
 	if policy != "strict" && policy != "accept-new" {
@@ -850,7 +901,50 @@ func sshHostKeyCallback(cfg config.Config) (ssh.HostKeyCallback, error) {
 	}, nil
 }
 
-func newSSHExecutor(cfg config.Config) (*SSHExecutor, error) {
+func newSSHExecutor(cfg config.Config) (Executor, error) {
+	client, err := dialSSHClient(cfg)
+	if err != nil {
+		return nil, err
+	}
+	deviceType := normalizeDeviceType(cfg.SSHDeviceType)
+	if deviceType != "auto" && deviceType != "linux" {
+		network, networkErr := newSSHNetworkExecutor(client, cfg)
+		if networkErr != nil {
+			_ = client.Close()
+			return nil, networkErr
+		}
+		return network, nil
+	}
+
+	// SFTP is a strong Linux/server signal, but it is optional. Many network
+	// appliances and minimal hosts intentionally do not expose the subsystem.
+	sftpClient, sftpErr := sftp.NewClient(client)
+	if deviceType == "auto" && sftpErr != nil {
+		if network, networkErr := newSSHNetworkExecutor(client, cfg); networkErr == nil {
+			return network, nil
+		}
+	}
+
+	linux, linuxErr := newLinuxSSHExecutor(client, sftpClient, cfg)
+	if linuxErr == nil {
+		return linux, nil
+	}
+	if sftpClient != nil {
+		_ = sftpClient.Close()
+	}
+	if deviceType == "auto" {
+		if network, networkErr := newSSHNetworkExecutor(client, cfg); networkErr == nil {
+			return network, nil
+		} else {
+			_ = client.Close()
+			return nil, fmt.Errorf("SSH 目标既无法启动 Linux shell，也无法建立网络设备 CLI: shell=%v; cli=%v", linuxErr, networkErr)
+		}
+	}
+	_ = client.Close()
+	return nil, linuxErr
+}
+
+func dialSSHClient(cfg config.Config) (*ssh.Client, error) {
 	var authMethods []ssh.AuthMethod
 	if cfg.SSHKeyPath != "" {
 		key, err := os.ReadFile(cfg.SSHKeyPath)
@@ -877,51 +971,70 @@ func newSSHExecutor(cfg config.Config) (*SSHExecutor, error) {
 		Timeout:         10 * time.Second,
 	}
 
-	client, err := ssh.Dial("tcp", normalizeSSHHost(cfg.SSHHost), sshConfig)
+	addr := normalizeSSHHost(cfg.SSHHost)
+	rawConn, err := config.ControllerDialTimeout("tcp", addr, sshConfig.Timeout)
 	if err != nil {
 		return nil, fmt.Errorf("SSH连接失败: %v", err)
 	}
-
-	sftpClient, err := sftp.NewClient(client)
+	_ = rawConn.SetDeadline(time.Now().Add(sshConfig.Timeout))
+	clientConn, channels, requests, err := ssh.NewClientConn(rawConn, addr, sshConfig)
 	if err != nil {
-		client.Close()
-		return nil, fmt.Errorf("SFTP 初始化失败: %v", err)
+		_ = rawConn.Close()
+		return nil, fmt.Errorf("SSH握手失败: %v", err)
 	}
+	_ = rawConn.SetDeadline(time.Time{})
+	client := ssh.NewClient(clientConn, channels, requests)
+	return client, nil
+}
 
-	session, err := client.NewSession()
+func newLinuxSSHExecutor(client *ssh.Client, sftpClient *sftp.Client, cfg config.Config) (*SSHExecutor, error) {
+	session, stdin, stdout, err := startSSHCommandShell(client, "/bin/bash")
 	if err != nil {
-		sftpClient.Close()
-		client.Close()
-		return nil, fmt.Errorf("创建 Session 失败: %v", err)
-	}
-
-	stdin, err := session.StdinPipe()
-	if err != nil {
-		return nil, err
-	}
-	stdout, err := session.StdoutPipe()
-	if err != nil {
-		return nil, err
-	}
-	session.Stderr = session.Stdout
-
-	if err := session.Start("/bin/bash"); err != nil {
-		if err := session.Start("/bin/sh"); err != nil {
-			return nil, fmt.Errorf("无法启动远程Shell: %v", err)
+		session, stdin, stdout, err = startSSHCommandShell(client, "/bin/sh")
+		if err != nil {
+			return nil, fmt.Errorf("无法启动远程 Shell: %v", err)
 		}
 	}
 
 	exe := &SSHExecutor{
-		client:     client,
-		session:    session,
-		sftpClient: sftpClient,
-		stdin:      stdin,
-		stdout:     bufio.NewReader(stdout),
+		client:         client,
+		session:        session,
+		sftpClient:     sftpClient,
+		stdin:          stdin,
+		stdout:         bufio.NewReader(stdout),
+		commandTimeout: 5 * time.Second,
 	}
 
-	exe.Run("export TERM=xterm; export LANG=en_US.UTF-8")
+	if _, err := exe.run("export TERM=xterm; export LANG=en_US.UTF-8", false, nil, nil); err != nil {
+		_ = session.Close()
+		return nil, fmt.Errorf("远程 Linux Shell 探测失败: %w", err)
+	}
+	exe.commandTimeout = secondsOrDefault(cfg.SSHCommandTimeoutSec, 90)
 
 	return exe, nil
+}
+
+func startSSHCommandShell(client *ssh.Client, command string) (*ssh.Session, io.WriteCloser, io.Reader, error) {
+	session, err := client.NewSession()
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("创建 Session 失败: %w", err)
+	}
+	stdin, err := session.StdinPipe()
+	if err != nil {
+		_ = session.Close()
+		return nil, nil, nil, err
+	}
+	stdout, err := session.StdoutPipe()
+	if err != nil {
+		_ = session.Close()
+		return nil, nil, nil, err
+	}
+	session.Stderr = session.Stdout
+	if err := session.Start(command); err != nil {
+		_ = session.Close()
+		return nil, nil, nil, err
+	}
+	return session, stdin, stdout, nil
 }
 
 func (s *SSHExecutor) Run(cmdStr string) (string, error) {
@@ -987,7 +1100,10 @@ func (s *SSHExecutor) run(cmdStr string, retryOnWriteFailure bool, onLine func(s
 		return "", fmt.Errorf("写入命令失败: %v", err)
 	}
 
-	timeout := time.Duration(config.GlobalConfig.EffectiveSSHTimeout()) * time.Second
+	timeout := s.commandTimeout
+	if timeout <= 0 {
+		timeout = time.Duration(config.GlobalConfig.EffectiveSSHTimeout()) * time.Second
+	}
 	type readResult struct {
 		out string
 		err error
@@ -1020,6 +1136,9 @@ func (s *SSHExecutor) run(cmdStr string, retryOnWriteFailure bool, onLine func(s
 		}
 		return res.out, res.err
 	case <-time.After(timeout):
+		if !retryOnWriteFailure {
+			return "", fmt.Errorf("SSH Shell 探测超时 (%v)", timeout)
+		}
 		reconnectErr := reconnectSSHExecutor(s)
 		if reconnectErr != nil {
 			return "", fmt.Errorf("SSH 命令超时 (%v)，且重连失败: %v", timeout, reconnectErr)
@@ -1088,7 +1207,9 @@ func (s *SSHExecutor) uploadFile(localPath, remotePath string) (string, error) {
 	}
 	defer srcFile.Close()
 
-	s.sftpClient.MkdirAll(filepath.Dir(remotePath))
+	if err := s.sftpClient.MkdirAll(filepath.Dir(remotePath)); err != nil {
+		return "", fmt.Errorf("创建远程目录失败: %v", err)
+	}
 
 	dstFile, err := s.sftpClient.Create(remotePath)
 	if err != nil {
@@ -1112,7 +1233,7 @@ func (s *SSHExecutor) downloadFile(remotePath, localPath string) (string, error)
 	}
 	defer srcFile.Close()
 
-	if err := os.MkdirAll(filepath.Dir(localPath), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(localPath), 0o700); err != nil {
 		return "", fmt.Errorf("创建本地目录失败: %v", err)
 	}
 

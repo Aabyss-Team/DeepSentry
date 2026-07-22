@@ -88,7 +88,9 @@ func configuredSecrets() []string {
 	values := []string{
 		cfg.ApiKey,
 		cfg.SSHPassword,
+		cfg.SSHEnablePassword,
 		cfg.TelnetPassword,
+		cfg.TelnetEnablePassword,
 		cfg.FTPPassword,
 		cfg.BenchmarkToken,
 		cfg.DingTalkWebhook,
@@ -98,7 +100,7 @@ func configuredSecrets() []string {
 		cfg.EmailGatewayToken,
 	}
 	for _, target := range cfg.Targets {
-		values = append(values, target.Password)
+		values = append(values, target.Password, target.EnablePassword)
 	}
 	for _, server := range cfg.MCPServerConfigs {
 		for key, value := range server.Env {

@@ -132,6 +132,24 @@ func TestWizardProviderOptionsMapToBuiltInPresets(t *testing.T) {
 	}
 }
 
+func TestWizardTerminalThemeChoices(t *testing.T) {
+	for _, test := range []struct {
+		choice string
+		want   string
+	}{
+		{wizardThemeOptions[0], "auto"},
+		{wizardThemeOptions[1], "dark"},
+		{wizardThemeOptions[2], "light"},
+	} {
+		if got := wizardTerminalTheme(test.choice); got != test.want {
+			t.Fatalf("wizardTerminalTheme(%q)=%q want %q", test.choice, got, test.want)
+		}
+		if got := wizardThemeDefault(test.want); got != test.choice {
+			t.Fatalf("wizardThemeDefault(%q)=%q want %q", test.want, got, test.choice)
+		}
+	}
+}
+
 func TestCaptureStdoutDrainsLargeStartupOutputAndRestoresStdout(t *testing.T) {
 	original := os.Stdout
 	payload := strings.Repeat("startup-warning\n", 10000)

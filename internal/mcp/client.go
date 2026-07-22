@@ -44,6 +44,9 @@ var globalRegistry = &Registry{
 	ambiguous: make(map[string]bool),
 }
 
+// stdioConnection is retained as a protocol-compatibility adapter for older
+// MCP servers and its focused compatibility tests. Production connections use
+// the official SDK path in sdk_client.go.
 type stdioConnection struct {
 	mu          sync.Mutex
 	cmd         *exec.Cmd

@@ -20,6 +20,8 @@ func FleetInventory(rt Runtime, selector string) (string, error) {
 		b.WriteString(fmt.Sprintf("- %s protocol=%s host=%s user=%s tags=%s\n",
 			executor.TargetDisplayName(t), t.Protocol, t.Host, t.User, strings.Join(t.Tags, ",")))
 	}
+	b.WriteString(fmt.Sprintf("下一步: inventory 只确认了 %d 个目标，尚未采集健康/日志证据；同项批量巡检请继续调用 fleet_exec(selector=%q, command=<只读巡检命令>)，文件取证用 fleet_file。\n",
+		len(targets), emptyDefault(selector, "all")))
 	return b.String(), nil
 }
 

@@ -80,6 +80,16 @@ func Run(name string, args map[string]string, rt Runtime) (string, error) {
 		return ProcessList(rt, argInt(args, "limit", 50, 200))
 	case "target_health_summary":
 		return TargetHealthSummary(rt)
+	case "network_device_baseline":
+		return NetworkDeviceBaseline(rt, arg(args, "profile", "device_type", "vendor"))
+	case "network_device_diagnose":
+		return NetworkDeviceDiagnose(rt, arg(args, "profile", "device_type", "vendor"), arg(args, "focus"))
+	case "competition_answer_check":
+		return CompetitionAnswerCheck(arg(args, "task", "question", "requirement"), arg(args, "answer", "draft", "report"))
+	case "host_incident_baseline":
+		return HostIncidentBaseline(rt, args)
+	case "webshell_hunt":
+		return WebShellHunt(rt, args)
 	case "disk_usage":
 		return DiskUsage(rt, arg(args, "path", "root"))
 	case "file_tail":

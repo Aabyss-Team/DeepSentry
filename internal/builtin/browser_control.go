@@ -226,6 +226,14 @@ func openBrowserSession(rawURL, mode string, waitMs, maxText, textOffset, elemen
 		}
 	}
 	visible, modeNote := browserVisibleMode(mode)
+	if browserNoSandboxEnabled() {
+		warning := "WARNING: Chrome sandbox disabled by DEEPSENTRY_BROWSER_NO_SANDBOX; use only in an isolated test container"
+		if modeNote == "" {
+			modeNote = warning
+		} else {
+			modeNote += "; " + warning
+		}
+	}
 	// Start Chrome on about:blank first. A website refusing the connection is
 	// a navigation problem, not a missing-browser problem, and the session can
 	// still be reused for another URL.
@@ -264,7 +272,10 @@ func startBrowserSession(bin, u string, visible bool, waitMs int) (*controlledBr
 	if err != nil {
 		return nil, err
 	}
-	_ = os.Chmod(profile, 0o700)
+	if err := os.Chmod(profile, 0o700); err != nil {
+		_ = os.RemoveAll(profile)
+		return nil, err
+	}
 	opts := append([]chromedp.ExecAllocatorOption{}, chromedp.DefaultExecAllocatorOptions[:]...)
 	opts = append(opts,
 		chromedp.ExecPath(bin),
@@ -273,6 +284,9 @@ func startBrowserSession(bin, u string, visible bool, waitMs int) (*controlledBr
 		chromedp.Flag("window-size", "1365,900"),
 		chromedp.Flag("start-maximized", visible),
 	)
+	if browserNoSandboxEnabled() {
+		opts = append(opts, chromedp.NoSandbox)
+	}
 	if proxy := strings.TrimSpace(config.GlobalConfig.ControllerProxy); proxy != "" {
 		opts = append(opts, chromedp.ProxyServer(proxy))
 	}
@@ -299,6 +313,15 @@ func startBrowserSession(bin, u string, visible bool, waitMs int) (*controlledBr
 		return nil, err
 	}
 	return s, nil
+}
+
+func browserNoSandboxEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("DEEPSENTRY_BROWSER_NO_SANDBOX"))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 func runInitialBrowserActions(s *controlledBrowserSession, actions ...chromedp.Action) error {
@@ -476,7 +499,9 @@ func browserScreenshotLocked(s *controlledBrowserSession) (string, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
-	_ = os.Chmod(dir, 0o700)
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return "", err
+	}
 	path := filepath.Join(dir, fmt.Sprintf("browser_%s_%d.png", s.id, time.Now().UnixMilli()))
 	var data []byte
 	if err := runBrowserActions(s, chromedp.FullScreenshot(&data, 90)); err != nil {

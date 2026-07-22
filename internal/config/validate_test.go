@@ -30,9 +30,19 @@ func TestValidateRuntimeConfigRejectsUnsafeOrAmbiguousState(t *testing.T) {
 		want   string
 	}{
 		{"unknown provider", func(c *Config) { c.Provider = "mystery" }, "provider"},
+		{"bad terminal theme", func(c *Config) { c.TerminalTheme = "sepia" }, "terminal_theme"},
 		{"bad url", func(c *Config) { c.ApiURL = "file:///tmp/model" }, "api_url"},
 		{"bad context", func(c *Config) { c.ContextWindowTokens = 2048 }, "context_window_tokens"},
+		{"negative temperature", func(c *Config) { c.Temperature = -0.1 }, "temperature"},
+		{"excessive temperature", func(c *Config) { c.Temperature = 2.1 }, "temperature"},
 		{"bad host key policy", func(c *Config) { c.SSHHostKeyPolicy = "ignore" }, "ssh_host_key_policy"},
+		{"bad ssh device", func(c *Config) { c.SSHDeviceType = "juniper" }, "ssh_device_type"},
+		{"bad ssh prompt regex", func(c *Config) { c.SSHPrompt = "regex:[" }, "ssh_prompt"},
+		{"negative ftp timeout", func(c *Config) { c.FTPTransferTimeoutSec = -1 }, "ftp 超时"},
+		{"excessive ftp timeout", func(c *Config) { c.FTPCommandTimeoutSec = 601 }, "ftp 超时"},
+		{"bad ftp tls mode", func(c *Config) { c.FTPTLSMode = "ssl3" }, "ftp_tls_mode"},
+		{"bad ftp data mode", func(c *Config) { c.FTPDataMode = "bounce" }, "ftp_data_mode"},
+		{"bad ftp active address", func(c *Config) { c.FTPActiveAddress = "host.example" }, "ftp_active_address"},
 		{"duplicate target", func(c *Config) {
 			c.Targets = []TargetConfig{{Name: "prod", Protocol: "ssh", Host: "a"}, {Name: "prod", Protocol: "ssh", Host: "b"}}
 		}, "重复目标"},
@@ -69,6 +79,37 @@ func TestInitConfigReplacesRatherThanMergesOldGlobalState(t *testing.T) {
 	}
 	if GlobalConfig.ApiKey != "" || len(GlobalConfig.Targets) != 0 {
 		t.Fatalf("removed fields survived reload: %#v", GlobalConfig)
+	}
+	if GlobalConfig.AgentRuntime != "v3" {
+		t.Fatalf("missing agent_runtime should default to v3, got %q", GlobalConfig.AgentRuntime)
+	}
+	if GlobalConfig.TerminalTheme != "auto" {
+		t.Fatalf("missing terminal_theme should default to auto, got %q", GlobalConfig.TerminalTheme)
+	}
+}
+
+func TestInitConfigKeepsExplicitLegacyRuntimeRollback(t *testing.T) {
+	viper.Reset()
+	t.Cleanup(viper.Reset)
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	data := []byte("provider: custom\napi_protocol: openai_chat\napi_url: http://127.0.0.1:11434/v1\nmodel_name: local\nagent_runtime: legacy\n")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := InitConfig(path); err != nil {
+		t.Fatal(err)
+	}
+	if GlobalConfig.AgentRuntime != "legacy" || GlobalConfig.EffectiveAgentRuntime() != "legacy" {
+		t.Fatalf("explicit legacy rollback was not preserved: %#v", GlobalConfig.AgentRuntime)
+	}
+}
+
+func TestEffectiveAgentRuntimeDefaultsToV3(t *testing.T) {
+	if got := (Config{}).EffectiveAgentRuntime(); got != "v3" {
+		t.Fatalf("empty runtime=%q want v3", got)
+	}
+	if got := (Config{AgentRuntime: " LEGACY "}).EffectiveAgentRuntime(); got != "legacy" {
+		t.Fatalf("normalized runtime=%q want legacy", got)
 	}
 }
 

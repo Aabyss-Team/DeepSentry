@@ -1,26 +1,39 @@
-# Local configuration and secrets
-config.yaml
-.env
-.env.*
+# Local secrets and operator-specific configuration
+/config.yaml
+/config_*.yaml
+/.env
+/.env.*
+!.env.example
 *.pem
 *.key
+*.p12
+*.pfx
 
-# Build artifacts
+# Runtime state, evidence and generated reports
+/.deepsentry/
+/reports/
+/results/
+/workspace/
+*.log
+
+# Build and release artifacts (attach release ZIPs through GitHub Releases)
 /build/
 /bin/
 /deepsentry
 /deepsentry.exe
+/deepsentry-*
 *.zip
-*.tar
-*.tar.gz
+/coverage.out
+/coverage.html
 
-# Runtime output
-/reports/
-*.log
-
-# OS / editor noise
+# Editor and operating-system metadata
 .DS_Store
 Thumbs.db
 .idea/
 .vscode/
+*.swp
+*.swo
 
+# Go test/build leftovers
+*.test
+*.prof

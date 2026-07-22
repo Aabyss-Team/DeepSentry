@@ -55,6 +55,8 @@ var bannerTips = []string{
 	"reserved_output_tokens 为模型回答与推理预留空间，留 0 自动计算",
 	"Native Tool schema 也会计入上下文预算，避免小模型暗中超窗",
 	"native_tool_limit 可限制每轮直接暴露的内置工具数量",
+	"Runtime v3 已默认启用；仅遇兼容问题时才临时回滚 legacy",
+	"配置 models[] fallback，可在 429、超时或服务故障后自动切换模型",
 
 	// 工具发现与参数契约
 	"不确定工具参数时，让 Agent 先用 tool_catalog 查看完整用法",
@@ -99,7 +101,7 @@ var bannerTips = []string{
 	"远程 SSH：mem_info、port_listen 等在目标机执行",
 	"控制端工具 ping、nmap_scan 从 DeepSentry 进程发起",
 	"Native Tool Calling 已启用时可更稳定地调用内置工具",
-	"高风险 Shell 会弹窗确认，按 Y 批准 / N 拒绝",
+	"高风险操作按 Y 仅批准本次，A 允许本会话同类操作，N 拒绝",
 	"Shell 规则判高后会先由 AI 复核，只有双高危或复核失败才人工确认",
 	"2>&1 只合并错误输出，不再被误判为写文件重定向",
 	"Batch 模式自动批准操作，仅建议在隔离环境使用",
@@ -118,6 +120,15 @@ var bannerTips = []string{
 	"db_config_audit 可检查 MySQL/PostgreSQL/Redis 等服务的高风险配置",
 	"secret_scan 用于查找代码与配置中的 Token、密钥和高风险凭证",
 	"大段工具输出会落盘到会话工作区，上下文只保留摘要与路径",
+	"高成功率任务写法：目标 + 时间窗 + 只读/可修改 + 证据与输出格式",
+	"先要求只读取证和根因判断，确认后再做最小修改与复验",
+	"结论要求附命令、关键输出和 artifact 路径，可明显减少幻觉",
+	"网络设备先跑完整 display/show，再按异常字段做过滤投影",
+	"projection=filtered 不是截断；output_truncated=true 才是字节上限截断",
+	"华为/H3C/锐捷可显式配置 device_type，减少命令方言试错",
+	"FTP 先列目录和校验目标路径，再下载；临时文件完成后才会原子落盘",
+	"FTP/Telnet 默认是明文协议，生产环境优先 SSH/SFTP 或启用证书校验的 FTPS",
+	"比赛题先限定 10 分钟与固定交付格式，最后调用答案自检再提交",
 
 	// 任务示例
 	"示例：排查目标机内存与监听端口",
@@ -136,6 +147,9 @@ var bannerTips = []string{
 	"首次使用可运行 deepsentry --init 进入配置向导",
 	"--init 可选择配置 /tsecbench 跑分模式",
 	"指定配置: deepsentry -c /path/to/config.yaml --tui",
+	"HTTP 代理启动: deepsentry -proxy http://127.0.0.1:8080 --task \"...\"",
+	"SOCKS5 启动: deepsentry -socks5 socks5://127.0.0.1:1080 --task \"...\"",
+	"-proxy 与 -socks5 只覆盖本次进程，不会把代理凭据写回 config.yaml",
 
 	// Skills 与 Memory
 	"Agent 可按场景加载 Skills（日志分析、取证、漏洞扫描等）",
@@ -150,7 +164,7 @@ var bannerTips = []string{
 	"Enter 不会批准高风险操作，必须按 Y 确认",
 	"拒绝危险操作时按 N 或 Esc",
 	"无人值守请加 -batch，生产环境务必先评估风险",
-	"Telnet/FTP 目标仅适合文件与命令类排查，注意协议限制",
+	"Telnet 可执行设备命令；FTP 支持目录与文件传输，明文 FTP 请仅用于受控网络",
 
 	// 评测与其他
 	"Benchmark TUI: go run ./cmd/benchmark/ -c config.yaml --tui",
@@ -164,4 +178,5 @@ var bannerTips = []string{
 	"委派任务时尽量写清范围：路径、时间窗、成功标准",
 	"追问时引用上一步结论，Agent 会继续同一 checkpoint",
 	"长任务中断后可 --resume 从上次步数继续，不必重来",
+	"看到供应商故障先看 /status 和 trace，再判断重试、failover 或恢复会话",
 }

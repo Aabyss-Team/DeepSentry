@@ -4,6 +4,7 @@ import (
 	"ai-edr/internal/collector"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -75,6 +76,108 @@ func TestOpenAICompatibleSendsNativeBuiltinSchemasAndParsesName(t *testing.T) {
 	}
 	if result.ToolCallName != "config_manage" || result.ToolCallArgs != `{"action":"status"}` {
 		t.Fatalf("unexpected tool result: %#v", result)
+	}
+}
+
+func TestOpenAICompatiblePreservesReasoningContentAcrossToolTurn(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		var request ChatRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if requests == 1 {
+			_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"","reasoning_content":"signed-thought","tool_calls":[{"id":"call_1","type":"function","function":{"name":"read_log","arguments":"{\"path\":\"fixture.log\"}"}}]}}]}`))
+			return
+		}
+		if len(request.Messages) < 2 || request.Messages[1].ReasoningContent != "signed-thought" {
+			t.Fatalf("reasoning content was not passed back: %#v", request.Messages)
+		}
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"done"}}]}`))
+	}))
+	defer server.Close()
+
+	cfg := config.Config{ApiURL: server.URL, ModelName: "thinking-model", ApiKey: "none"}
+	first, err := callOpenAICompatible(context.Background(), cfg, []Message{{Role: "user", Content: "inspect"}}, true, nil)
+	if err != nil || first.ReasoningContent != "signed-thought" {
+		t.Fatalf("first=%#v err=%v", first, err)
+	}
+	call := ToolCall{ID: first.ToolCallID, Type: "function"}
+	call.Function.Name = first.ToolCallName
+	call.Function.Arguments = first.ToolCallArgs
+	messages := []Message{
+		{Role: "user", Content: "inspect"},
+		{Role: "assistant", ReasoningContent: first.ReasoningContent, ToolCalls: []ToolCall{call}},
+		{Role: "tool", ToolCallID: first.ToolCallID, Name: first.ToolCallName, Content: "ok"},
+	}
+	if _, err := callOpenAICompatible(context.Background(), cfg, messages, true, nil); err != nil || requests != 2 {
+		t.Fatalf("round trip requests=%d err=%v", requests, err)
+	}
+}
+
+func TestOpenAIStreamingPreservesMultipleToolCallsAndUsage(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprintln(w, `data: {"choices":[{"delta":{"reasoning_content":"reason-","tool_calls":[{"index":0,"id":"call_a","function":{"name":"process_list","arguments":"{\"lim"}},{"index":1,"id":"call_b","function":{"name":"port_listen","arguments":"{}"}}]}}]}`)
+		_, _ = fmt.Fprintln(w, `data: {"choices":[{"delta":{"reasoning_content":"content","tool_calls":[{"index":0,"function":{"arguments":"it\":20}"}}]}}],"usage":{"prompt_tokens":10,"completion_tokens":6,"total_tokens":16}}`)
+		_, _ = fmt.Fprintln(w, "data: [DONE]")
+	}))
+	defer server.Close()
+
+	result, err := callOpenAICompatible(context.Background(), config.Config{ApiURL: server.URL, ModelName: "test", ApiKey: "none"}, []Message{{Role: "user", Content: "inspect"}}, true, func(string) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.ToolCalls) != 2 || result.ToolCalls[0].ID != "call_a" || result.ToolCalls[0].Arguments != `{"limit":20}` || result.ToolCalls[1].ID != "call_b" {
+		t.Fatalf("tool calls not reconstructed: %#v", result.ToolCalls)
+	}
+	if result.Usage.TotalTokens != 16 {
+		t.Fatalf("usage=%#v", result.Usage)
+	}
+	if result.ReasoningContent != "reason-content" {
+		t.Fatalf("reasoning content=%q", result.ReasoningContent)
+	}
+}
+
+func TestOpenAIStreamingReturnsStructuredPartialError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprintln(w, `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_partial","function":{"name":"process_list","arguments":"{\"limit\":"}}]}}]}`)
+	}))
+	defer server.Close()
+	result, err := callOpenAICompatible(context.Background(), config.Config{ApiURL: server.URL, ModelName: "test", ApiKey: "none"}, []Message{{Role: "user", Content: "inspect"}}, true, func(string) {})
+	var partial *PartialStreamError
+	if !errors.As(err, &partial) || len(result.ToolCalls) != 1 || result.ToolCalls[0].ID != "call_partial" || partial.Result.ToolCalls[0].ID != "call_partial" {
+		t.Fatalf("result=%#v err=%T %v", result, err, err)
+	}
+}
+
+func TestLLMFailoverUsesConfiguredFallback(t *testing.T) {
+	original := config.GlobalConfig
+	t.Cleanup(func() { config.GlobalConfig = original })
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[]}`))
+	}))
+	defer primary.Close()
+	fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"action\":\"finish\",\"final_report\":\"fallback-ok\"}"}}]}`))
+	}))
+	defer fallback.Close()
+	config.GlobalConfig = config.Config{
+		Provider: "custom", APIProtocol: "openai_chat", ApiURL: primary.URL, ApiKey: "none", ModelName: "primary",
+		Models: []config.ModelConfig{
+			{ID: "primary", Role: "primary", Provider: "custom", APIProtocol: "openai_chat", APIURL: primary.URL, ModelName: "primary", MaxRetries: 0},
+			{ID: "fallback", Role: "fallback", Provider: "custom", APIProtocol: "openai_chat", APIURL: fallback.URL, ModelName: "fallback", MaxRetries: 0},
+		},
+		ModelRouting: config.ModelRoutingConfig{FailoverOn: []string{"invalid_output"}},
+	}
+	result, err := CallLLMWithRetryContext(context.Background(), []Message{{Role: "user", Content: "hi"}}, false, nil)
+	if err != nil || result.ModelID != "fallback" || !strings.Contains(result.Content, "fallback-ok") || result.Failovers != 1 {
+		t.Fatalf("result=%#v err=%v", result, err)
 	}
 }
 
@@ -199,5 +302,14 @@ func TestLLMRetryDelayUsesBoundedJitter(t *testing.T) {
 		if got < base || got > base+500*time.Millisecond {
 			t.Fatalf("attempt %d delay=%s, want %s..%s", attempt, got, base, base+500*time.Millisecond)
 		}
+	}
+}
+
+func TestEffectiveTemperaturePreservesConfiguredZero(t *testing.T) {
+	if got := effectiveTemperature(config.Config{Temperature: 0}); got != 0 {
+		t.Fatalf("temperature 0 became %v", got)
+	}
+	if got := effectiveTemperature(config.Config{Temperature: 0.35}); got != 0.35 {
+		t.Fatalf("temperature 0.35 became %v", got)
 	}
 }

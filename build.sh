@@ -22,15 +22,11 @@ build_main() {
   [[ "$goos" == "windows" ]] && out="${out}.exe"
 
   echo "🔨 $goos/$goarch → $(basename "$out")"
-  if [[ "$goos" == "windows" ]]; then
-    env CGO_ENABLED=0 GOOS=$goos GOARCH=$goarch \
-      go build -ldflags "$LDFLAGS" -o "$out" \
-      ./cmd/main.go ./cmd/usage.go ./cmd/survey_compat.go ./cmd/console_windows.go
-  else
-    env CGO_ENABLED=0 GOOS=$goos GOARCH=$goarch \
-      go build -ldflags "$LDFLAGS" -o "$out" \
-      ./cmd/main.go ./cmd/usage.go ./cmd/survey_compat.go ./cmd/console_other.go
-  fi
+  # Build the package, not a hand-maintained list of files. Go will select
+  # console_windows.go/console_other.go through build tags, new entry files
+  # cannot be silently omitted, and module metadata stays attributable.
+  env CGO_ENABLED=0 GOOS=$goos GOARCH=$goarch \
+    go build -trimpath -buildvcs=false -ldflags "$LDFLAGS" -o "$out" ./cmd
 }
 
 build_aux() {
@@ -39,7 +35,7 @@ build_aux() {
   local out="$STAGING/bin/${name}-${goos}-${goarch}"
   [[ "$goos" == "windows" ]] && out="${out}.exe"
   env CGO_ENABLED=0 GOOS=$goos GOARCH=$goarch \
-    go build -ldflags "$LDFLAGS" -o "$out" "$pkg"
+    go build -trimpath -buildvcs=false -ldflags "$LDFLAGS" -o "$out" "$pkg"
 }
 
 platforms=(
@@ -88,17 +84,18 @@ cp "$HOST_BINARY" "$ROOT_ALIAS"
 # 配置与环境文件可能含密钥。既不删除也不打包，只收紧现有文件权限。
 find "$OUTPUT_DIR" -maxdepth 1 -type f \( -iname 'config*.yaml' -o -name '.env' \) -exec chmod 600 {} +
 
-# 校验文件只覆盖本次生成的二进制，供发布页和离线安装核验。
+# 公开校验清单必须与 GitHub Release/ZIP 的 7 个跨平台主程序完全一致。
+# 不列出本机别名和 bin/ 下的内部 benchmark/smoke，否则用户下载 Release
+# 后执行 `shasum -c SHA256SUMS` 会因缺少非发布文件而误报失败。
 (
   cd "$OUTPUT_DIR"
-  find . -maxdepth 2 -type f \( -name 'deepsentry*' -o -name 'benchmark-*' -o -name 'smoke-*' -o -name 'toolsmoke-*' \) -print0 \
-    | sort -z \
-    | xargs -0 shasum -a 256
+  find . -maxdepth 1 -type f \( -name 'deepsentry-*-*' -o -name 'deepsentry-*-*.exe' \) -print0 |
+    sort -z | xargs -0 shasum -a 256
 ) > "$OUTPUT_DIR/SHA256SUMS"
 
 echo "------------------------------------------"
 echo "✅ 编译完成"
 echo "💡 运行: cd build && ./deepsentry -c config.yaml"
-echo "   或:   ./bin/deepsentry -c config.yaml"
+echo "   或:   ./build/bin/deepsentry -c build/config.yaml"
 ls -lh "$OUTPUT_DIR"
 ls -lh "$OUTPUT_DIR/bin" 2>/dev/null || true

@@ -11,7 +11,10 @@ import (
 
 // WriteReports 写入 JSON + Markdown 报告
 func WriteReports(r *SuiteReport, dir string) (jsonPath, mdPath string, err error) {
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", "", err
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
 		return "", "", err
 	}
 	ts := r.Timestamp.Format("20060102_150405")
@@ -22,10 +25,10 @@ func WriteReports(r *SuiteReport, dir string) (jsonPath, mdPath string, err erro
 	if err != nil {
 		return "", "", err
 	}
-	if err := os.WriteFile(jsonPath, raw, 0644); err != nil {
+	if err := os.WriteFile(jsonPath, raw, 0o600); err != nil {
 		return "", "", err
 	}
-	if err := os.WriteFile(mdPath, []byte(renderMarkdown(r)), 0644); err != nil {
+	if err := os.WriteFile(mdPath, []byte(renderMarkdown(r)), 0o600); err != nil {
 		return "", "", err
 	}
 	return jsonPath, mdPath, nil

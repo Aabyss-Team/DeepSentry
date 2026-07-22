@@ -13,8 +13,22 @@ import (
 )
 
 type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	ID               string     `json:"id,omitempty"`
+	Role             string     `json:"role"`
+	Content          string     `json:"content"`
+	ReasoningContent string     `json:"reasoning_content,omitempty"`
+	ToolCalls        []ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID       string     `json:"tool_call_id,omitempty"`
+	Name             string     `json:"name,omitempty"`
+}
+
+type ToolCall struct {
+	ID       string `json:"id"`
+	Type     string `json:"type,omitempty"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
 }
 
 type ChatRequest struct {
@@ -35,8 +49,9 @@ type StreamOptions struct {
 type ChatResponse struct {
 	Choices []struct {
 		Message struct {
-			Content   string `json:"content"`
-			ToolCalls []struct {
+			Content          string `json:"content"`
+			ReasoningContent string `json:"reasoning_content,omitempty"`
+			ToolCalls        []struct {
 				ID       string `json:"id"`
 				Type     string `json:"type"`
 				Function struct {
@@ -90,6 +105,19 @@ type AgentResponse struct {
 	NewString   string `json:"new_string"`
 	ReplaceAll  bool   `json:"replace_all"`
 	GlobPattern string `json:"glob_pattern"`
+
+	// NativeToolCalls preserves provider call IDs and every call in a single
+	// response. Legacy fields remain populated for single-call compatibility.
+	ToolCallID       string           `json:"-"`
+	ToolCallName     string           `json:"-"`
+	ReasoningContent string           `json:"-"`
+	NativeToolCalls  []NativeToolCall `json:"-"`
+}
+
+type NativeToolCall struct {
+	ID        string
+	Name      string
+	Arguments string
 }
 
 // TodoItem 任务清单项
@@ -198,7 +226,14 @@ type StepOptions struct {
 	UseNativeTools bool
 	OnStream       func(delta string) // 非 nil 且模型支持时启用 SSE 流式输出
 	OnUsage        func(TokenUsage)   // 模型返回真实 usage 时回调
+	OnModelRoute   func(ModelRouteInfo)
 	OnContextEvent func(compacted bool, fallback bool, beforeTokens int, afterTokens int)
+}
+
+type ModelRouteInfo struct {
+	ModelID   string
+	Attempts  int
+	Failovers int
 }
 
 // RunAgentStep 执行 Agent 的单步思考
@@ -249,8 +284,8 @@ func RunAgentStepWithOptions(opts StepOptions) (AgentResponse, error) {
 	systemPrompt = fitSystemPrompt(systemPrompt, capabilities.SystemPromptBudgetTokens())
 	requestOverheadTokens := EstimateTextTokens(systemPrompt)
 	if opts.UseNativeTools && config.GlobalConfig.IsOpenAICompatible() {
-		toolContext := recentToolSelectionContext(*history, 12000)
-		if encodedTools, encodeErr := json.Marshal(AgentToolDefinitionsForContext(capabilities.NativeToolLimit, toolContext)); encodeErr == nil {
+		toolMessages := append([]Message{{Role: "system", Content: systemPrompt}}, (*history)...)
+		if encodedTools, encodeErr := json.Marshal(nativeToolDefinitionsForRequest(config.GlobalConfig, toolMessages)); encodeErr == nil {
 			requestOverheadTokens += EstimateTextTokens(string(encodedTools))
 		}
 	}
@@ -276,6 +311,7 @@ func RunAgentStepWithOptions(opts StepOptions) (AgentResponse, error) {
 		{Role: "system", Content: systemPrompt},
 	}
 	messages = append(messages, *history...)
+	messages = PatchDanglingToolCalls(messages)
 
 	llmResult, err := CallLLMWithRetryContext(opts.Context, messages, opts.UseNativeTools, opts.OnStream)
 	if err != nil && isContextLimitError(err) && history != nil {
@@ -286,6 +322,7 @@ func RunAgentStepWithOptions(opts StepOptions) (AgentResponse, error) {
 		truncateHistoryFallbackToBudget(history, maxAnalyzerInt(4, capabilities.KeepRecentMessages/2), opts.PinnedContext, historyBudgetTokens/2)
 		messages = []Message{{Role: "system", Content: systemPrompt}}
 		messages = append(messages, *history...)
+		messages = PatchDanglingToolCalls(messages)
 		if opts.OnContextEvent != nil {
 			opts.OnContextEvent(false, true, before, EstimateMessagesTokens(*history))
 		}
@@ -297,12 +334,33 @@ func RunAgentStepWithOptions(opts StepOptions) (AgentResponse, error) {
 	if opts.OnUsage != nil && llmResult.Usage.HasAny() {
 		opts.OnUsage(llmResult.Usage)
 	}
+	if opts.OnModelRoute != nil {
+		opts.OnModelRoute(ModelRouteInfo{ModelID: llmResult.ModelID, Attempts: llmResult.Attempts, Failovers: llmResult.Failovers})
+	}
 	rawResp := llmResult.Content
 	toolCallArgs := llmResult.ToolCallArgs
+
+	if len(llmResult.ToolCalls) > 1 {
+		allDirectTools := true
+		calls := make([]NativeToolCall, 0, len(llmResult.ToolCalls))
+		for _, call := range llmResult.ToolCalls {
+			if call.Name == "agent_action" {
+				allDirectTools = false
+				break
+			}
+			calls = append(calls, NativeToolCall(call))
+		}
+		if allDirectTools {
+			return AgentResponse{Action: "tool_batch", ReasoningContent: llmResult.ReasoningContent, NativeToolCalls: calls}, nil
+		}
+	}
 
 	if toolCallArgs != "" {
 		resp, perr := ParseNamedToolCall(llmResult.ToolCallName, toolCallArgs)
 		if perr == nil {
+			resp.ToolCallID = llmResult.ToolCallID
+			resp.ToolCallName = llmResult.ToolCallName
+			resp.ReasoningContent = llmResult.ReasoningContent
 			return finalizeResponse(resp), nil
 		}
 		// fallback to JSON content parse
@@ -420,6 +478,34 @@ func RunAgentStepWithOptions(opts StepOptions) (AgentResponse, error) {
 	}
 
 	return finalizeResponse(resp), nil
+}
+
+// PatchDanglingToolCalls inserts explicit failed tool results for calls whose
+// execution was canceled or lost during restore. Strict provider APIs reject
+// histories containing unmatched calls.
+func PatchDanglingToolCalls(messages []Message) []Message {
+	results := make(map[string]bool)
+	for _, message := range messages {
+		if message.Role == "tool" && message.ToolCallID != "" {
+			results[message.ToolCallID] = true
+		}
+	}
+	out := make([]Message, 0, len(messages))
+	for _, message := range messages {
+		out = append(out, message)
+		for _, call := range message.ToolCalls {
+			if call.ID == "" || results[call.ID] {
+				continue
+			}
+			out = append(out, Message{
+				Role:       "tool",
+				Name:       call.Function.Name,
+				ToolCallID: call.ID,
+				Content:    "Tool execution was interrupted before a result was recorded.",
+			})
+		}
+	}
+	return out
 }
 
 func extractClarificationQuestion(raw string) string {

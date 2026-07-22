@@ -41,6 +41,24 @@ type ToolContract struct {
 }
 
 var explicitContracts = map[string]ToolContract{
+	"network_device_baseline": {
+		Args:     []ArgSpec{{Name: "profile", Type: "string", Description: "设备 CLI 类型；auto 使用当前 SSH/Telnet 会话画像", Enum: []string{"auto", "huawei", "h3c", "ruijie", "cisco"}, Example: "auto"}},
+		Examples: []map[string]string{{"profile": "auto"}, {"profile": "huawei"}},
+	},
+	"network_device_diagnose": {
+		Args: []ArgSpec{
+			{Name: "profile", Type: "string", Description: "设备 CLI 类型；auto 使用当前 SSH/Telnet 会话画像", Enum: []string{"auto", "huawei", "h3c", "ruijie", "cisco"}, Example: "auto"},
+			{Name: "focus", Type: "string", Description: "快诊方向", Enum: []string{"overview", "interfaces", "routing", "l2", "logs", "full"}, Example: "routing"},
+		},
+		Examples: []map[string]string{{"profile": "auto", "focus": "interfaces"}, {"profile": "huawei", "focus": "routing"}},
+	},
+	"competition_answer_check": {
+		Args: []ArgSpec{
+			{Name: "task", Type: "string", Description: "原始题干与子要求", Example: "排查核心交换机端口流量异常并给出证据"},
+			{Name: "answer", Type: "string", Required: true, Description: "准备提交的完整答案草稿"},
+		},
+		Examples: []map[string]string{{"task": "排查网络故障", "answer": "【任务状态】...\n【结论】..."}},
+	},
 	"tool_catalog": {
 		Args: []ArgSpec{
 			{Name: "category", Type: "string", Description: "工具分类；不确定时使用 all", Example: "all"},
@@ -126,6 +144,8 @@ var explicitContracts = map[string]ToolContract{
 			{Name: "password", Type: "string", Description: "登录密码（敏感，不会在结果中回显）"},
 			{Name: "key_path", Type: "string", Description: "SSH 私钥路径"},
 			{Name: "prompt", Type: "string", Description: "Telnet prompt 提示符"},
+			{Name: "auth_prompt_regex", Type: "string", Description: "Telnet 认证提示正则，仅匹配密码/令牌提示"},
+			{Name: "device_type", Type: "string", Description: "网络设备类型", Enum: []string{"auto", "huawei", "h3c", "ruijie", "cisco", "linux", "generic"}, Example: "auto"},
 			{Name: "tags", Type: "string", Description: "逗号分隔标签", Example: "prod,web"},
 			{Name: "content", Type: "string", Description: "replace_yaml/import 使用的 YAML 或 JSON 内容"},
 			{Name: "command", Type: "string", Description: "MCP stdio command"},

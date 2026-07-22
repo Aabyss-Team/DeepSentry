@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -75,7 +76,7 @@ func TestManageHistoryContextCancellationDoesNotMutateHistory(t *testing.T) {
 	if compacted || !errors.Is(err, context.Canceled) {
 		t.Fatalf("unexpected cancellation result compacted=%v err=%v", compacted, err)
 	}
-	if len(history) != len(original) || history[0] != original[0] || history[len(history)-1] != original[len(original)-1] {
+	if len(history) != len(original) || !reflect.DeepEqual(history[0], original[0]) || !reflect.DeepEqual(history[len(history)-1], original[len(original)-1]) {
 		t.Fatal("failed/cancelled compaction mutated live history")
 	}
 }
@@ -111,7 +112,7 @@ func TestTruncateHistoryFallbackPreservesGoalAndPinnedClues(t *testing.T) {
 			t.Fatalf("fallback lost %q:\n%s", want, history[0].Content)
 		}
 	}
-	if history[len(history)-1] != last {
+	if !reflect.DeepEqual(history[len(history)-1], last) {
 		t.Fatal("fallback lost latest message")
 	}
 }

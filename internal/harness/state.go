@@ -1,16 +1,24 @@
 package harness
 
-import "sync"
+import (
+	"sort"
+	"sync"
+	"time"
+)
 
 // AgentState 持久化 Agent 运行时状态（对标 DeepAgentState）
 type AgentState struct {
-	Todos        []TodoItem
-	LoadedSkills map[string]string // skill name -> full content
-	Memory       map[string]string // 会话内临时 KV（不落盘）
-	CoreClues    []CoreClue        // 会话级核心线索，checkpoint 持久化并共享给子 Agent
-	WorkspaceDir string            // 工具输出卸载目录
-	SessionID    string            // checkpoint/session id，用于隔离输出卸载文件
-	mu           sync.RWMutex
+	Todos              []TodoItem
+	LoadedSkills       map[string]string // skill name -> full content
+	Memory             map[string]string // 会话内临时 KV（不落盘）
+	CoreClues          []CoreClue        // 会话级核心线索，checkpoint 持久化并共享给子 Agent
+	SelectedTools      map[string]bool   // 当前任务经 tool_search/实际调用验证过的工具
+	PendingToolCalls   map[string]ToolCallRecord
+	CompletedToolCalls map[string]ToolCallRecord
+	Artifacts          []ArtifactRecord
+	WorkspaceDir       string // 工具输出卸载目录
+	SessionID          string // checkpoint/session id，用于隔离输出卸载文件
+	mu                 sync.RWMutex
 }
 
 // NewAgentState 创建初始状态
@@ -20,13 +28,162 @@ func NewAgentState(workspaceDir string) *AgentState {
 
 func NewAgentStateWithSession(workspaceDir, sessionID string) *AgentState {
 	return &AgentState{
-		Todos:        []TodoItem{},
-		LoadedSkills: make(map[string]string),
-		Memory:       make(map[string]string),
-		CoreClues:    []CoreClue{},
-		WorkspaceDir: workspaceDir,
-		SessionID:    sessionID,
+		Todos:              []TodoItem{},
+		LoadedSkills:       make(map[string]string),
+		Memory:             make(map[string]string),
+		CoreClues:          []CoreClue{},
+		SelectedTools:      make(map[string]bool),
+		PendingToolCalls:   make(map[string]ToolCallRecord),
+		CompletedToolCalls: make(map[string]ToolCallRecord),
+		Artifacts:          []ArtifactRecord{},
+		WorkspaceDir:       workspaceDir,
+		SessionID:          sessionID,
 	}
+}
+
+type ToolCallRecord struct {
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	Risk      string    `json:"risk,omitempty"`
+	ArgsHash  string    `json:"args_hash,omitempty"`
+	StartedAt time.Time `json:"started_at,omitempty"`
+	EndedAt   time.Time `json:"ended_at,omitempty"`
+}
+
+type ArtifactRecord struct {
+	Path       string    `json:"path"`
+	SHA256     string    `json:"sha256"`
+	Source     string    `json:"source"`
+	Target     string    `json:"target,omitempty"`
+	Size       int64     `json:"size"`
+	Summary    string    `json:"summary"`
+	RecordedAt time.Time `json:"recorded_at"`
+}
+
+func (s *AgentState) AddArtifact(record ArtifactRecord) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.Artifacts = append(s.Artifacts, record)
+}
+
+func (s *AgentState) MarkSelectedTool(name string) {
+	if s == nil || name == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.SelectedTools == nil {
+		s.SelectedTools = make(map[string]bool)
+	}
+	s.SelectedTools[name] = true
+}
+
+func (s *AgentState) SelectedToolNames() []string {
+	if s == nil {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]string, 0, len(s.SelectedTools))
+	for name := range s.SelectedTools {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (s *AgentState) ToolCallPending(id string) (ToolCallRecord, bool) {
+	if s == nil || id == "" {
+		return ToolCallRecord{}, false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	record, ok := s.PendingToolCalls[id]
+	return record, ok
+}
+
+// PendingMutationByFingerprint detects the same non-idempotent operation even
+// when a provider regenerates a different tool-call ID after resume. A pending
+// modifying call is deliberately not replayed automatically because the
+// process may have crashed after the external side effect but before the
+// completion checkpoint became durable.
+func (s *AgentState) PendingMutationByFingerprint(name, argsHash string) (ToolCallRecord, bool) {
+	if s == nil || name == "" || argsHash == "" {
+		return ToolCallRecord{}, false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, record := range s.PendingToolCalls {
+		if record.Name == name && record.ArgsHash == argsHash && record.Risk != "" && record.Risk != "low" {
+			return record, true
+		}
+	}
+	return ToolCallRecord{}, false
+}
+
+func (s *AgentState) BeginToolCall(record ToolCallRecord) bool {
+	if s == nil || record.ID == "" {
+		return true
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, done := s.CompletedToolCalls[record.ID]; done {
+		return false
+	}
+	if s.PendingToolCalls == nil {
+		s.PendingToolCalls = make(map[string]ToolCallRecord)
+	}
+	record.StartedAt = time.Now().UTC()
+	s.PendingToolCalls[record.ID] = record
+	return true
+}
+
+func (s *AgentState) CompleteToolCall(id string) {
+	if s == nil || id == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	record := s.PendingToolCalls[id]
+	record.ID = id
+	record.EndedAt = time.Now().UTC()
+	delete(s.PendingToolCalls, id)
+	if s.CompletedToolCalls == nil {
+		s.CompletedToolCalls = make(map[string]ToolCallRecord)
+	}
+	s.CompletedToolCalls[id] = record
+}
+
+// FailToolCall releases a failed low-risk/idempotent call so the model may
+// retry it with the same or a regenerated ID. Non-low-risk calls remain
+// pending because a transport error cannot prove that an external mutation
+// did not happen.
+func (s *AgentState) FailToolCall(id string) {
+	if s == nil || id == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	record, ok := s.PendingToolCalls[id]
+	if !ok {
+		return
+	}
+	if record.Risk == "" || record.Risk == "low" {
+		delete(s.PendingToolCalls, id)
+	}
+}
+
+func (s *AgentState) ToolCallCompleted(id string) bool {
+	if s == nil || id == "" {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	_, ok := s.CompletedToolCalls[id]
+	return ok
 }
 
 // SetMemory 写入记忆

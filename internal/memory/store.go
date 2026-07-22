@@ -82,7 +82,9 @@ func NewStore(scope string) (*Store, error) {
 	if err := os.MkdirAll(memDir, 0o700); err != nil {
 		return nil, fmt.Errorf("创建 memory 目录失败: %w", err)
 	}
-	_ = os.Chmod(memDir, 0o700)
+	if err := os.Chmod(memDir, 0o700); err != nil {
+		return nil, fmt.Errorf("收紧 memory 目录权限失败: %w", err)
+	}
 
 	s := &Store{
 		filePath: filepath.Join(memDir, "store.json"),

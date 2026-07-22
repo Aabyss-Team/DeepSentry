@@ -3,6 +3,7 @@ package builtin
 import (
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
@@ -106,6 +107,11 @@ func TestControlledHeadlessBrowserSession(t *testing.T) {
 	if bin, _ := findBrowserBinary(); bin == "" {
 		t.Skip("Chrome/Chromium is not installed in the test environment")
 	}
+	// GitHub-hosted Ubuntu runners disable the user namespaces Chromium needs.
+	// The test only visits the loopback httptest server inside an ephemeral VM.
+	if os.Getenv("CI") != "" {
+		t.Setenv("DEEPSENTRY_BROWSER_NO_SANDBOX", "1")
+	}
 	CloseBrowserSessions()
 	defer CloseBrowserSessions()
 
@@ -143,5 +149,16 @@ func TestControlledHeadlessBrowserSession(t *testing.T) {
 	}
 	if !strings.Contains(out, "Deep Result Page") || !strings.Contains(out, "followed link successfully") {
 		t.Fatalf("follow result missing destination snapshot: %s", out)
+	}
+}
+
+func TestBrowserNoSandboxRequiresExplicitOptIn(t *testing.T) {
+	t.Setenv("DEEPSENTRY_BROWSER_NO_SANDBOX", "")
+	if browserNoSandboxEnabled() {
+		t.Fatal("browser sandbox must be enabled by default")
+	}
+	t.Setenv("DEEPSENTRY_BROWSER_NO_SANDBOX", "true")
+	if !browserNoSandboxEnabled() {
+		t.Fatal("explicit test-container opt-in should disable the browser sandbox")
 	}
 }

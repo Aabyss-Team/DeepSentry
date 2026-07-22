@@ -1,6 +1,7 @@
 package builtin
 
 import (
+	"ai-edr/internal/config"
 	"bufio"
 	"bytes"
 	"encoding/binary"
@@ -24,7 +25,7 @@ func ServiceFingerprint(rt Runtime, host, port string, timeoutSec int) (string, 
 		timeoutSec = 3
 	}
 	addr := net.JoinHostPort(host, strconv.Itoa(p))
-	conn, err := net.DialTimeout("tcp", addr, time.Duration(timeoutSec)*time.Second)
+	conn, err := config.ControllerDialTimeout("tcp", addr, time.Duration(timeoutSec)*time.Second)
 	if err != nil {
 		return "", err
 	}
@@ -167,7 +168,7 @@ func dialHostPort(host, port string, timeoutSec int) (net.Conn, error) {
 	if timeoutSec <= 0 {
 		timeoutSec = 3
 	}
-	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(p)), time.Duration(timeoutSec)*time.Second)
+	conn, err := config.ControllerDialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(p)), time.Duration(timeoutSec)*time.Second)
 	if err != nil {
 		return nil, err
 	}

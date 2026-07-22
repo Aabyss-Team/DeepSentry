@@ -7,16 +7,16 @@ require (
 	github.com/google/gopacket v1.1.19
 	github.com/pkg/sftp v1.13.10
 	github.com/spf13/viper v1.21.0
-	golang.org/x/crypto v0.52.0
-	golang.org/x/sys v0.45.0
-	golang.org/x/text v0.37.0
+	golang.org/x/crypto v0.53.0
+	golang.org/x/sys v0.46.0
+	golang.org/x/text v0.40.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
 	github.com/chromedp/chromedp v0.14.2
 	github.com/modelcontextprotocol/go-sdk v1.6.1
-	golang.org/x/net v0.54.0
+	golang.org/x/net v0.56.0
 )
 
 require (
@@ -56,7 +56,7 @@ require (
 	github.com/mgutz/ansi v0.0.0-20170206155736-9520e82c474b // indirect
 	github.com/muesli/ansi v0.0.0-20230316100256-276c6243b2f6 // indirect
 	github.com/muesli/cancelreader v0.2.2 // indirect
-	github.com/muesli/termenv v0.16.0 // indirect
+	github.com/muesli/termenv v0.16.0
 	github.com/pelletier/go-toml/v2 v2.2.4 // indirect
 	github.com/rivo/uniseg v0.4.7
 	github.com/sagikazarmark/locafero v0.11.0 // indirect
@@ -67,6 +67,6 @@ require (
 	github.com/subosito/gotenv v1.6.0 // indirect
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
 	go.yaml.in/yaml/v3 v3.0.4 // indirect
-	golang.org/x/sync v0.20.0 // indirect
-	golang.org/x/term v0.43.0
+	golang.org/x/sync v0.22.0 // indirect
+	golang.org/x/term v0.44.0
 )

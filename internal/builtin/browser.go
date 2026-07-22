@@ -241,7 +241,9 @@ func captureBrowserScreenshot(bin, u string, waitMs int) (string, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
-	_ = os.Chmod(dir, 0o700)
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return "", err
+	}
 	sum := sha256.Sum256([]byte(u + time.Now().Format(time.RFC3339Nano)))
 	path := filepath.Join(dir, "browser_"+hex.EncodeToString(sum[:])[:12]+".png")
 	ctx, cancel := context.WithTimeout(context.Background(), browserTimeout())

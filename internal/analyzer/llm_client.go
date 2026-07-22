@@ -12,6 +12,7 @@ import (
 	"io"
 	"math/big"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -19,11 +20,33 @@ import (
 
 // LLMResult LLM 调用结果
 type LLMResult struct {
-	Content      string
-	ToolCallName string
-	ToolCallArgs string
-	Usage        TokenUsage
+	Content string
+	// ReasoningContent must be preserved on assistant tool-call messages for
+	// thinking-mode OpenAI-compatible providers that validate the next turn.
+	ReasoningContent string
+	ToolCallName     string
+	ToolCallArgs     string
+	ToolCallID       string
+	ToolCalls        []LLMToolCall
+	Usage            TokenUsage
+	ModelID          string
+	Attempts         int
+	Failovers        int
 }
+
+type LLMToolCall struct {
+	ID        string
+	Name      string
+	Arguments string
+}
+
+type PartialStreamError struct {
+	Result LLMResult
+	Err    error
+}
+
+func (e *PartialStreamError) Error() string { return "partial stream response: " + e.Err.Error() }
+func (e *PartialStreamError) Unwrap() error { return e.Err }
 
 type TokenUsage struct {
 	PromptTokens     int `json:"prompt_tokens,omitempty"`
@@ -44,56 +67,113 @@ func CallLLMWithRetryContext(ctx context.Context, messages []Message, useNativeT
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	cfg := config.GlobalConfig
-	retries := cfg.EffectiveLLMRetries()
+	baseCfg := config.GlobalConfig
+	models := baseCfg.EffectiveModels()
 	var lastErr error
+	totalAttempts := 0
+	for modelIndex, model := range models {
+		cfg := baseCfg.ConfigForModel(model)
+		retries := model.MaxRetries
+		for attempt := 0; attempt <= retries; attempt++ {
+			totalAttempts++
+			if attempt > 0 {
+				timer := time.NewTimer(llmRetryDelay(attempt))
+				select {
+				case <-timer.C:
+				case <-ctx.Done():
+					timer.Stop()
+					return LLMResult{}, ctx.Err()
+				}
+			}
 
-	for attempt := 0; attempt <= retries; attempt++ {
-		if attempt > 0 {
-			timer := time.NewTimer(llmRetryDelay(attempt))
-			select {
-			case <-timer.C:
-			case <-ctx.Done():
-				timer.Stop()
+			result, err := callLLMOnce(ctx, cfg, messages, useNativeTools, onStream)
+			if err == nil {
+				result.ModelID = model.ID
+				result.Attempts = totalAttempts
+				result.Failovers = modelIndex
+				return result, nil
+			}
+			lastErr = err
+			if ctx.Err() != nil {
 				return LLMResult{}, ctx.Err()
 			}
-		}
-
-		native := useNativeTools && cfg.IsOpenAICompatible()
-		var result LLMResult
-		var err error
-
-		// TUI 等场景：有 onStream 时优先 JSON + SSE 流式
-		if onStream != nil && cfg.IsOpenAICompatible() {
-			result, err = callOpenAICompatible(ctx, cfg, messages, false, onStream)
-			if err != nil && isStreamUnsupported(err) {
-				result, err = callOpenAICompatible(ctx, cfg, messages, false, nil)
+			if !isRetryable(err) {
+				break
 			}
-		} else if cfg.IsAnthropic() {
-			result, err = callAnthropic(ctx, cfg, messages)
-		} else if cfg.IsOpenAIResponses() {
-			result, err = callOpenAIResponses(ctx, cfg, messages)
-		} else if native {
-			result, err = callOpenAICompatible(ctx, cfg, messages, true, nil)
-			if err != nil && isToolsUnsupported(err) {
-				result, err = callOpenAICompatible(ctx, cfg, messages, false, onStream)
-			}
-		} else {
-			result, err = callOpenAICompatible(ctx, cfg, messages, false, nil)
 		}
-
-		if err == nil {
-			return result, nil
-		}
-		lastErr = err
-		if ctx.Err() != nil {
-			return LLMResult{}, ctx.Err()
-		}
-		if !isRetryable(err) {
+		if modelIndex+1 >= len(models) || !shouldFailover(baseCfg, lastErr) {
 			break
 		}
 	}
-	return LLMResult{}, fmt.Errorf("LLM 调用失败(已重试 %d 次): %w", retries, lastErr)
+	return LLMResult{}, fmt.Errorf("LLM 调用失败(总尝试 %d 次): %w", totalAttempts, lastErr)
+}
+
+func callLLMOnce(ctx context.Context, cfg config.Config, messages []Message, useNativeTools bool, onStream func(string)) (LLMResult, error) {
+	native := useNativeTools && cfg.IsOpenAICompatible()
+	if cfg.IsAnthropic() {
+		return callAnthropic(ctx, cfg, messages)
+	}
+	if cfg.IsOpenAIResponses() {
+		return callOpenAIResponses(ctx, cfg, messages)
+	}
+	if native {
+		result, err := callOpenAICompatible(ctx, cfg, messages, true, onStream)
+		if err != nil && isStreamUnsupported(err) && onStream != nil {
+			result, err = callOpenAICompatible(ctx, cfg, messages, true, nil)
+		}
+		if err != nil && isToolsUnsupported(err) {
+			return callOpenAICompatible(ctx, cfg, messages, false, onStream)
+		}
+		return result, err
+	}
+	if onStream != nil && cfg.IsOpenAICompatible() {
+		result, err := callOpenAICompatible(ctx, cfg, messages, false, onStream)
+		if err != nil && isStreamUnsupported(err) {
+			return callOpenAICompatible(ctx, cfg, messages, false, nil)
+		}
+		return result, err
+	}
+	return callOpenAICompatible(ctx, cfg, messages, false, nil)
+}
+
+func shouldFailover(cfg config.Config, err error) bool {
+	kind := classifyLLMError(err)
+	if len(cfg.ModelRouting.FailoverOn) == 0 {
+		return kind == "rate_limit" || kind == "timeout" || kind == "server_error" || kind == "connection" || kind == "invalid_output"
+	}
+	for _, allowed := range cfg.ModelRouting.FailoverOn {
+		if strings.EqualFold(strings.TrimSpace(allowed), kind) {
+			return true
+		}
+	}
+	return false
+}
+
+func classifyLLMError(err error) string {
+	if err == nil {
+		return ""
+	}
+	if errors.Is(err, context.Canceled) {
+		return "canceled"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timeout"
+	}
+	s := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(s, "429"), strings.Contains(s, "rate limit"):
+		return "rate_limit"
+	case strings.Contains(s, "500"), strings.Contains(s, "502"), strings.Contains(s, "503"), strings.Contains(s, "504"):
+		return "server_error"
+	case strings.Contains(s, "timeout"), strings.Contains(s, "deadline"):
+		return "timeout"
+	case strings.Contains(s, "connection reset"), strings.Contains(s, "eof"), strings.Contains(s, "broken pipe"):
+		return "connection"
+	case strings.Contains(s, "parse"), strings.Contains(s, "empty response"):
+		return "invalid_output"
+	default:
+		return "unknown"
+	}
 }
 
 // llmRetryDelay 使并发 Agent 的重试错开，避免限流期间在整秒上同时再次冲击供应商。
@@ -258,7 +338,7 @@ func isMaxTokensUnsupported(err error) bool {
 
 func callOpenAICompatible(ctx context.Context, cfg config.Config, messages []Message, withTools bool, onStream func(string)) (LLMResult, error) {
 	url := config.NormalizeChatURL(cfg.ApiURL)
-	useStream := onStream != nil && !withTools
+	useStream := onStream != nil
 	reqBody := ChatRequest{
 		Model:       cfg.ModelName,
 		Messages:    messages,
@@ -267,8 +347,7 @@ func callOpenAICompatible(ctx context.Context, cfg config.Config, messages []Mes
 		MaxTokens:   cfg.EffectiveModelCapabilities().ReservedOutputTokens,
 	}
 	if withTools {
-		capabilities := cfg.EffectiveModelCapabilities()
-		reqBody.Tools = AgentToolDefinitionsForContext(capabilities.NativeToolLimit, recentToolSelectionContext(messages, 12000))
+		reqBody.Tools = nativeToolDefinitionsForRequest(cfg, messages)
 		// auto lets the model select a strongly typed built-in function, while
 		// agent_action remains available for shell/file/task/finish actions.
 		reqBody.ToolChoice = "auto"
@@ -315,17 +394,81 @@ func callOpenAICompatible(ctx context.Context, cfg config.Config, messages []Mes
 	}
 	msg := chatResp.Choices[0].Message
 	if len(msg.ToolCalls) > 0 {
-		return LLMResult{Content: msg.Content, ToolCallName: msg.ToolCalls[0].Function.Name, ToolCallArgs: msg.ToolCalls[0].Function.Arguments, Usage: chatResp.Usage}, nil
+		calls := make([]LLMToolCall, 0, len(msg.ToolCalls))
+		for _, call := range msg.ToolCalls {
+			calls = append(calls, LLMToolCall{ID: call.ID, Name: call.Function.Name, Arguments: call.Function.Arguments})
+		}
+		return LLMResult{Content: msg.Content, ReasoningContent: msg.ReasoningContent, ToolCallID: calls[0].ID, ToolCallName: calls[0].Name, ToolCallArgs: calls[0].Arguments, ToolCalls: calls, Usage: chatResp.Usage}, nil
 	}
-	return LLMResult{Content: msg.Content, Usage: chatResp.Usage}, nil
+	return LLMResult{Content: msg.Content, ReasoningContent: msg.ReasoningContent, Usage: chatResp.Usage}, nil
+}
+
+const runtimeV3DeferredToolLimit = 16
+
+func nativeToolDefinitionsForRequest(cfg config.Config, messages []Message) []ToolDefinition {
+	capabilities := cfg.EffectiveModelCapabilities()
+	contextText := recentToolSelectionContext(messages, 12000)
+	if cfg.EffectiveAgentRuntime() != "v3" {
+		return AgentToolDefinitionsForContext(capabilities.NativeToolLimit, contextText)
+	}
+	limit := capabilities.NativeToolLimit
+	if limit <= 0 {
+		// A large context window is not a reason to resend every tool schema.
+		// Keep a small goal-ranked candidate set so models without native
+		// deferred-tool APIs can still complete common tasks in one turn.
+		limit = runtimeV3DeferredToolLimit
+	}
+	return AgentToolDefinitionsForContextWithPinned(limit, contextText, pinnedNativeToolNames(messages))
+}
+
+func pinnedNativeToolNames(messages []Message) []string {
+	known := make(map[string]bool)
+	allNames := AgentToolDefinitionsForContext(0, "")
+	for _, definition := range allNames {
+		known[definition.Function.Name] = true
+	}
+	selected := make(map[string]bool)
+	for _, message := range messages {
+		if message.Role == "tool" && known[message.Name] && message.Name != "tool_catalog" && message.Name != "agent_action" {
+			selected[message.Name] = true
+		}
+		if message.Role != "system" {
+			continue
+		}
+		const marker = "【本任务已验证工具】"
+		for _, line := range strings.Split(message.Content, "\n") {
+			index := strings.Index(line, marker)
+			if index < 0 {
+				continue
+			}
+			list := line[index+len(marker):]
+			if colon := strings.IndexAny(list, ":："); colon >= 0 {
+				list = list[colon+1:]
+			}
+			for _, name := range strings.Split(list, ",") {
+				name = strings.TrimSpace(name)
+				if known[name] && name != "tool_catalog" && name != "agent_action" {
+					selected[name] = true
+				}
+			}
+		}
+	}
+	out := make([]string, 0, len(selected))
+	for name := range selected {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
 }
 
 type streamChunk struct {
 	Choices []struct {
 		Delta struct {
-			Content   string `json:"content"`
-			ToolCalls []struct {
-				Index    int `json:"index"`
+			Content          string `json:"content"`
+			ReasoningContent string `json:"reasoning_content,omitempty"`
+			ToolCalls        []struct {
+				Index    int    `json:"index"`
+				ID       string `json:"id"`
 				Function struct {
 					Name      string `json:"name"`
 					Arguments string `json:"arguments"`
@@ -363,7 +506,15 @@ func callOpenAICompatibleStream(ctx context.Context, url string, cfg config.Conf
 	}
 
 	var content strings.Builder
+	var reasoningContent strings.Builder
+	type toolCallBuilder struct {
+		id   strings.Builder
+		name strings.Builder
+		args strings.Builder
+	}
+	toolBuilders := make(map[int]*toolCallBuilder)
 	var usage TokenUsage
+	var partialErr error
 	maxResponseBytes := maxLLMResponseBytes(cfg)
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
@@ -381,6 +532,7 @@ func callOpenAICompatibleStream(ctx context.Context, url string, cfg config.Conf
 		}
 		var chunk streamChunk
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			partialErr = fmt.Errorf("invalid SSE JSON: %w", err)
 			continue
 		}
 		if chunk.Usage.HasAny() {
@@ -389,23 +541,63 @@ func callOpenAICompatibleStream(ctx context.Context, url string, cfg config.Conf
 		if len(chunk.Choices) == 0 {
 			continue
 		}
-		delta := chunk.Choices[0].Delta.Content
-		if delta == "" {
-			continue
+		choice := chunk.Choices[0]
+		if choice.Delta.ReasoningContent != "" {
+			reasoningContent.WriteString(choice.Delta.ReasoningContent)
 		}
-		if int64(content.Len()+len(delta)) > maxResponseBytes {
+		for _, call := range choice.Delta.ToolCalls {
+			builder := toolBuilders[call.Index]
+			if builder == nil {
+				builder = &toolCallBuilder{}
+				toolBuilders[call.Index] = builder
+			}
+			builder.id.WriteString(call.ID)
+			builder.name.WriteString(call.Function.Name)
+			builder.args.WriteString(call.Function.Arguments)
+		}
+		delta := choice.Delta.Content
+		toolBytes := 0
+		for _, builder := range toolBuilders {
+			toolBytes += builder.id.Len() + builder.name.Len() + builder.args.Len()
+		}
+		if int64(content.Len()+reasoningContent.Len()+len(delta)+toolBytes) > maxResponseBytes {
 			return LLMResult{}, fmt.Errorf("LLM 流式响应超过上限 %d 字节", maxResponseBytes)
 		}
-		content.WriteString(delta)
-		onStream(delta)
+		if delta != "" {
+			content.WriteString(delta)
+			onStream(delta)
+		}
 	}
 	if err := scanner.Err(); err != nil {
-		return LLMResult{}, fmt.Errorf("stream read error: %w", err)
+		partialErr = fmt.Errorf("stream read error: %w", err)
 	}
-	if content.Len() == 0 {
+	if content.Len() == 0 && len(toolBuilders) == 0 {
 		return LLMResult{}, errors.New("empty stream response")
 	}
-	return LLMResult{Content: content.String(), Usage: usage}, nil
+	indexes := make([]int, 0, len(toolBuilders))
+	for index := range toolBuilders {
+		indexes = append(indexes, index)
+	}
+	sort.Ints(indexes)
+	calls := make([]LLMToolCall, 0, len(indexes))
+	for _, index := range indexes {
+		builder := toolBuilders[index]
+		call := LLMToolCall{ID: builder.id.String(), Name: builder.name.String(), Arguments: builder.args.String()}
+		if strings.TrimSpace(call.Arguments) != "" && !json.Valid([]byte(call.Arguments)) {
+			partialErr = fmt.Errorf("invalid JSON tool arguments for %s", call.Name)
+		}
+		calls = append(calls, call)
+	}
+	result := LLMResult{Content: content.String(), ReasoningContent: reasoningContent.String(), ToolCalls: calls, Usage: usage}
+	if len(calls) > 0 {
+		result.ToolCallID = calls[0].ID
+		result.ToolCallName = calls[0].Name
+		result.ToolCallArgs = calls[0].Arguments
+	}
+	if partialErr != nil {
+		return result, &PartialStreamError{Result: result, Err: partialErr}
+	}
+	return result, nil
 }
 
 type anthropicRequest struct {
@@ -444,7 +636,19 @@ func callAnthropic(ctx context.Context, cfg config.Config, messages []Message) (
 			system.WriteString(m.Content)
 			system.WriteString("\n")
 		case "user", "assistant":
-			msgs = append(msgs, anthropicMessage(m))
+			content := m.Content
+			if len(m.ToolCalls) > 0 {
+				var calls []string
+				for _, call := range m.ToolCalls {
+					calls = append(calls, fmt.Sprintf("%s(%s)", call.Function.Name, call.Function.Arguments))
+				}
+				content = "Tool calls requested: " + strings.Join(calls, ", ")
+			}
+			if strings.TrimSpace(content) != "" {
+				msgs = append(msgs, anthropicMessage{Role: m.Role, Content: content})
+			}
+		case "tool":
+			msgs = append(msgs, anthropicMessage{Role: "user", Content: fmt.Sprintf("Tool result [%s, call_id=%s]:\n%s", m.Name, m.ToolCallID, m.Content)})
 		}
 	}
 	if len(msgs) == 0 {
@@ -587,10 +791,10 @@ func readLimitedResponseBody(r io.Reader, limit int64) ([]byte, error) {
 }
 
 func effectiveTemperature(cfg config.Config) float64 {
-	if cfg.Temperature > 0 {
-		return cfg.Temperature
-	}
-	return 0.1
+	// Zero is a valid and intentional value for operational/benchmark
+	// determinism. The old fallback silently turned temperature: 0.0 into 0.1,
+	// causing identical Runtime A/B prompts to select different tools.
+	return cfg.Temperature
 }
 
 func truncateStr(s string, max int) string {

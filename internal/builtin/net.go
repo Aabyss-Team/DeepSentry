@@ -55,7 +55,7 @@ func Ping(rt Runtime, host string, count int) (string, error) {
 func tcpReachable(host string, ports []int, timeout time.Duration) (bool, int) {
 	for _, port := range ports {
 		addr := net.JoinHostPort(host, strconv.Itoa(port))
-		conn, err := net.DialTimeout("tcp", addr, timeout)
+		conn, err := config.ControllerDialTimeout("tcp", addr, timeout)
 		if err == nil {
 			conn.Close()
 			return true, port
@@ -198,7 +198,7 @@ func TCPProbe(rt Runtime, host, port string, timeoutSec int) (string, error) {
 
 	addr := net.JoinHostPort(host, strconv.Itoa(p))
 	start := time.Now()
-	conn, err := net.DialTimeout("tcp", addr, time.Duration(timeoutSec)*time.Second)
+	conn, err := config.ControllerDialTimeout("tcp", addr, time.Duration(timeoutSec)*time.Second)
 	elapsed := time.Since(start)
 
 	var b strings.Builder
@@ -254,7 +254,7 @@ func PortScan(rt Runtime, host, portsSpec, mode string) (string, error) {
 			defer func() { <-sem }()
 			addr := net.JoinHostPort(host, strconv.Itoa(p))
 			start := time.Now()
-			conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+			conn, err := config.ControllerDialTimeout("tcp", addr, 2*time.Second)
 			elapsed := time.Since(start)
 			open := err == nil
 			if open {

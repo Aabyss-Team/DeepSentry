@@ -2,7 +2,9 @@ package harness
 
 import (
 	"ai-edr/internal/analyzer"
+	"ai-edr/internal/config"
 	"ai-edr/internal/security"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -10,17 +12,26 @@ import (
 	"regexp"
 	"runtime"
 	"sort"
+	"strings"
 	"time"
 )
 
 // CheckpointData 会话 checkpoint 快照
+const currentCheckpointSchemaVersion = 3
+
 type CheckpointData struct {
-	SessionID string             `json:"session_id"`
-	StepNum   int                `json:"step_num"`
-	UserGoal  string             `json:"user_goal,omitempty"`
-	State     *AgentState        `json:"state"`
-	History   []analyzer.Message `json:"history"`
-	SavedAt   time.Time          `json:"saved_at"`
+	SchemaVersion   int                `json:"schema_version"`
+	RuntimeVersion  string             `json:"runtime_version,omitempty"`
+	RunID           string             `json:"run_id,omitempty"`
+	TurnID          string             `json:"turn_id,omitempty"`
+	EventCursor     int64              `json:"event_cursor,omitempty"`
+	SessionID       string             `json:"session_id"`
+	StepNum         int                `json:"step_num"`
+	UserGoal        string             `json:"user_goal,omitempty"`
+	State           *AgentState        `json:"state"`
+	History         []analyzer.Message `json:"history"`
+	SavedAt         time.Time          `json:"saved_at"`
+	IntegritySHA256 string             `json:"integrity_sha256,omitempty"`
 }
 
 // CheckpointStore checkpoint 持久化
@@ -51,7 +62,9 @@ func NewCheckpointStore(sessionID string) (*CheckpointStore, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	_ = os.Chmod(dir, 0o700)
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return nil, err
+	}
 	return &CheckpointStore{dir: dir, sessionID: sessionID}, nil
 }
 
@@ -62,9 +75,22 @@ func (c *CheckpointStore) SessionDir() string {
 
 // Save 保存 checkpoint
 func (c *CheckpointStore) Save(data CheckpointData) error {
+	if data.SchemaVersion == 0 {
+		data.SchemaVersion = currentCheckpointSchemaVersion
+	}
+	if data.RuntimeVersion == "" {
+		data.RuntimeVersion = config.GlobalConfig.EffectiveAgentRuntime()
+	}
 	data.SessionID = c.sessionID
-	data.SavedAt = time.Now()
+	data.SavedAt = time.Now().UTC()
+	data.IntegritySHA256 = ""
 	raw, err := security.RedactJSON(data)
+	if err != nil {
+		return err
+	}
+	sum := sha256.Sum256(raw)
+	data.IntegritySHA256 = fmt.Sprintf("%x", sum[:])
+	raw, err = security.RedactJSON(data)
 	if err != nil {
 		return err
 	}
@@ -89,7 +115,23 @@ func (c *CheckpointStore) Save(data CheckpointData) error {
 	if err := tmpFile.Close(); err != nil {
 		return err
 	}
-	return replaceCheckpointFile(tmp, filepath.Join(c.dir, "checkpoint.json"))
+	return rotateCheckpointFile(tmp, filepath.Join(c.dir, "checkpoint.json"), filepath.Join(c.dir, "checkpoint.prev.json"))
+}
+
+func rotateCheckpointFile(src, dst, previous string) error {
+	if _, err := os.Stat(dst); err == nil {
+		if runtime.GOOS == "windows" {
+			_ = os.Remove(previous)
+		}
+		if err := os.Rename(dst, previous); err != nil {
+			return err
+		}
+	}
+	if err := replaceCheckpointFile(src, dst); err != nil {
+		_ = os.Rename(previous, dst)
+		return err
+	}
+	return nil
 }
 
 func replaceCheckpointFile(src, dst string) error {
@@ -119,9 +161,49 @@ func LoadCheckpoint(sessionID string) (*CheckpointData, error) {
 	if err != nil {
 		return nil, fmt.Errorf("无法加载会话 %s: %w", sessionID, err)
 	}
+	data, err := decodeCheckpoint(raw)
+	if err != nil {
+		previous := filepath.Join(filepath.Dir(path), "checkpoint.prev.json")
+		if priorRaw, priorErr := os.ReadFile(previous); priorErr == nil {
+			if prior, priorErr := decodeCheckpoint(priorRaw); priorErr == nil {
+				initializeCheckpointState(prior)
+				return prior, nil
+			}
+		}
+		return nil, err
+	}
+	initializeCheckpointState(data)
+	return data, nil
+}
+
+func decodeCheckpoint(raw []byte) (*CheckpointData, error) {
 	var data CheckpointData
 	if err := json.Unmarshal(raw, &data); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("checkpoint JSON 损坏: %w", err)
+	}
+	if data.IntegritySHA256 != "" {
+		want := data.IntegritySHA256
+		data.IntegritySHA256 = ""
+		canonical, err := security.RedactJSON(data)
+		if err != nil {
+			return nil, err
+		}
+		got := sha256.Sum256(canonical)
+		if fmt.Sprintf("%x", got[:]) != want {
+			return nil, fmt.Errorf("checkpoint 完整性校验失败")
+		}
+		data.IntegritySHA256 = want
+	}
+	if data.SchemaVersion == 0 {
+		data.SchemaVersion = 1
+	}
+	return &data, nil
+}
+
+func initializeCheckpointState(data *CheckpointData) {
+	legacyBoundary := data.SchemaVersion < currentCheckpointSchemaVersion
+	if strings.TrimSpace(data.RuntimeVersion) == "" {
+		data.RuntimeVersion = "legacy"
 	}
 	if data.State == nil {
 		data.State = NewAgentState("")
@@ -135,7 +217,28 @@ func LoadCheckpoint(sessionID string) (*CheckpointData, error) {
 	if data.State.CoreClues == nil {
 		data.State.CoreClues = []CoreClue{}
 	}
-	return &data, nil
+	if data.State.SelectedTools == nil {
+		data.State.SelectedTools = make(map[string]bool)
+	}
+	if data.State.PendingToolCalls == nil {
+		data.State.PendingToolCalls = make(map[string]ToolCallRecord)
+	}
+	if data.State.CompletedToolCalls == nil {
+		data.State.CompletedToolCalls = make(map[string]ToolCallRecord)
+	}
+	if data.State.Artifacts == nil {
+		data.State.Artifacts = []ArtifactRecord{}
+	}
+	if legacyBoundary {
+		// Schema v1/v2 had no durable per-tool safe point. Resume only at the
+		// saved turn boundary instead of trusting fields an old writer could not
+		// have committed atomically.
+		data.RunID = ""
+		data.TurnID = ""
+		data.EventCursor = 0
+		data.State.PendingToolCalls = make(map[string]ToolCallRecord)
+		data.State.CompletedToolCalls = make(map[string]ToolCallRecord)
+	}
 }
 
 // ListSessions 列出可恢复的会话 ID
