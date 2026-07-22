@@ -38,11 +38,14 @@ import (
 )
 
 func main() {
+	os.Exit(runCLI())
+}
+
+func runCLI() (exitCode int) {
 	// 1. 跨平台控制台初始化
 	enableWindowsANSI()
-	defer ui.ResetTerminalState()
-	defer mcp.CloseAll()
-	defer builtin.CloseBrowserSessions()
+	defer boundedCleanup("MCP", 2*time.Second, mcp.CloseAll)
+	defer boundedCleanup("浏览器会话", 2*time.Second, builtin.CloseBrowserSessions)
 
 	// 🟢 [核心增强] 强制设置 Windows 控制台代码页为 UTF-8
 	// 这解决了即便开启了 ANSI 渲染，底层系统命令输出依然可能坚持使用 GBK 的问题
@@ -78,6 +81,9 @@ func main() {
 	showHelpLong := flag.Bool("help", false, "显示帮助")
 	flag.Usage = printUsage
 	flag.Parse()
+	if os.Getenv("DEEPSENTRY_WEBSHELL_SUPERVISOR") == "1" {
+		return runWebShellSupervisor()
+	}
 	if _, ok := tui.NormalizeTerminalTheme(*themeFlag); !ok {
 		fmt.Printf("%s--theme 只支持 auto|dark|light，当前为 %q\n", ui.Prefix("❌", "[ERR]"), *themeFlag)
 		ui.Exit(1)
@@ -103,11 +109,21 @@ func main() {
 		*tuiMode = false
 	}
 	interactiveTerminal := isInteractiveTerminal()
-	nonInteractive := *jsonOutput || *quiet || !interactiveTerminal
+	explicitOneShot := strings.TrimSpace(*taskFlag) != "" || strings.TrimSpace(*taskShort) != "" || len(flag.Args()) > 0 || strings.TrimSpace(*resumeSession) != ""
+	// --no-tui with an explicit task is primarily a one-shot automation mode.
+	// WebShell/SFTP clients often allocate a pseudo-TTY, but that must not make
+	// ask_user or high-risk confirmations wait forever on stdin.
+	nonInteractive := resolvedNonInteractive(*jsonOutput, *quiet, interactiveTerminal, *noTUI, explicitOneShot)
 	if nonInteractive && !flagWasPassed("tui") {
 		*tuiMode = false
 	}
 	*tuiMode = resolvedTUIMode(*tuiMode, *noTUI, nonInteractive, flagWasPassed("tui"), interactiveTerminal)
+	// Only modes that actually render a TUI or run an interactive survey need
+	// terminal restoration.  Emitting alternate-screen reset sequences from a
+	// one-shot/WebShell process can corrupt the final shell prompt.
+	if *tuiMode || (interactiveTerminal && !nonInteractive) {
+		defer ui.ResetTerminalState()
+	}
 
 	if *showHelp || *showHelpLong {
 		printUsage()
@@ -324,13 +340,13 @@ func main() {
 	}
 
 	if *webshellMode && os.Getenv("DEEPSENTRY_WEBSHELL_CHILD") != "1" {
-		reportPath, progressPath, latestPath, err := launchDetachedWebShell(logger.TitleFromHistory(history))
+		reportPath, progressPath, statusPath, latestPath, err := launchDetachedWebShell(logger.TitleFromHistory(history))
 		if err != nil {
 			fmt.Printf("[WEB] 后台任务启动失败: %v\n", err)
 			ui.Exit(1)
 			return
 		}
-		printWebShellDetachedNotice(reportPath, progressPath, latestPath)
+		printWebShellDetachedNotice(reportPath, progressPath, statusPath, latestPath)
 		return
 	}
 
@@ -427,7 +443,11 @@ func main() {
 		emitInitFailure(*jsonOutput, "executor_init_failed", fmt.Sprintf("初始化执行环境失败: %v", err))
 		ui.Exit(1)
 	}
-	defer executor.Current.Close()
+	defer func() {
+		if executor.Current != nil {
+			boundedCleanup("执行器连接", 2*time.Second, executor.Current.Close)
+		}
+	}()
 
 	// Batch mode can approve destructive actions. Require an explicit -y in
 	// non-interactive environments, and ask once before starting any background
@@ -458,7 +478,10 @@ func main() {
 		waitForSignal()
 		return
 	}
-	if config.GlobalConfig.SchedulerEnabled {
+	// A one-shot/no-TUI/WebShell invocation must not race a background scheduler
+	// against process shutdown.  Use explicit --scheduler for headless service
+	// mode; interactive/TUI sessions may still host the convenience scheduler.
+	if config.GlobalConfig.SchedulerEnabled && !nonInteractive {
 		schedRunner.Start(schedCtx, schedulerInterval())
 		if *tuiMode {
 			startup.Notices = append(startup.Notices, fmt.Sprintf("定时任务调度已启用：%s", schedRunner.Store.Path))
@@ -590,6 +613,12 @@ func main() {
 	confirmFn := func(action *harness.AgentAction) bool {
 		confirmationMu.Lock()
 		defer confirmationMu.Unlock()
+		if nonInteractive {
+			// A one-shot process has no reliable confirmation channel.  Batch -y
+			// bypasses this callback; all other high-risk actions fail closed.
+			fmt.Fprintln(os.Stderr, ui.Prefix("🚫", "[DENY]")+"非交互任务已拒绝需要人工确认的操作；如已授权无人值守执行，请显式使用 --batch -y。")
+			return false
+		}
 		scopeKey, scopeLabel := action.ApprovalScopeKey, action.ApprovalScopeLabel
 		if scopeKey == "" {
 			scopeKey, scopeLabel = harness.SessionApprovalScope(action)
@@ -703,10 +732,15 @@ func main() {
 	runCtx, stopRunSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopRunSignals()
 	loopCfg.Stop = runCtx.Done()
-	agent.RunLoop(loopCfg)
+	runResult := agent.RunLoop(loopCfg)
 	if !*jsonOutput && !*quiet {
+		fmt.Printf("%s任务结束: status=%s step=%d reason=%s\n", ui.Prefix("⏹️", "[DONE]"), runResult.Status, runResult.Step, runResult.Reason)
 		printExitHint()
 	}
+	if !runResult.Successful() {
+		return 2
+	}
+	return 0
 }
 
 func flagWasPassed(name string) bool {
@@ -738,6 +772,10 @@ func resolvedTUIMode(requested, noTUI, nonInteractive, explicitTUI, interactiveT
 	return true
 }
 
+func resolvedNonInteractive(jsonOutput, quiet, interactiveTerminal, noTUI, explicitOneShot bool) bool {
+	return jsonOutput || quiet || !interactiveTerminal || (noTUI && explicitOneShot)
+}
+
 func batchApprovalRequirement(batchMode, autoYes, interactiveTerminal bool) (bool, error) {
 	if !batchMode || autoYes {
 		return false, nil
@@ -764,42 +802,79 @@ func emitInitFailure(jsonOutput bool, code, message string) {
 	fmt.Printf("%s%s\n", ui.Prefix("❌", "[ERR]"), message)
 }
 
-func launchDetachedWebShell(title string) (string, string, string, error) {
+type webShellTaskStatus struct {
+	SchemaVersion int    `json:"schema_version"`
+	Status        string `json:"status"`
+	SupervisorPID int    `json:"supervisor_pid,omitempty"`
+	WorkerPID     int    `json:"worker_pid,omitempty"`
+	ReportPath    string `json:"report_path"`
+	ProgressPath  string `json:"progress_path"`
+	StatusPath    string `json:"status_path"`
+	QueuedAt      string `json:"queued_at"`
+	StartedAt     string `json:"started_at,omitempty"`
+	FinishedAt    string `json:"finished_at,omitempty"`
+	ExitCode      *int   `json:"exit_code,omitempty"`
+	Error         string `json:"error,omitempty"`
+}
+
+func launchDetachedWebShell(title string) (string, string, string, string, error) {
 	if err := os.MkdirAll("reports", 0o700); err != nil {
-		return "", "", "", err
+		return "", "", "", "", err
 	}
 	if err := os.Chmod("reports", 0o700); err != nil {
-		return "", "", "", err
+		return "", "", "", "", err
 	}
-	stamp := time.Now().Format("20060102_150405_000000000")
+	now := time.Now()
+	stamp := now.Format("20060102_150405") + fmt.Sprintf("_%09d", now.Nanosecond())
 	progressFile, progressPath, reportPath, err := createWebShellArtifacts(stamp)
 	if err != nil {
-		return "", "", "", err
+		return "", "", "", "", err
 	}
+	statusPath := webShellStatusPath(progressPath)
 	latestPath, err := filepath.Abs(filepath.Join("reports", "latest_webshell.txt"))
 	if err != nil {
 		_ = progressFile.Close()
-		return "", "", "", err
+		return "", "", "", "", err
 	}
 
-	notice := webShellNoticeText(reportPath, progressPath, latestPath)
+	notice := webShellNoticeText(reportPath, progressPath, statusPath, latestPath)
 	_, _ = progressFile.WriteString(notice + "\n\n")
-	_ = writePrivateFile(latestPath, []byte(notice+"\n"))
+	latest := notice + "\n"
+	if strings.TrimSpace(title) != "" {
+		latest += "任务标题: " + logger.NormalizeReportTitle(title) + "\n"
+	}
+	if err := writePrivateFile(latestPath, []byte(latest)); err != nil {
+		_ = progressFile.Close()
+		return "", "", "", "", err
+	}
+	status := webShellTaskStatus{
+		SchemaVersion: 1,
+		Status:        "queued",
+		ReportPath:    reportPath,
+		ProgressPath:  progressPath,
+		StatusPath:    statusPath,
+		QueuedAt:      now.Format(time.RFC3339Nano),
+	}
+	if err := writeWebShellStatus(statusPath, status); err != nil {
+		_ = progressFile.Close()
+		return "", "", "", "", err
+	}
 
 	exe, err := os.Executable()
 	if err != nil {
 		_ = progressFile.Close()
-		return "", "", "", err
+		return "", "", "", "", err
 	}
 	// #nosec G204 G702 -- exe 由 os.Executable 返回，参数是操作员用来启动当前进程的原始 argv；未经 shell 解析，用于受控后台重启自身。
 	cmd := exec.Command(exe, os.Args[1:]...)
 	if wd, err := os.Getwd(); err == nil {
 		cmd.Dir = wd
 	}
-	cmd.Env = append(os.Environ(),
-		"DEEPSENTRY_WEBSHELL_CHILD=1",
+	cmd.Env = append(envWithout(os.Environ(), "DEEPSENTRY_COLOR", "CLICOLOR_FORCE", "DEEPSENTRY_WEBSHELL_SUPERVISOR", "DEEPSENTRY_WEBSHELL_CHILD"),
+		"DEEPSENTRY_WEBSHELL_SUPERVISOR=1",
 		"DEEPSENTRY_REPORT_PATH="+reportPath,
 		"DEEPSENTRY_WEBSHELL_PROGRESS_PATH="+progressPath,
+		"DEEPSENTRY_WEBSHELL_STATUS_PATH="+statusPath,
 		"DEEPSENTRY_NO_COLOR=1",
 		"NO_COLOR=1",
 	)
@@ -810,17 +885,114 @@ func launchDetachedWebShell(title string) (string, string, string, error) {
 
 	if err := cmd.Start(); err != nil {
 		_ = progressFile.Close()
-		return "", "", "", err
+		return "", "", "", "", err
 	}
 	if cmd.Process != nil {
 		_ = cmd.Process.Release()
 	}
 	_ = progressFile.Close()
+	return reportPath, progressPath, statusPath, latestPath, nil
+}
 
-	if strings.TrimSpace(title) != "" {
-		_ = writePrivateFile(latestPath, []byte(notice+"\n任务标题: "+logger.NormalizeReportTitle(title)+"\n"))
+func runWebShellSupervisor() int {
+	reportPath := strings.TrimSpace(os.Getenv("DEEPSENTRY_REPORT_PATH"))
+	progressPath := strings.TrimSpace(os.Getenv("DEEPSENTRY_WEBSHELL_PROGRESS_PATH"))
+	statusPath := strings.TrimSpace(os.Getenv("DEEPSENTRY_WEBSHELL_STATUS_PATH"))
+	status := readWebShellStatus(statusPath)
+	status.SchemaVersion = 1
+	status.Status = "starting"
+	status.SupervisorPID = os.Getpid()
+	status.ReportPath = reportPath
+	status.ProgressPath = progressPath
+	status.StatusPath = statusPath
+	if status.QueuedAt == "" {
+		status.QueuedAt = time.Now().Format(time.RFC3339Nano)
 	}
-	return reportPath, progressPath, latestPath, nil
+	_ = writeWebShellStatus(statusPath, status)
+
+	exe, err := os.Executable()
+	if err != nil {
+		status.Status = "failed"
+		status.Error = err.Error()
+		status.FinishedAt = time.Now().Format(time.RFC3339Nano)
+		code := 1
+		status.ExitCode = &code
+		_ = writeWebShellStatus(statusPath, status)
+		fmt.Printf("[WEB] 状态: failed exit_code=%d error=%s\n", code, err)
+		return code
+	}
+
+	// #nosec G204 G702 -- executable and argv are the current trusted process;
+	// the worker is launched without a shell and with an explicit environment.
+	worker := exec.Command(exe, os.Args[1:]...)
+	if wd, wdErr := os.Getwd(); wdErr == nil {
+		worker.Dir = wd
+	}
+	worker.Env = append(envWithout(os.Environ(), "DEEPSENTRY_WEBSHELL_SUPERVISOR", "DEEPSENTRY_WEBSHELL_CHILD"),
+		"DEEPSENTRY_WEBSHELL_CHILD=1",
+	)
+	worker.Stdin = nil
+	worker.Stdout = os.Stdout
+	worker.Stderr = os.Stderr
+	if err = worker.Start(); err != nil {
+		status.Status = "failed"
+		status.Error = err.Error()
+		status.FinishedAt = time.Now().Format(time.RFC3339Nano)
+		code := 1
+		status.ExitCode = &code
+		_ = writeWebShellStatus(statusPath, status)
+		fmt.Printf("[WEB] 状态: failed exit_code=%d error=%s\n", code, err)
+		return code
+	}
+	status.Status = "running"
+	status.WorkerPID = worker.Process.Pid
+	status.StartedAt = time.Now().Format(time.RFC3339Nano)
+	_ = writeWebShellStatus(statusPath, status)
+	fmt.Printf("[WEB] 状态: running pid=%d\n", status.WorkerPID)
+
+	waitErr := worker.Wait()
+	code := 0
+	if waitErr != nil {
+		code = 1
+		if exitErr, ok := waitErr.(*exec.ExitError); ok {
+			code = exitErr.ExitCode()
+		}
+		status.Error = waitErr.Error()
+	}
+	if code == 0 {
+		if _, statErr := os.Stat(reportPath); statErr != nil {
+			code = 3
+			status.Error = "worker exited without a readable report"
+		}
+	}
+	status.ExitCode = &code
+	status.FinishedAt = time.Now().Format(time.RFC3339Nano)
+	if code == 0 {
+		status.Status = "completed"
+	} else {
+		status.Status = "failed"
+	}
+	_ = writeWebShellStatus(statusPath, status)
+	fmt.Printf("\n[WEB] 状态: %s exit_code=%d finished_at=%s\n", status.Status, code, status.FinishedAt)
+	return code
+}
+
+func envWithout(env []string, keys ...string) []string {
+	blocked := make(map[string]bool, len(keys))
+	for _, key := range keys {
+		blocked[strings.ToUpper(strings.TrimSpace(key))] = true
+	}
+	out := make([]string, 0, len(env))
+	for _, entry := range env {
+		key := entry
+		if i := strings.IndexByte(entry, '='); i >= 0 {
+			key = entry[:i]
+		}
+		if !blocked[strings.ToUpper(key)] {
+			out = append(out, entry)
+		}
+	}
+	return out
 }
 
 func createWebShellArtifacts(stamp string) (*os.File, string, string, error) {
@@ -858,19 +1030,65 @@ func writePrivateFile(path string, data []byte) error {
 	return os.Chmod(path, 0o600)
 }
 
-func printWebShellDetachedNotice(reportPath, progressPath, latestPath string) {
-	fmt.Print(webShellNoticeText(reportPath, progressPath, latestPath) + "\n")
+func webShellStatusPath(progressPath string) string {
+	dir, name := filepath.Split(progressPath)
+	name = strings.TrimPrefix(name, "webshell_progress_")
+	name = strings.TrimSuffix(name, filepath.Ext(name))
+	return filepath.Join(dir, "webshell_status_"+name+".json")
+}
+
+func writeWebShellStatus(path string, status webShellTaskStatus) error {
+	if strings.TrimSpace(path) == "" {
+		return fmt.Errorf("WebShell status path is empty")
+	}
+	raw, err := json.MarshalIndent(status, "", "  ")
+	if err != nil {
+		return err
+	}
+	raw = append(raw, '\n')
+	return writePrivateFile(path, raw)
+}
+
+func readWebShellStatus(path string) webShellTaskStatus {
+	var status webShellTaskStatus
+	raw, err := os.ReadFile(path)
+	if err == nil {
+		_ = json.Unmarshal(raw, &status)
+	}
+	return status
+}
+
+func printWebShellDetachedNotice(reportPath, progressPath, statusPath, latestPath string) {
+	fmt.Print(webShellNoticeText(reportPath, progressPath, statusPath, latestPath) + "\n")
 	_ = os.Stdout.Sync()
 }
 
-func webShellNoticeText(reportPath, progressPath, latestPath string) string {
+func webShellNoticeText(reportPath, progressPath, statusPath, latestPath string) string {
 	return fmt.Sprintf("[WEB] DeepSentry 任务已提交后台执行\n"+
 		"[WEB] 执行结果报告: %s\n"+
 		"[WEB] 实时进度日志: %s\n"+
+		"[WEB] 任务状态文件: %s\n"+
 		"[WEB] 固定索引文件: %s\n"+
 		"[WEB] 查看进度: cat %s\n"+
+		"[WEB] 查看状态: cat %s\n"+
 		"[WEB] 查看报告: cat %s",
-		reportPath, progressPath, latestPath, progressPath, reportPath)
+		reportPath, progressPath, statusPath, latestPath, progressPath, statusPath, reportPath)
+}
+
+func boundedCleanup(label string, timeout time.Duration, cleanup func()) {
+	if cleanup == nil {
+		return
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		cleanup()
+	}()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		fmt.Fprintf(os.Stderr, "[WARN] %s关闭超过 %s，已停止等待并继续退出\n", label, timeout)
+	}
 }
 
 func captureStdout(fn func()) (out string) {

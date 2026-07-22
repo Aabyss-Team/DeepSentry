@@ -71,6 +71,11 @@
 - 保留逐帧精确的 macOS/中文输入法光标锚点；用于强制重绘的私有标记在写入终端前移除，不影响字符宽度或候选框位置。
 - 合并供应商/运行时重复上报的相邻思考和重复询问展示，但不修改原始审计或 checkpoint 内容。
 - 修复后台 Web/HTTP 服务保持运行时 Agent 永久等待 stdout/stderr 管道 EOF 的问题；前台 shell 结束后 Agent 可继续下一步，已正确脱离的服务不必被关闭。
+- 修复 `--no-tui --task` 在 WebShell/SFTP 伪 TTY 中被误判为交互会话、任务中途等待 `ask_user`/风险确认的问题；显式任务现在是真正的一次性执行，未授权高风险操作保守拒绝。
+- WebShell 后台任务增加独立 `status.json`，记录 queued/running/completed/failed、worker PID、时间和退出码；进度日志在结束时写入明确完成标记。
+- 经典 CLI 现在输出结构化终态（completed/failed/cancelled/awaiting_input/max_steps）并返回匹配的进程退出码，不再把 checkpoint 或步数耗尽伪装成成功。
+- 只有真正进入 TUI/交互问答的进程才恢复终端状态，修复 no-TUI/WebShell 退出时 ANSI 复位序列导致末行错位、提示符异常和日志残留 ESC 字符的问题。
+- SSH/FTP 执行器、浏览器和 MCP 的退出清理增加有界等待，`stty sane` 增加超时；一次性任务不再同时启动常驻 scheduler，避免报告完成后仍长时间不回 shell 或留下调度锁。
 - 高风险确认升级为 `Y` 仅本次、`A` 本会话允许同类范围、`N/Esc` 拒绝，`Enter` 继续默认拒绝。
 - 会话授权采用保守指纹：文件修改按“动作类型 + 精确路径”，Shell 按“目标 + 完整命令”，工具按“目标 + 工具 + 完整参数”匹配；授权不进入 checkpoint，新建或恢复会话时清空。
 - 移除旧的进程级 Shell 批准缓存；`Y` 现在真正只批准当前一次，不再跨 `/new` 或恢复会话隐式放行。

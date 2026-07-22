@@ -67,9 +67,17 @@ const (
 // 经典 CLI 只显示 AI 思考/动作摘要，不直接打印原始 JSON delta。
 type StdoutSink struct {
 	streamLast string
+	forcePlain bool
 }
 
 func NewStdoutSink() *StdoutSink { return &StdoutSink{} }
+
+func (s *StdoutSink) text(value string) string {
+	if s.forcePlain {
+		return ui.StripANSI(value)
+	}
+	return ui.TerminalText(value)
+}
 
 func (s *StdoutSink) Emit(e UIEvent) {
 	switch e.Kind {
@@ -78,14 +86,14 @@ func (s *StdoutSink) Emit(e UIEvent) {
 	case EventStepStart:
 		fmt.Printf("\n--- [Step %d / %d] -----------------\n", e.Step, e.MaxSteps)
 	case EventThinking:
-		fmt.Printf("%s%sAI 正在思考...%s\n", ansiThought, ui.Prefix("🧠", "[AI]"), ansiReset)
+		fmt.Println(s.text(ansiThought + ui.Prefix("🧠", "[AI]") + "AI 正在思考..." + ansiReset))
 	case EventThought:
 		if e.Message != "" {
-			fmt.Printf("%s%s想法: %s%s\n", ansiThought, ui.Prefix("💡", "[IDEA]"), ui.TerminalText(e.Message), ansiReset)
+			fmt.Println(s.text(ansiThought + ui.Prefix("💡", "[IDEA]") + "想法: " + e.Message + ansiReset))
 		}
 	case EventTokenUsage:
 		if e.TotalTokens > 0 {
-			fmt.Printf("%s%sToken: prompt=%d completion=%d total=%d%s\n", ansiThought, ui.Prefix("📊", "[TOK]"), e.PromptTokens, e.CompletionTokens, e.TotalTokens, ansiReset)
+			fmt.Println(s.text(fmt.Sprintf("%s%sToken: prompt=%d completion=%d total=%d%s", ansiThought, ui.Prefix("📊", "[TOK]"), e.PromptTokens, e.CompletionTokens, e.TotalTokens, ansiReset)))
 		}
 	case EventAction:
 		if e.Action != nil {
@@ -218,6 +226,11 @@ type WebShellSink struct {
 func NewWebShellSink(inner UISink) *WebShellSink {
 	if inner == nil {
 		inner = NewStdoutSink()
+	}
+	if stdout, ok := inner.(*StdoutSink); ok {
+		clone := *stdout
+		clone.forcePlain = true
+		inner = &clone
 	}
 	return &WebShellSink{inner: inner}
 }

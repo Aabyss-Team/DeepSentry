@@ -1,10 +1,12 @@
 package ui
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"runtime"
+	"time"
 
 	"golang.org/x/term"
 )
@@ -26,7 +28,9 @@ func ResetTerminalState() {
 	_, _ = fmt.Fprint(os.Stdout, "\r\n")
 	if runtime.GOOS != "windows" && term.IsTerminal(int(os.Stdin.Fd())) {
 		args := sttySaneArgs(runtime.GOOS)
-		_ = exec.Command("stty", args...).Run()
+		ctx, cancel := context.WithTimeout(context.Background(), 750*time.Millisecond)
+		defer cancel()
+		_ = exec.CommandContext(ctx, "stty", args...).Run()
 	}
 }
 

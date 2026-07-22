@@ -63,8 +63,16 @@ build_aux benchmark ./cmd/benchmark/main.go "$HOST_OS" "$HOST_ARCH"
 build_aux smoke ./cmd/smoke/main.go "$HOST_OS" "$HOST_ARCH"
 build_aux toolsmoke ./cmd/toolsmoke/main.go "$HOST_OS" "$HOST_ARCH"
 
-# 只替换构建脚本拥有的已知产物；build/ 下的配置副本、报告和用户文件不删除。
-find "$OUTPUT_DIR" -maxdepth 1 -type f \( -name 'deepsentry-*-*' -o -name 'deepsentry-*-*.exe' -o -name 'deepsentry' -o -name 'deepsentry.exe' \) -delete
+# 只替换构建脚本拥有的已知产物；build/ 下的配置副本、报告、ZIP 和用户文件不删除。
+# 不能使用 deepsentry-*-* 通配符，它会误删发布包
+# deepsentry-v<version>-all-platforms.zip。
+for p in "${platforms[@]}"; do
+  IFS=/ read -r goos goarch <<< "$p"
+  artifact="${APP_NAME}-${goos}-${goarch}"
+  [[ "$goos" == "windows" ]] && artifact="${artifact}.exe"
+  rm -f "$OUTPUT_DIR/$artifact"
+done
+rm -f "$OUTPUT_DIR/deepsentry" "$OUTPUT_DIR/deepsentry.exe"
 find "$OUTPUT_DIR/bin" -maxdepth 1 -type f \( -name 'deepsentry' -o -name 'deepsentry.exe' -o -name 'benchmark-*' -o -name 'smoke-*' -o -name 'toolsmoke-*' \) -delete
 cp "$STAGING"/deepsentry-* "$OUTPUT_DIR/"
 cp "$STAGING"/bin/* "$OUTPUT_DIR/bin/"
@@ -89,8 +97,12 @@ find "$OUTPUT_DIR" -maxdepth 1 -type f \( -iname 'config*.yaml' -o -name '.env' 
 # 后执行 `shasum -c SHA256SUMS` 会因缺少非发布文件而误报失败。
 (
   cd "$OUTPUT_DIR"
-  find . -maxdepth 1 -type f \( -name 'deepsentry-*-*' -o -name 'deepsentry-*-*.exe' \) -print0 |
-    sort -z | xargs -0 shasum -a 256
+  for p in "${platforms[@]}"; do
+    IFS=/ read -r goos goarch <<< "$p"
+    artifact="${APP_NAME}-${goos}-${goarch}"
+    [[ "$goos" == "windows" ]] && artifact="${artifact}.exe"
+    printf './%s\0' "$artifact"
+  done | sort -z | xargs -0 shasum -a 256
 ) > "$OUTPUT_DIR/SHA256SUMS"
 
 echo "------------------------------------------"

@@ -1,11 +1,13 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"ai-edr/internal/config"
 	"ai-edr/internal/executor"
@@ -218,6 +220,62 @@ func TestResolvedTUIModeFallsBackForPipes(t *testing.T) {
 				t.Fatalf("resolvedTUIMode()=%v want %v", got, tt.expected)
 			}
 		})
+	}
+}
+
+func TestNoTUIExplicitTaskIsOneShotEvenWithPseudoTTY(t *testing.T) {
+	if !resolvedNonInteractive(false, false, true, true, true) {
+		t.Fatal("--no-tui with an explicit task must not wait for pseudo-TTY stdin")
+	}
+	if resolvedNonInteractive(false, false, true, true, false) {
+		t.Fatal("interactive --no-tui without a task should still be able to prompt for the initial goal")
+	}
+}
+
+func TestWebShellStatusIsPrivateAndRoundTrips(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "webshell_status_task.json")
+	code := 0
+	want := webShellTaskStatus{
+		SchemaVersion: 1,
+		Status:        "completed",
+		WorkerPID:     123,
+		ReportPath:    "/tmp/report.md",
+		ProgressPath:  "/tmp/progress.log",
+		StatusPath:    path,
+		QueuedAt:      time.Now().Format(time.RFC3339Nano),
+		ExitCode:      &code,
+	}
+	if err := writeWebShellStatus(path, want); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("status mode=%o want 600", got)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got webShellTaskStatus
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != want.Status || got.WorkerPID != want.WorkerPID || got.ExitCode == nil || *got.ExitCode != 0 {
+		t.Fatalf("status round trip mismatch: %+v", got)
+	}
+	if notice := webShellNoticeText(want.ReportPath, want.ProgressPath, path, "/tmp/latest.txt"); !strings.Contains(notice, "任务状态文件") || !strings.Contains(notice, "cat "+path) {
+		t.Fatalf("notice does not expose status path: %s", notice)
+	}
+}
+
+func TestBoundedCleanupDoesNotBlockProcessExit(t *testing.T) {
+	started := time.Now()
+	boundedCleanup("test", 20*time.Millisecond, func() { time.Sleep(250 * time.Millisecond) })
+	if elapsed := time.Since(started); elapsed > 150*time.Millisecond {
+		t.Fatalf("bounded cleanup took %s", elapsed)
 	}
 }
 

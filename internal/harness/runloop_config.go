@@ -18,6 +18,30 @@ type ModelStepFunc func(analyzer.StepOptions) (analyzer.AgentResponse, error)
 // approvals, history, event and checkpoint lifecycle.
 type ActionHandlerFunc func(*StepContext, *AgentAction) (*ActionResult, error)
 
+// RunStatus describes why one RunLoop invocation returned.  Classic CLI and
+// detached WebShell callers use it to produce a truthful process exit status
+// instead of treating checkpoints, cancellation and max-step exhaustion as a
+// successful finish.
+type RunStatus string
+
+const (
+	RunStatusCompleted     RunStatus = "completed"
+	RunStatusFailed        RunStatus = "failed"
+	RunStatusCancelled     RunStatus = "cancelled"
+	RunStatusAwaitingInput RunStatus = "awaiting_input"
+	RunStatusMaxSteps      RunStatus = "max_steps"
+)
+
+// RunResult is the terminal state of a single Agent run.
+type RunResult struct {
+	Status     RunStatus
+	Reason     string
+	Step       int
+	ReportPath string
+}
+
+func (r RunResult) Successful() bool { return r.Status == RunStatusCompleted }
+
 // RunLoopConfig Agent 主循环配置
 type RunLoopConfig struct {
 	SysCtx           collector.SystemContext

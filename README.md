@@ -875,8 +875,10 @@ TUI 图形化选择恢复：
 [WEB] DeepSentry 任务已提交后台执行
 [WEB] 执行结果报告: /path/to/reports/report_YYYYMMDD_HHMMSS.md
 [WEB] 实时进度日志: /path/to/reports/webshell_progress_YYYYMMDD_HHMMSS.log
+[WEB] 任务状态文件: /path/to/reports/webshell_status_YYYYMMDD_HHMMSS.json
 [WEB] 固定索引文件: /path/to/reports/latest_webshell.txt
 [WEB] 查看进度: cat /path/to/reports/webshell_progress_YYYYMMDD_HHMMSS.log
+[WEB] 查看状态: cat /path/to/reports/webshell_status_YYYYMMDD_HHMMSS.json
 [WEB] 查看报告: cat /path/to/reports/report_YYYYMMDD_HHMMSS.md
 ```
 
@@ -902,6 +904,7 @@ cat reports/report_YYYYMMDD_HHMMSS.md
 
 - 父进程立即返回，不会卡住 WebShell 页面。
 - 子进程后台执行，进度写入 `webshell_progress_<时间>.log`。
+- 状态写入 `webshell_status_<时间>.json`，可直接检查 PID、退出码以及 queued/running/completed/failed；进度日志末尾也会写入完成标记。
 - 最终报告写入 `report_<时间>.md`。
 - `reports/latest_webshell.txt` 永远指向最近一次任务路径。
 - 等同于后台启用 `--no-tui --batch -y`，高风险动作会自动批准。

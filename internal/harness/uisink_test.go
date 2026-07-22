@@ -65,6 +65,7 @@ func TestWebShellSinkKeepsExecutionLog(t *testing.T) {
 		s := NewWebShellSink(NewStdoutSink())
 		s.Emit(UIEvent{Kind: EventThinking})
 		s.Emit(UIEvent{Kind: EventStepStart, Step: 1, MaxSteps: 30})
+		s.Emit(UIEvent{Kind: EventThought, Message: "inspect target"})
 		s.Emit(UIEvent{Kind: EventAction, Action: &AgentAction{Type: ActionExecute, Command: "\033[36mid\033[0m"}})
 		s.Emit(UIEvent{Kind: EventCommandOutput, Message: "\033[32muid=33(www-data)\033[0m\n"})
 		s.Emit(UIEvent{Kind: EventCommandOutput, Message: "gid=33(www-data)\n"})
@@ -73,7 +74,7 @@ func TestWebShellSinkKeepsExecutionLog(t *testing.T) {
 	if strings.Contains(out, "AI 正在思考") {
 		t.Fatalf("webshell sink should suppress thinking output:\n%s", out)
 	}
-	for _, want := range []string{"Step 1 / 30", "命令[控制端本机]: id", full} {
+	for _, want := range []string{"Step 1 / 30", "想法: inspect target", "命令[控制端本机]: id", full} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("webshell sink should keep %q, got:\n%s", want, out)
 		}

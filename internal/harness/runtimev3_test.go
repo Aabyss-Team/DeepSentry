@@ -148,7 +148,7 @@ func TestRunLoopUsesInjectedModelAndExecutorEndToEnd(t *testing.T) {
 		return analyzer.AgentResponse{Action: "finish", FinalReport: "fixture complete", IsFinished: true}, nil
 	}
 
-	agent.RunLoop(RunLoopConfig{
+	runResult := agent.RunLoop(RunLoopConfig{
 		History:   &history,
 		BatchMode: true,
 		PlanMode:  true,
@@ -157,6 +157,9 @@ func TestRunLoopUsesInjectedModelAndExecutorEndToEnd(t *testing.T) {
 		ModelStep: model,
 		Executor:  exec,
 	})
+	if runResult.Status != RunStatusCompleted || runResult.Reason != "agent_finish" || runResult.Step != 2 {
+		t.Fatalf("unexpected run result: %+v", runResult)
+	}
 
 	if step != 2 || len(exec.commands) != 1 || exec.commands[0] != "uname -a" {
 		t.Fatalf("steps=%d commands=%#v", step, exec.commands)
@@ -194,6 +197,7 @@ func TestRunLoopCoversAskEmptyErrorDenialAndToolFailureLifecycles(t *testing.T) 
 		handler        ActionHandlerFunc
 		wantKind       EventKind
 		wantExec       int
+		wantStatus     RunStatus
 	}{
 		{
 			name: "noninteractive ask continues",
@@ -201,21 +205,27 @@ func TestRunLoopCoversAskEmptyErrorDenialAndToolFailureLifecycles(t *testing.T) 
 				{Action: "ask_user", Question: "optional?"},
 				{Action: "finish", IsFinished: true, FinalReport: "continued"},
 			},
-			nonInteractive: true, wantKind: EventFinish,
+			nonInteractive: true, wantKind: EventFinish, wantStatus: RunStatusCompleted,
+		},
+		{
+			name:       "interactive ask checkpoints",
+			responses:  []analyzer.AgentResponse{{Action: "ask_user", Question: "required?"}},
+			wantKind:   EventAwaitUser,
+			wantStatus: RunStatusAwaitingInput,
 		},
 		{
 			name:      "empty action stops after guard",
 			responses: []analyzer.AgentResponse{{}, {}, {}},
-			wantKind:  EventFinish,
+			wantKind:  EventFinish, wantStatus: RunStatusFailed,
 		},
 		{
 			name:     "model error checkpoints and exits",
-			modelErr: errors.New("provider unavailable"), wantKind: EventError,
+			modelErr: errors.New("provider unavailable"), wantKind: EventError, wantStatus: RunStatusFailed,
 		},
 		{
 			name:      "high risk denial returns to model",
 			responses: []analyzer.AgentResponse{{Action: "execute", Command: "rm -rf /tmp/fixture"}, {Action: "finish", IsFinished: true, FinalReport: "denied safely"}},
-			confirm:   func(*AgentAction) bool { return false }, wantKind: EventDenied,
+			confirm:   func(*AgentAction) bool { return false }, wantKind: EventDenied, wantStatus: RunStatusCompleted,
 		},
 		{
 			name:      "tool failure returns structured feedback",
@@ -223,7 +233,7 @@ func TestRunLoopCoversAskEmptyErrorDenialAndToolFailureLifecycles(t *testing.T) 
 			handler: func(_ *StepContext, _ *AgentAction) (*ActionResult, error) {
 				return &ActionResult{Output: "fixture read failed"}, errors.New("connection reset")
 			},
-			wantKind: EventError,
+			wantKind: EventError, wantStatus: RunStatusCompleted,
 		},
 	}
 	for _, tc := range tests {
@@ -244,10 +254,13 @@ func TestRunLoopCoversAskEmptyErrorDenialAndToolFailureLifecycles(t *testing.T) 
 				index++
 				return response, nil
 			}
-			agent.RunLoop(RunLoopConfig{
+			runResult := agent.RunLoop(RunLoopConfig{
 				History: &history, BatchMode: false, NonInteractive: tc.nonInteractive, PlanMode: true,
 				MaxSteps: 4, UI: ui, ModelStep: model, Executor: exec, ConfirmFn: tc.confirm, ActionHandler: tc.handler,
 			})
+			if runResult.Status != tc.wantStatus {
+				t.Fatalf("status=%s want %s (%+v)", runResult.Status, tc.wantStatus, runResult)
+			}
 			seen := false
 			for _, event := range ui.events {
 				if event.Kind == tc.wantKind {

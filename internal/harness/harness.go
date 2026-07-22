@@ -885,7 +885,7 @@ func nonInteractivePrompt(_ bool) string {
 }
 
 // RunLoop 主 Agent 循环
-func (a *DeepAgent) RunLoop(cfg RunLoopConfig) {
+func (a *DeepAgent) RunLoop(cfg RunLoopConfig) (runResult RunResult) {
 	ui := cfg.UI
 	if ui == nil {
 		ui = NewStdoutSink()
@@ -927,6 +927,8 @@ func (a *DeepAgent) RunLoop(cfg RunLoopConfig) {
 	}()
 
 	stepCount := a.StartStep
+	runResult = RunResult{Status: RunStatusMaxSteps, Reason: "max_steps", Step: stepCount, ReportPath: reportPath}
+	defer func() { runResult.Step = stepCount }()
 	consecutiveEmpty := 0
 	consecutiveAutoAsk := 0
 
@@ -1001,11 +1003,15 @@ func (a *DeepAgent) RunLoop(cfg RunLoopConfig) {
 		ui.Emit(UIEvent{Kind: EventInfo, Message: termui.Prefix("🧠", "[MEM]") + "跨会话 Memory: " + strings.Join(parts, " + ") + " (已注入上下文)"})
 	}
 	if !cfg.PlanMode && a.tryNativeScheduleIntent(history, ui, reporter, reportPath) {
+		runResult.Status = RunStatusCompleted
+		runResult.Reason = "native_schedule_completed"
 		return
 	}
 
 	for stepCount < maxSteps {
 		if shouldStop(stop) {
+			runResult.Status = RunStatusCancelled
+			runResult.Reason = "cancelled_before_step"
 			a.saveCheckpointUI(stepCount, history, ui)
 			ui.Emit(UIEvent{Kind: EventCheckpoint, Message: fmt.Sprintf("已停止，checkpoint 已保存。继续: deepsentry --resume %s", a.SessionID)})
 			break
@@ -1088,12 +1094,16 @@ func (a *DeepAgent) RunLoop(cfg RunLoopConfig) {
 			ui.Emit(UIEvent{Kind: EventStreamEnd, Detail: streamBuf.String()})
 		}
 		if shouldStop(stop) {
+			runResult.Status = RunStatusCancelled
+			runResult.Reason = "cancelled_after_model"
 			a.saveCheckpointUI(stepCount, history, ui)
 			ui.Emit(UIEvent{Kind: EventCheckpoint, Message: fmt.Sprintf("已停止，checkpoint 已保存。继续: deepsentry --resume %s", a.SessionID)})
 			break
 		}
 
 		if err != nil {
+			runResult.Status = RunStatusFailed
+			runResult.Reason = "model_error"
 			safeErr := security.RedactSensitiveText(err.Error())
 			ui.Emit(UIEvent{Kind: EventError, Message: fmt.Sprintf("%sAI 错误: %s", termui.Prefix("❌", "[ERR]"), safeErr)})
 			a.saveCheckpointUI(stepCount, history, ui)
@@ -1145,11 +1155,15 @@ func (a *DeepAgent) RunLoop(cfg RunLoopConfig) {
 			ui.Emit(UIEvent{Kind: EventAwaitUser, Message: formatAskUserMessage(actCopy), Action: &actCopy})
 			a.saveCheckpointUI(stepCount, history, ui)
 			if cfg.AwaitUserFn == nil {
+				runResult.Status = RunStatusAwaitingInput
+				runResult.Reason = "awaiting_user_input"
 				ui.Emit(UIEvent{Kind: EventCheckpoint, Message: askResumeMessage(a.SessionID, cfg.PauseOnAskUser)})
 				break
 			}
 			answer, ok := cfg.AwaitUserFn(&action)
 			if !ok || strings.TrimSpace(answer) == "" {
+				runResult.Status = RunStatusAwaitingInput
+				runResult.Reason = "awaiting_user_input"
 				ui.Emit(UIEvent{Kind: EventCheckpoint, Message: askResumeMessage(a.SessionID, cfg.PauseOnAskUser)})
 				break
 			}
@@ -1163,6 +1177,8 @@ func (a *DeepAgent) RunLoop(cfg RunLoopConfig) {
 		consecutiveAutoAsk = 0
 
 		if action.Type == ActionFinish || action.IsFinished {
+			runResult.Status = RunStatusCompleted
+			runResult.Reason = "agent_finish"
 			report := action.FinalReport
 			if strings.TrimSpace(report) == "" {
 				report = fmt.Sprintf("%s任务完成。总结: %s", termui.Prefix("✅", "[OK]"), action.Thought)
@@ -1176,6 +1192,8 @@ func (a *DeepAgent) RunLoop(cfg RunLoopConfig) {
 		if isEmptyAction(action) {
 			consecutiveEmpty++
 			if consecutiveEmpty >= 3 {
+				runResult.Status = RunStatusFailed
+				runResult.Reason = "empty_action_limit"
 				ui.Emit(UIEvent{Kind: EventError, Message: termui.Prefix("⚠️", "[WARN]") + "AI 多次未给出行动，强制结束。"})
 				report := action.FinalReport
 				if report == "" {
@@ -1202,6 +1220,8 @@ func (a *DeepAgent) RunLoop(cfg RunLoopConfig) {
 		enrichActionExecutionTargetWithExecutor(&actCopy, targetExecutor)
 		ui.Emit(UIEvent{Kind: EventAction, Action: &actCopy})
 		if shouldStop(stop) {
+			runResult.Status = RunStatusCancelled
+			runResult.Reason = "cancelled_before_action"
 			a.saveCheckpointUI(stepCount, history, ui)
 			ui.Emit(UIEvent{Kind: EventCheckpoint, Message: fmt.Sprintf("已停止，checkpoint 已保存。继续: deepsentry --resume %s", a.SessionID)})
 			break
@@ -1358,11 +1378,15 @@ func (a *DeepAgent) RunLoop(cfg RunLoopConfig) {
 			a.State.ObserveCoreClues(result.Output, "action/"+string(action.Type))
 		}
 		if shouldStop(stop) {
+			runResult.Status = RunStatusCancelled
+			runResult.Reason = "cancelled_after_action"
 			a.saveCheckpointUI(stepCount, history, ui)
 			ui.Emit(UIEvent{Kind: EventCheckpoint, Message: fmt.Sprintf("已停止，checkpoint 已保存。继续: deepsentry --resume %s", a.SessionID)})
 			break
 		}
 		if result.ShouldStop {
+			runResult.Status = RunStatusCompleted
+			runResult.Reason = "action_finish"
 			a.saveCheckpointUI(stepCount, history, ui)
 			a.emitFinish(ui, result.FinalReport, reporter, reportPath)
 			break
@@ -1397,6 +1421,7 @@ func (a *DeepAgent) RunLoop(cfg RunLoopConfig) {
 
 		a.saveCheckpointUI(stepCount, history, ui)
 	}
+	return runResult
 }
 
 func appendActionResultHistory(history *[]analyzer.Message, action AgentAction, result *ActionResult) {
