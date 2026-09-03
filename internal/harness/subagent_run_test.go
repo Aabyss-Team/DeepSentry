@@ -151,6 +151,24 @@ func TestAuthorizeSubAgentExecuteConfirmsHighRiskCommand(t *testing.T) {
 	}
 }
 
+func TestAuthorizeSubAgentExecuteBlocksFlagPayloadWithoutConfirm(t *testing.T) {
+	action := &AgentAction{Type: ActionExecute, Command: "flag{Adm1N-B2G-kU-SZIP}"}
+	confirmCalled := false
+	allowed, feedback := authorizeSubAgentExecute(action, collector.SystemContext{}, false, nil, func(*AgentAction) bool {
+		confirmCalled = true
+		return true
+	}, func(collector.SystemContext, string, string) (string, string, bool) {
+		t.Fatal("AI review should not run for flag payloads")
+		return "", "", false
+	})
+	if allowed || confirmCalled {
+		t.Fatalf("flag payload must be auto-denied: allowed=%v confirm=%v feedback=%q", allowed, confirmCalled, feedback)
+	}
+	if !strings.Contains(feedback, "不是可执行命令") {
+		t.Fatalf("feedback=%q", feedback)
+	}
+}
+
 func TestAuthorizeSubAgentExecuteDeniesWhenConfirmationRejected(t *testing.T) {
 	action := &AgentAction{Type: ActionExecute, Command: "rm -rf /tmp/deepsentry-risk-deny"}
 

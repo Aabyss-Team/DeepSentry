@@ -50,7 +50,7 @@ func TestOpenAICompatibleSendsNativeBuiltinSchemasAndParsesName(t *testing.T) {
 		if request.MaxTokens != 4096 {
 			t.Fatalf("max_tokens=%d want local adaptive 4096", request.MaxTokens)
 		}
-		if len(request.Tools) > 10 {
+		if len(request.Tools) > 11 {
 			t.Fatalf("local compact model received too many native schemas: %d", len(request.Tools))
 		}
 		found := false

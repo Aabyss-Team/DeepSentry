@@ -60,12 +60,7 @@ func newSSHNetworkExecutor(client *ssh.Client, cfg config.Config) (*SSHNetworkEx
 		return nil, err
 	}
 	session.Stderr = session.Stdout
-	modes := ssh.TerminalModes{
-		ssh.ECHO:          0,
-		ssh.TTY_OP_ISPEED: 14400,
-		ssh.TTY_OP_OSPEED: 14400,
-	}
-	if err := session.RequestPty("xterm", 80, 240, modes); err != nil {
+	if err := requestNetworkPTY(session); err != nil {
 		_ = session.Close()
 		return nil, fmt.Errorf("网络设备 SSH PTY 请求失败: %w", err)
 	}
@@ -77,7 +72,7 @@ func newSSHNetworkExecutor(client *ssh.Client, cfg config.Config) (*SSHNetworkEx
 	exe := &SSHNetworkExecutor{
 		client: client, session: session, stdin: stdin, chunks: make(chan sshCLIChunk, 32),
 		deviceType: normalizeDeviceType(cfg.SSHDeviceType), enablePassword: cfg.SSHEnablePassword,
-		loginTimeout: 15 * time.Second, commandTimeout: secondsOrDefault(cfg.SSHCommandTimeoutSec, 90),
+		loginTimeout: 25 * time.Second, commandTimeout: secondsOrDefault(cfg.SSHCommandTimeoutSec, 90),
 	}
 	if raw := strings.TrimSpace(cfg.SSHPrompt); raw != "" {
 		exe.promptRE, err = compilePromptSpec(raw)
@@ -301,19 +296,25 @@ func (s *SSHNetworkExecutor) enterPrivilegedMode() error {
 	return fmt.Errorf("等待 %s 特权 prompt 超时；最后响应: %s", command, diagnosticTail(transcript.String(), 240))
 }
 
-func (s *SSHNetworkExecutor) disablePaging() {
-	command := ""
-	switch s.deviceType {
-	case "huawei", "h3c":
-		command = "screen-length 0 temporary"
-	case "ruijie", "cisco":
-		command = "terminal length 0"
-	case "generic":
-		if strings.HasPrefix(strings.TrimSpace(s.prompt), "<") || strings.HasPrefix(strings.TrimSpace(s.prompt), "[") {
-			command = "screen-length 0 temporary"
+func requestNetworkPTY(session *ssh.Session) error {
+	modes := ssh.TerminalModes{
+		ssh.ECHO:          0,
+		ssh.TTY_OP_ISPEED: 14400,
+		ssh.TTY_OP_OSPEED: 14400,
+	}
+	var last error
+	for _, term := range []string{"vt100", "xterm", "vt220", "ansi", "dumb"} {
+		if err := session.RequestPty(term, 80, 240, modes); err == nil {
+			return nil
+		} else {
+			last = err
 		}
 	}
-	if command != "" {
+	return last
+}
+
+func (s *SSHNetworkExecutor) disablePaging() {
+	for _, command := range networkPagingCommands(s.deviceType, s.prompt) {
 		_, _ = s.runCLICommand(command, nil, minDuration(s.commandTimeout, 8*time.Second))
 	}
 }

@@ -6,14 +6,113 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
+func TestReconnectReplacesDisconnectedSessionWithoutReplayingTools(t *testing.T) {
+	CloseAll()
+	t.Cleanup(CloseAll)
+
+	var toolCalls atomic.Int32
+	server := sdkmcp.NewServer(&sdkmcp.Implementation{Name: "reconnect-test", Version: "1"}, nil)
+	sdkmcp.AddTool(server, &sdkmcp.Tool{Name: "probe", Description: "count one explicit invocation"},
+		func(_ context.Context, _ *sdkmcp.CallToolRequest, _ any) (*sdkmcp.CallToolResult, any, error) {
+			toolCalls.Add(1)
+			return &sdkmcp.CallToolResult{Content: []sdkmcp.Content{&sdkmcp.TextContent{Text: "ok"}}}, nil, nil
+		})
+	httpServer := httptest.NewServer(sdkmcp.NewStreamableHTTPHandler(func(*http.Request) *sdkmcp.Server { return server }, nil))
+
+	cfg := ServerConfig{Name: "reconnectable", Type: "streamable_http", URL: httpServer.URL}
+	defer func() {
+		Disconnect(cfg.Name)
+		httpServer.Close()
+	}()
+	if err := Connect(cfg); err != nil {
+		t.Fatal(err)
+	}
+	sdkConnections.RLock()
+	first := sdkConnections.byName[cfg.Name]
+	sdkConnections.RUnlock()
+	if first == nil {
+		t.Fatal("initial MCP session was not recorded")
+	}
+	first.mu.Lock()
+	first.status.State = "disconnected"
+	first.mu.Unlock()
+
+	// Re-enabling the same fingerprint must replace a stale session instead of
+	// treating it as an already connected no-op.
+	if err := Connect(cfg); err != nil {
+		t.Fatal(err)
+	}
+	sdkConnections.RLock()
+	second := sdkConnections.byName[cfg.Name]
+	sdkConnections.RUnlock()
+	if second == nil || second == first {
+		t.Fatal("same-config reconnect did not replace the disconnected session")
+	}
+	if toolCalls.Load() != 0 {
+		t.Fatalf("reconnect unexpectedly replayed a tool call: %d", toolCalls.Load())
+	}
+
+	if err := Reconnect(cfg.Name); err != nil {
+		t.Fatal(err)
+	}
+	sdkConnections.RLock()
+	third := sdkConnections.byName[cfg.Name]
+	sdkConnections.RUnlock()
+	if third == nil || third == second {
+		t.Fatal("explicit reconnect did not replace the active session")
+	}
+	got, err := Global().Run(cfg.Name+"__probe", map[string]string{})
+	if err != nil || got != "ok" {
+		t.Fatalf("tool after reconnect=%q err=%v", got, err)
+	}
+	if toolCalls.Load() != 1 {
+		t.Fatalf("expected only the explicit tool invocation, got %d calls", toolCalls.Load())
+	}
+}
+
+func TestFormatOfflineStatusUsesAuthAppropriateRecoveryCommand(t *testing.T) {
+	CloseAll()
+	t.Cleanup(CloseAll)
+	sdkConnections.Lock()
+	sdkConnections.byName["plain"] = &sdkConnection{
+		serverName: "plain",
+		status:     ServerStatus{Name: "plain", State: "failed", Auth: "bearer-env"},
+	}
+	sdkConnections.byName["oauth-docs"] = &sdkConnection{
+		serverName: "oauth-docs",
+		status:     ServerStatus{Name: "oauth-docs", State: "disconnected", Auth: "oauth"},
+	}
+	sdkConnections.Unlock()
+
+	status := FormatServerStatus()
+	if !strings.Contains(status, "retry=/mcp reconnect plain") {
+		t.Fatalf("plain server reconnect hint missing: %s", status)
+	}
+	if !strings.Contains(status, "retry=/mcp login oauth-docs") {
+		t.Fatalf("OAuth login hint missing: %s", status)
+	}
+}
+
 type sdkGreetingArgs struct {
 	Name string `json:"name"`
+}
+
+type sdkNavigateArgs struct {
+	URL string `json:"url"`
+}
+
+type sdkTabsArgs struct {
+	Action string `json:"action"`
+	URL    string `json:"url"`
+	Active bool   `json:"active"`
+	Bind   bool   `json:"bind"`
 }
 
 func TestConnectStreamableHTTPDiscoversAndUsesAllServerPrimitives(t *testing.T) {
@@ -121,6 +220,38 @@ func TestConnectStreamableHTTPDiscoversAndUsesAllServerPrimitives(t *testing.T) 
 	}
 }
 
+func TestHawkEyeNavigateAutoRecoversStaleBindingThroughTabsNew(t *testing.T) {
+	CloseAll()
+	t.Cleanup(CloseAll)
+	server := sdkmcp.NewServer(&sdkmcp.Implementation{Name: "hawkeye-test", Version: "1.0.6"}, nil)
+	sdkmcp.AddTool(server, &sdkmcp.Tool{Name: "browser_navigate"},
+		func(_ context.Context, _ *sdkmcp.CallToolRequest, args sdkNavigateArgs) (*sdkmcp.CallToolResult, any, error) {
+			if args.URL != "https://example.test/video" {
+				t.Fatalf("navigate URL=%q", args.URL)
+			}
+			return &sdkmcp.CallToolResult{IsError: true, Content: []sdkmcp.Content{&sdkmcp.TextContent{Text: `{"ok":false,"error":"Test tab no longer exists"}`}}}, nil, nil
+		})
+	var recovered sdkTabsArgs
+	sdkmcp.AddTool(server, &sdkmcp.Tool{Name: "browser_tabs"},
+		func(_ context.Context, _ *sdkmcp.CallToolRequest, args sdkTabsArgs) (*sdkmcp.CallToolResult, any, error) {
+			recovered = args
+			return &sdkmcp.CallToolResult{Content: []sdkmcp.Content{&sdkmcp.TextContent{Text: `{"ok":true,"bound":true}`}}}, nil, nil
+		})
+	handler := sdkmcp.NewStreamableHTTPHandler(func(*http.Request) *sdkmcp.Server { return server }, nil)
+	httpServer := httptest.NewServer(handler)
+	defer httpServer.Close()
+	if err := Connect(ServerConfig{Name: "hawkeye-auto-heal", Type: "streamable_http", URL: httpServer.URL}); err != nil {
+		t.Fatal(err)
+	}
+	out, err := Global().Run("hawkeye-auto-heal__browser_navigate", map[string]string{"url": "https://example.test/video"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "自动修复") || recovered.Action != "new" || recovered.URL != "https://example.test/video" || !recovered.Active || !recovered.Bind {
+		t.Fatalf("stale binding was not recovered safely: out=%q args=%#v", out, recovered)
+	}
+}
+
 func TestValidateRemoteMCPURL(t *testing.T) {
 	for _, valid := range []string{"https://example.com/mcp", "http://localhost:8080/mcp", "http://127.0.0.1/mcp"} {
 		if err := validateRemoteMCPURL(valid); err != nil {
@@ -160,5 +291,38 @@ func TestMCPHTTPClientRejectsCredentialedCrossOriginRedirect(t *testing.T) {
 	}
 	if destinationHit {
 		t.Fatal("redirect destination should not be contacted")
+	}
+}
+
+func TestFormatConnectedInventoryListsServersAndCounts(t *testing.T) {
+	if got := formatConnectedInventory(nil); got != "" {
+		t.Fatalf("empty inventory should be blank, got %q", got)
+	}
+	got := formatConnectedInventory([]ServerInventory{
+		{Name: "hx0-hawkeye", ToolCount: 51},
+		{Name: "fofamap", ToolCount: 15},
+	})
+	want := "2 个已连接 · hx0-hawkeye 51 · fofamap 15"
+	if got != want {
+		t.Fatalf("got %q want %q", got, want)
+	}
+
+	fromTools := inventoryFromTools([]ExternalTool{
+		{Name: "a", Server: "hx0-hawkeye"},
+		{Name: "b", Server: "hx0-hawkeye"},
+		{Name: "c", Server: "fofamap"},
+		{Name: "d", Server: ""},
+	})
+	if len(fromTools) != 2 || fromTools[0].Name != "fofamap" || fromTools[0].ToolCount != 1 || fromTools[1].ToolCount != 2 {
+		t.Fatalf("unexpected registry inventory: %#v", fromTools)
+	}
+
+	fromStatus := inventoryFromStatuses([]ServerStatus{
+		{Name: "fofamap", State: "connected", Tools: 15},
+		{Name: "hx0-hawkeye", State: "error", Tools: 0},
+		{Name: "idle", State: "connecting", Tools: 0},
+	})
+	if len(fromStatus) != 1 || fromStatus[0].Name != "fofamap" || fromStatus[0].ToolCount != 15 {
+		t.Fatalf("only connected servers should be counted: %#v", fromStatus)
 	}
 }

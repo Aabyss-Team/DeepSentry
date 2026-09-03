@@ -13,13 +13,26 @@ import (
 )
 
 type Message struct {
-	ID               string     `json:"id,omitempty"`
-	Role             string     `json:"role"`
-	Content          string     `json:"content"`
-	ReasoningContent string     `json:"reasoning_content,omitempty"`
-	ToolCalls        []ToolCall `json:"tool_calls,omitempty"`
-	ToolCallID       string     `json:"tool_call_id,omitempty"`
-	Name             string     `json:"name,omitempty"`
+	ID               string            `json:"id,omitempty"`
+	Role             string            `json:"role"`
+	Content          string            `json:"content"`
+	Attachments      []ImageAttachment `json:"attachments,omitempty"`
+	ReasoningContent string            `json:"reasoning_content,omitempty"`
+	ToolCalls        []ToolCall        `json:"tool_calls,omitempty"`
+	ToolCallID       string            `json:"tool_call_id,omitempty"`
+	Name             string            `json:"name,omitempty"`
+}
+
+// ImageAttachment is a durable, path-backed image reference. DeepSentry keeps
+// binary data out of checkpoints and traces; provider adapters materialize a
+// validated data URL/base64 block only for the outbound model request.
+type ImageAttachment struct {
+	Path      string `json:"path"`
+	Name      string `json:"name,omitempty"`
+	MediaType string `json:"media_type,omitempty"`
+	Size      int64  `json:"size,omitempty"`
+	SHA256    string `json:"sha256,omitempty"`
+	Detail    string `json:"detail,omitempty"`
 }
 
 type ToolCall struct {
@@ -32,14 +45,14 @@ type ToolCall struct {
 }
 
 type ChatRequest struct {
-	Model         string           `json:"model"`
-	Messages      []Message        `json:"messages"`
-	Stream        bool             `json:"stream"`
-	Temperature   float64          `json:"temperature"`
-	MaxTokens     int              `json:"max_tokens,omitempty"`
-	Tools         []ToolDefinition `json:"tools,omitempty"`
-	ToolChoice    interface{}      `json:"tool_choice,omitempty"`
-	StreamOptions *StreamOptions   `json:"stream_options,omitempty"`
+	Model         string              `json:"model"`
+	Messages      []openAIChatMessage `json:"messages"`
+	Stream        bool                `json:"stream"`
+	Temperature   float64             `json:"temperature"`
+	MaxTokens     int                 `json:"max_tokens,omitempty"`
+	Tools         []ToolDefinition    `json:"tools,omitempty"`
+	ToolChoice    interface{}         `json:"tool_choice,omitempty"`
+	StreamOptions *StreamOptions      `json:"stream_options,omitempty"`
 }
 
 type StreamOptions struct {

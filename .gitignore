@@ -15,6 +15,7 @@
 /results/
 /workspace/
 *.log
+*.sqlite3
 
 # Build and release artifacts (attach release ZIPs through GitHub Releases)
 /build/

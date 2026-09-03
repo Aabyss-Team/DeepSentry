@@ -108,6 +108,15 @@ func TestValidateAndCoerceMCPArgs(t *testing.T) {
 	if _, err := validateAndCoerceMCPArgs(schema, map[string]string{"count": "1", "enabled": "true", "extra": "x"}); err == nil {
 		t.Fatal("unknown field should be rejected when additionalProperties=false")
 	}
+	got, err = validateAndCoerceMCPArgs(schema, map[string]string{
+		"count": "2", "enabled": "false", "thought": "检查标签页", "final_report": "nope",
+	})
+	if err != nil {
+		t.Fatalf("harness envelope keys should be ignored: %v", err)
+	}
+	if _, ok := got["thought"]; ok || got["count"] != int64(2) {
+		t.Fatalf("envelope key leaked into MCP args: %#v", got)
+	}
 }
 
 func TestMCPProcessEnvironmentDoesNotImplicitlyInheritCredentials(t *testing.T) {

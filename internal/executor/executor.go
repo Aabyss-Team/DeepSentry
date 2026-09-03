@@ -945,30 +945,13 @@ func newSSHExecutor(cfg config.Config) (Executor, error) {
 }
 
 func dialSSHClient(cfg config.Config) (*ssh.Client, error) {
-	var authMethods []ssh.AuthMethod
-	if cfg.SSHKeyPath != "" {
-		key, err := os.ReadFile(cfg.SSHKeyPath)
-		if err != nil {
-			return nil, fmt.Errorf("读取私钥失败: %v", err)
-		}
-		signer, err := ssh.ParsePrivateKey(key)
-		if err != nil {
-			return nil, fmt.Errorf("解析私钥失败: %v", err)
-		}
-		authMethods = append(authMethods, ssh.PublicKeys(signer))
-	} else {
-		authMethods = append(authMethods, ssh.Password(cfg.SSHPassword))
-	}
-
 	hostKeyCallback, err := sshHostKeyCallback(cfg)
 	if err != nil {
 		return nil, err
 	}
-	sshConfig := &ssh.ClientConfig{
-		User:            cfg.SSHUser,
-		Auth:            authMethods,
-		HostKeyCallback: hostKeyCallback,
-		Timeout:         10 * time.Second,
+	sshConfig, err := buildSSHClientConfig(cfg, hostKeyCallback)
+	if err != nil {
+		return nil, err
 	}
 
 	addr := normalizeSSHHost(cfg.SSHHost)
@@ -980,7 +963,7 @@ func dialSSHClient(cfg config.Config) (*ssh.Client, error) {
 	clientConn, channels, requests, err := ssh.NewClientConn(rawConn, addr, sshConfig)
 	if err != nil {
 		_ = rawConn.Close()
-		return nil, fmt.Errorf("SSH握手失败: %v", err)
+		return nil, formatSSHHandshakeError(addr, err)
 	}
 	_ = rawConn.SetDeadline(time.Time{})
 	client := ssh.NewClient(clientConn, channels, requests)

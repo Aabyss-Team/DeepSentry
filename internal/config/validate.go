@@ -68,20 +68,27 @@ func ValidateRuntimeConfig(cfg Config) error {
 	if cfg.ContextWindowTokens > 0 && cfg.ReservedOutputTokens >= cfg.ContextWindowTokens {
 		return fmt.Errorf("reserved_output_tokens 必须小于 context_window_tokens")
 	}
+	switch strings.ToLower(strings.TrimSpace(cfg.VisionMode)) {
+	case "", "auto", "enabled", "enable", "true", "required", "on", "disabled", "disable", "false", "off":
+	default:
+		return fmt.Errorf("vision_mode=%q 无效；可选 auto|enabled|disabled", cfg.VisionMode)
+	}
 	if cfg.LLMTimeoutSec < 0 || cfg.LLMRetries < 0 || cfg.SSHCommandTimeoutSec < 0 || cfg.SSHMaxOutputBytes < 0 || cfg.MaxSteps < 0 || cfg.SubAgentMaxSteps < 0 {
 		return fmt.Errorf("timeout/retries/output/max_steps 配置不能为负数")
 	}
-	deviceType := strings.ToLower(strings.TrimSpace(cfg.TelnetDeviceType))
-	switch deviceType {
-	case "", "auto", "huawei", "h3c", "ruijie", "cisco", "linux", "generic":
-	default:
-		return fmt.Errorf("telnet_device_type=%q 无效；可选 auto|huawei|h3c|ruijie|cisco|linux|generic", cfg.TelnetDeviceType)
+	if cfg.SSHConnectTimeoutSec < 0 || cfg.SSHConnectTimeoutSec > 120 {
+		return fmt.Errorf("ssh_connect_timeout_sec 必须在 0-120 之间")
 	}
-	sshDeviceType := strings.ToLower(strings.TrimSpace(cfg.SSHDeviceType))
-	switch sshDeviceType {
-	case "", "auto", "huawei", "h3c", "ruijie", "cisco", "linux", "generic":
+	switch strings.ToLower(strings.TrimSpace(cfg.SSHLegacyCompat)) {
+	case "", "true", "1", "yes", "on", "false", "0", "no", "off":
 	default:
-		return fmt.Errorf("ssh_device_type=%q 无效；可选 auto|huawei|h3c|ruijie|cisco|linux|generic", cfg.SSHDeviceType)
+		return fmt.Errorf("ssh_legacy_compat=%q 无效；可选 true|false", cfg.SSHLegacyCompat)
+	}
+	if err := validateDeviceType("telnet_device_type", cfg.TelnetDeviceType); err != nil {
+		return err
+	}
+	if err := validateDeviceType("ssh_device_type", cfg.SSHDeviceType); err != nil {
+		return err
 	}
 	if raw := strings.TrimSpace(cfg.SSHPrompt); strings.HasPrefix(strings.ToLower(raw), "regex:") {
 		if _, err := regexp.Compile(strings.TrimSpace(raw[len("regex:"):])); err != nil {
@@ -236,11 +243,8 @@ func validateTargets(targets []TargetConfig) error {
 			return fmt.Errorf("targets[%d].host 不能为空", i)
 		}
 		if protocol == "telnet" || protocol == "ssh" {
-			deviceType := strings.ToLower(strings.TrimSpace(target.DeviceType))
-			switch deviceType {
-			case "", "auto", "huawei", "h3c", "ruijie", "cisco", "linux", "generic":
-			default:
-				return fmt.Errorf("targets[%d].device_type=%q 无效", i, target.DeviceType)
+			if err := validateDeviceType(fmt.Sprintf("targets[%d].device_type", i), target.DeviceType); err != nil {
+				return err
 			}
 			if protocol == "ssh" {
 				if raw := strings.TrimSpace(target.Prompt); strings.HasPrefix(strings.ToLower(raw), "regex:") {
@@ -333,4 +337,30 @@ func validateMCPServers(servers []MCPServerConfig) error {
 func isLoopbackHost(host string) bool {
 	host = strings.ToLower(strings.TrimSpace(host))
 	return host == "localhost" || host == "127.0.0.1" || host == "::1"
+}
+
+func validateDeviceType(field, value string) error {
+	if allowedDeviceType(value) {
+		return nil
+	}
+	return fmt.Errorf("%s=%q 无效；可选 auto|huawei|h3c|ruijie|cisco|asa|juniper|fortinet|paloalto|hillstone|sangfor|checkpoint|linux|generic 及常见别名", field, value)
+}
+
+func allowedDeviceType(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "auto", "huawei", "h3c", "ruijie", "cisco", "linux", "generic",
+		"juniper", "junos", "screenos", "netscreen",
+		"fortinet", "fortios", "fortigate",
+		"paloalto", "panos", "palo-alto",
+		"hillstone", "stoneos",
+		"sangfor",
+		"checkpoint", "gaia",
+		"asa", "cisco-asa", "pix",
+		"vrp", "usg", "comware", "secpath", "rgos", "red-giant", "redgiant",
+		"ios", "ios-xe", "nxos", "nx-os", "ios-xr",
+		"dptech", "venustech", "topsec", "leadsec":
+		return true
+	default:
+		return false
+	}
 }

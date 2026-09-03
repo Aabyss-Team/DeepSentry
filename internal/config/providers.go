@@ -45,33 +45,45 @@ type ProviderPreset struct {
 	NativeTools bool
 }
 
+// ModelPreset is a deliberately small capability catalog for vendor model IDs
+// whose context and image support are documented. Exact IDs are preferred over
+// fuzzy name matching so MCP screenshots are never sent to a known text-only
+// model by accident. Unknown/custom models still use vision_mode and the legacy
+// conservative heuristics.
+type ModelPreset struct {
+	Provider            Provider
+	ID                  string
+	ContextWindowTokens int
+	SupportsVision      bool
+}
+
 // AllProviders contains convenience API/model presets. They are compatibility
 // defaults rather than a promise that a provider still labels them "latest";
 // operators can always override endpoint and model in config.
 var AllProviders = []ProviderPreset{
 	{
 		ID: ProviderOpenAI, DisplayName: "OpenAI",
-		APIURL: "https://api.openai.com/v1", Model: "gpt-5.5",
+		APIURL: "https://api.openai.com/v1", Model: "gpt-5.6",
 		AuthStyle: "bearer", Protocol: ProtocolOpenAIChat, NativeTools: true,
 	},
 	{
 		ID: ProviderAnthropic, DisplayName: "Anthropic Claude",
-		APIURL: "https://api.anthropic.com/v1", Model: "claude-opus-4-8",
+		APIURL: "https://api.anthropic.com/v1", Model: "claude-opus-5",
 		AuthStyle: "x-api-key", Protocol: ProtocolAnthropicMessages, NativeTools: false,
 	},
 	{
 		ID: ProviderGoogle, DisplayName: "Google Gemini",
-		APIURL: "https://generativelanguage.googleapis.com/v1beta/openai", Model: "gemini-3.5-flash",
+		APIURL: "https://generativelanguage.googleapis.com/v1beta/openai", Model: "gemini-3.8-flash",
 		AuthStyle: "bearer", Protocol: ProtocolOpenAIChat, NativeTools: true,
 	},
 	{
 		ID: ProviderDeepSeek, DisplayName: "DeepSeek",
-		APIURL: "https://api.deepseek.com/v1", Model: "deepseek-v4-pro",
+		APIURL: "https://api.deepseek.com", Model: "deepseek-v4-flash-vision-exp",
 		AuthStyle: "bearer", Protocol: ProtocolOpenAIChat, NativeTools: true,
 	},
 	{
 		ID: ProviderQwen, DisplayName: "Alibaba Qwen / DashScope",
-		APIURL: "https://dashscope.aliyuncs.com/compatible-mode/v1", Model: "qwen-plus",
+		APIURL: "https://dashscope.aliyuncs.com/compatible-mode/v1", Model: "qwen3.7-plus",
 		AuthStyle: "bearer", Protocol: ProtocolOpenAIChat, NativeTools: true,
 	},
 	{
@@ -86,27 +98,27 @@ var AllProviders = []ProviderPreset{
 	},
 	{
 		ID: ProviderMiniMax, DisplayName: "MiniMax",
-		APIURL: "https://api.minimax.chat/v1", Model: "MiniMax-M3",
+		APIURL: "https://api.minimax.cn/v1", Model: "MiniMax-M3",
 		AuthStyle: "bearer", Protocol: ProtocolOpenAIChat, NativeTools: true,
 	},
 	{
 		ID: ProviderMimo, DisplayName: "Xiaomi MiMo Token Plan / MiMo Claw",
-		APIURL: "https://token-plan-cn.xiaomimimo.com/v1", Model: "mimo-v2.5-pro",
+		APIURL: "https://token-plan-cn.xiaomimimo.com/v1", Model: "mimo-v2.5",
 		AuthStyle: "bearer", Protocol: ProtocolOpenAIChat, NativeTools: true,
 	},
 	{
 		ID: ProviderGLM, DisplayName: "智谱 GLM",
-		APIURL: "https://open.bigmodel.cn/api/paas/v4", Model: "glm-5.2",
+		APIURL: "https://open.bigmodel.cn/api/paas/v4", Model: "glm-5.3-flash",
 		AuthStyle: "bearer", Protocol: ProtocolOpenAIChat, NativeTools: true,
 	},
 	{
-		ID: ProviderHunyuan, DisplayName: "腾讯混元 Hunyuan",
-		APIURL: "https://api.hunyuan.cloud.tencent.com/v1", Model: "hunyuan-turbos-latest",
+		ID: ProviderHunyuan, DisplayName: "腾讯混元 Hunyuan / TokenHub",
+		APIURL: "https://tokenhub.tencentmaas.com/v1", Model: "hy4-preview",
 		AuthStyle: "bearer", Protocol: ProtocolOpenAIChat, NativeTools: true,
 	},
 	{
 		ID: ProviderTencentHY, DisplayName: "Tencent HY (alias)",
-		APIURL: "https://api.hunyuan.cloud.tencent.com/v1", Model: "hunyuan-turbos-latest",
+		APIURL: "https://tokenhub.tencentmaas.com/v1", Model: "hy4-preview",
 		AuthStyle: "bearer", Protocol: ProtocolOpenAIChat, NativeTools: true,
 	},
 	{
@@ -131,14 +143,85 @@ var AllProviders = []ProviderPreset{
 	},
 	{
 		ID: ProviderXAI, DisplayName: "xAI Grok",
-		APIURL: "https://api.x.ai/v1", Model: "grok-4",
+		APIURL: "https://api.x.ai/v1", Model: "grok-4.6",
 		AuthStyle: "bearer", Protocol: ProtocolOpenAIChat, NativeTools: true,
 	},
 	{
 		ID: ProviderGrok, DisplayName: "Grok (alias)",
-		APIURL: "https://api.x.ai/v1", Model: "grok-4",
+		APIURL: "https://api.x.ai/v1", Model: "grok-4.6",
 		AuthStyle: "bearer", Protocol: ProtocolOpenAIChat, NativeTools: true,
 	},
+}
+
+// AllModelPresets tracks the current documented IDs used by the built-in
+// Chinese providers. Historical IDs that are still served remain available so
+// existing configs get correct routing without becoming the new default.
+var AllModelPresets = []ModelPreset{
+	{Provider: ProviderDeepSeek, ID: "deepseek-v4-flash-vision-exp", ContextWindowTokens: 1_000_000, SupportsVision: true},
+	{Provider: ProviderDeepSeek, ID: "deepseek-v4-flash", ContextWindowTokens: 1_000_000},
+	{Provider: ProviderDeepSeek, ID: "deepseek-v4-pro", ContextWindowTokens: 1_000_000},
+	{Provider: ProviderGLM, ID: "glm-5.3-flash", ContextWindowTokens: 1_000_000, SupportsVision: true},
+	{Provider: ProviderGLM, ID: "glm-5.3", ContextWindowTokens: 1_000_000},
+	{Provider: ProviderMiniMax, ID: "MiniMax-M3", ContextWindowTokens: 1_000_000, SupportsVision: true},
+	{Provider: ProviderMiniMax, ID: "MiniMax-M2.7", ContextWindowTokens: 204_800},
+	{Provider: ProviderMiniMax, ID: "MiniMax-M2.7-highspeed", ContextWindowTokens: 204_800},
+	{Provider: ProviderMiniMax, ID: "MiniMax-M2.5", ContextWindowTokens: 204_800},
+	{Provider: ProviderMiniMax, ID: "MiniMax-M2.5-highspeed", ContextWindowTokens: 204_800},
+	{Provider: ProviderMimo, ID: "mimo-v2.5", ContextWindowTokens: 1_000_000, SupportsVision: true},
+	{Provider: ProviderMimo, ID: "mimo-v2.5-pro", ContextWindowTokens: 1_000_000},
+	{Provider: ProviderMimo, ID: "mimo-v2.5-pro-ultraspeed", ContextWindowTokens: 1_000_000},
+	{Provider: ProviderOpenAI, ID: "gpt-5.6", ContextWindowTokens: 1_050_000, SupportsVision: true},
+	{Provider: ProviderOpenAI, ID: "gpt-5.6-sol", ContextWindowTokens: 1_050_000, SupportsVision: true},
+	{Provider: ProviderOpenAI, ID: "gpt-5.6-terra", ContextWindowTokens: 1_050_000, SupportsVision: true},
+	{Provider: ProviderOpenAI, ID: "gpt-5.6-luna", ContextWindowTokens: 1_050_000, SupportsVision: true},
+	{Provider: ProviderOpenAI, ID: "gpt-5.5", ContextWindowTokens: 400_000, SupportsVision: true},
+	{Provider: ProviderAnthropic, ID: "claude-opus-5", ContextWindowTokens: 1_000_000, SupportsVision: true},
+	{Provider: ProviderAnthropic, ID: "claude-fable-5-1", ContextWindowTokens: 1_000_000, SupportsVision: true},
+	{Provider: ProviderAnthropic, ID: "claude-opus-4-8", ContextWindowTokens: 1_000_000, SupportsVision: true},
+	{Provider: ProviderGoogle, ID: "gemini-3.8-flash", ContextWindowTokens: 1_048_576, SupportsVision: true},
+	{Provider: ProviderGoogle, ID: "gemini-3.7-flash", ContextWindowTokens: 1_048_576, SupportsVision: true},
+	{Provider: ProviderGoogle, ID: "gemini-3.5-flash", ContextWindowTokens: 1_048_576, SupportsVision: true},
+	{Provider: ProviderQwen, ID: "qwen3.8-max", ContextWindowTokens: 1_000_000, SupportsVision: true},
+	{Provider: ProviderQwen, ID: "qwen3.7-plus", ContextWindowTokens: 1_000_000, SupportsVision: true},
+	{Provider: ProviderQwen, ID: "qwen3.8-flash", ContextWindowTokens: 1_000_000, SupportsVision: true},
+	{Provider: ProviderHunyuan, ID: "hy4-preview", ContextWindowTokens: 1_000_000},
+	{Provider: ProviderHunyuan, ID: "hy3", ContextWindowTokens: 256_000},
+	{Provider: ProviderXAI, ID: "grok-4.6", ContextWindowTokens: 500_000, SupportsVision: true},
+	{Provider: ProviderXAI, ID: "grok-4.5", ContextWindowTokens: 500_000, SupportsVision: true},
+	{Provider: ProviderXAI, ID: "grok-4", ContextWindowTokens: 256_000, SupportsVision: true},
+}
+
+// FindModelPreset resolves exact official IDs case-insensitively. Gateways often
+// expose an official model under provider=custom, so a unique exact ID remains
+// useful even when the configured provider is a proxy rather than the vendor.
+func FindModelPreset(provider, model string) (ModelPreset, bool) {
+	provider = canonicalProviderID(provider)
+	model = strings.ToLower(strings.TrimSpace(model))
+	if model == "" {
+		return ModelPreset{}, false
+	}
+	for _, preset := range AllModelPresets {
+		if strings.ToLower(preset.ID) != model {
+			continue
+		}
+		if provider == "" || provider == string(ProviderCustom) || provider == string(preset.Provider) {
+			return preset, true
+		}
+	}
+	return ModelPreset{}, false
+}
+
+func canonicalProviderID(provider string) string {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case string(ProviderTencentHY):
+		return string(ProviderHunyuan)
+	case string(ProviderGrok):
+		return string(ProviderXAI)
+	case string(ProviderCTYun):
+		return string(ProviderTeleAI)
+	default:
+		return strings.ToLower(strings.TrimSpace(provider))
+	}
 }
 
 // FindProvider 按 ID 查找预设

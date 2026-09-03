@@ -26,8 +26,8 @@ var GlobalConfig Config
 func setViperDefaults() {
 	viper.SetDefault("provider", "deepseek")
 	viper.SetDefault("api_protocol", "auto")
-	viper.SetDefault("api_url", "https://api.deepseek.com/v1")
-	viper.SetDefault("model_name", "deepseek-v4-pro")
+	viper.SetDefault("api_url", "https://api.deepseek.com")
+	viper.SetDefault("model_name", "deepseek-v4-flash-vision-exp")
 	viper.SetDefault("temperature", 0.0)
 	viper.SetDefault("model_profile", "auto")
 	viper.SetDefault("model_parameter_b", 0.0)
@@ -35,10 +35,13 @@ func setViperDefaults() {
 	viper.SetDefault("context_utilization", 0.0)
 	viper.SetDefault("reserved_output_tokens", 0)
 	viper.SetDefault("native_tool_limit", 0)
+	viper.SetDefault("vision_mode", "auto")
 	viper.SetDefault("ssh_user", "root")
 	viper.SetDefault("ssh_host_key_policy", "accept-new")
 	viper.SetDefault("ssh_known_hosts_path", "~/.deepsentry/known_hosts")
 	viper.SetDefault("ssh_device_type", "auto")
+	viper.SetDefault("ssh_legacy_compat", "true")
+	viper.SetDefault("ssh_connect_timeout_sec", 25)
 	viper.SetDefault("telnet_user", "root")
 	viper.SetDefault("telnet_device_type", "auto")
 	viper.SetDefault("telnet_connect_timeout_sec", 10)
@@ -103,6 +106,7 @@ type Config struct {
 	ContextUtilization   float64 `mapstructure:"context_utilization"`
 	ReservedOutputTokens int     `mapstructure:"reserved_output_tokens"`
 	NativeToolLimit      int     `mapstructure:"native_tool_limit"`
+	VisionMode           string  `mapstructure:"vision_mode"` // auto|enabled|disabled
 
 	// Runtime v3 is additive and can be rolled back to legacy without changing
 	// model or target configuration.
@@ -126,9 +130,12 @@ type Config struct {
 	SSHUser                  string         `mapstructure:"ssh_user"`
 	SSHPassword              string         `mapstructure:"ssh_password"`
 	SSHKeyPath               string         `mapstructure:"ssh_key_path"`
+	SSHKeyPassphrase         string         `mapstructure:"ssh_key_passphrase"`
 	SSHHostKeyPolicy         string         `mapstructure:"ssh_host_key_policy"` // strict|accept-new|insecure
 	SSHKnownHostsPath        string         `mapstructure:"ssh_known_hosts_path"`
-	SSHDeviceType            string         `mapstructure:"ssh_device_type"` // auto|huawei|h3c|ruijie|cisco|linux|generic
+	SSHLegacyCompat          string         `mapstructure:"ssh_legacy_compat"` // 默认 true：兼容 ssh-rsa / DH-SHA1 / CBC
+	SSHConnectTimeoutSec     int            `mapstructure:"ssh_connect_timeout_sec"`
+	SSHDeviceType            string         `mapstructure:"ssh_device_type"` // auto|huawei|h3c|ruijie|cisco|juniper|fortinet|...
 	SSHPrompt                string         `mapstructure:"ssh_prompt"`      // 网络设备交互 CLI prompt；可空自动探测
 	SSHEnablePassword        string         `mapstructure:"ssh_enable_password"`
 	TelnetHost               string         `mapstructure:"telnet_host"`
@@ -222,6 +229,7 @@ type ModelConfig struct {
 	ContextWindowTokens  int     `mapstructure:"context_window_tokens" json:"context_window_tokens" yaml:"context_window_tokens"`
 	ReservedOutputTokens int     `mapstructure:"reserved_output_tokens" json:"reserved_output_tokens" yaml:"reserved_output_tokens"`
 	NativeToolLimit      int     `mapstructure:"native_tool_limit" json:"native_tool_limit" yaml:"native_tool_limit"`
+	VisionMode           string  `mapstructure:"vision_mode" json:"vision_mode" yaml:"vision_mode"`
 	MaxRetries           int     `mapstructure:"max_retries" json:"max_retries" yaml:"max_retries"`
 }
 
@@ -246,6 +254,7 @@ func (c Config) EffectiveModels() []ModelConfig {
 			ContextWindowTokens:  c.ContextWindowTokens,
 			ReservedOutputTokens: c.ReservedOutputTokens,
 			NativeToolLimit:      c.NativeToolLimit,
+			VisionMode:           c.VisionMode,
 			MaxRetries:           c.EffectiveLLMRetries(),
 		}}
 	}
@@ -271,6 +280,7 @@ func mergeModelConfig(base Config, model ModelConfig, index int) ModelConfig {
 	model.APIKey = firstNonEmptyConfig(model.APIKey, base.ApiKey)
 	model.ModelName = firstNonEmptyConfig(model.ModelName, base.ModelName)
 	model.ModelProfile = firstNonEmptyConfig(model.ModelProfile, base.ModelProfile)
+	model.VisionMode = firstNonEmptyConfig(model.VisionMode, base.VisionMode, "auto")
 	if model.Temperature == 0 {
 		model.Temperature = base.Temperature
 	}
@@ -306,6 +316,7 @@ func (c Config) ConfigForModel(model ModelConfig) Config {
 	out.ContextWindowTokens = model.ContextWindowTokens
 	out.ReservedOutputTokens = model.ReservedOutputTokens
 	out.NativeToolLimit = model.NativeToolLimit
+	out.VisionMode = model.VisionMode
 	out.LLMRetries = model.MaxRetries
 	out.Models = nil
 	ApplyProviderDefaults(&out)
@@ -338,6 +349,7 @@ type TargetConfig struct {
 	User                     string   `mapstructure:"user" json:"user"`
 	Password                 string   `mapstructure:"password" json:"password"`
 	KeyPath                  string   `mapstructure:"key_path" json:"key_path"`
+	KeyPassphrase            string   `mapstructure:"key_passphrase" json:"key_passphrase"`
 	Prompt                   string   `mapstructure:"prompt" json:"prompt"`
 	AuthPromptRegex          string   `mapstructure:"auth_prompt_regex" json:"auth_prompt_regex"`
 	DeviceType               string   `mapstructure:"device_type" json:"device_type"`

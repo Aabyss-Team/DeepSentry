@@ -4,6 +4,7 @@ import (
 	"ai-edr/internal/analyzer"
 	"ai-edr/internal/config"
 	"ai-edr/internal/executor"
+	"ai-edr/internal/mcp"
 	"ai-edr/internal/skills"
 	"ai-edr/internal/tools"
 	"encoding/json"
@@ -433,6 +434,74 @@ func TestClassifyUnknownToolRequiresConfirmation(t *testing.T) {
 	risk, reason := classifyToolRisk(AgentAction{Type: ActionTool, ToolName: "not_registered_anywhere"})
 	if risk != tools.RiskHigh || !strings.Contains(reason, "未知工具") {
 		t.Fatalf("unknown tool risk=%q reason=%q", risk, reason)
+	}
+}
+
+func TestClassifyHawkEyeMCPUsesToolAndActionRisk(t *testing.T) {
+	handler := func(map[string]string) (string, error) { return "ok", nil }
+	register := func(canonical, original string) {
+		mcp.Global().RegisterHandler(canonical, mcp.ExternalTool{
+			Name: canonical, OriginalName: original, Server: "hawkeye-risk-test",
+		}, handler)
+	}
+	register("hawkeye_risk__capture_history", "hawkeye_capture_history")
+	register("hawkeye_risk__intercept", "hawkeye_intercept")
+	register("hawkeye_risk__evaluate", "hawkeye_evaluate")
+
+	if risk, _ := classifyToolRisk(AgentAction{Type: ActionTool, ToolName: "hawkeye_risk__capture_history"}); risk != tools.RiskLow {
+		t.Fatalf("HawkEye capture history should be low risk, got %s", risk)
+	}
+	if risk, _ := classifyToolRisk(AgentAction{Type: ActionTool, ToolName: "hawkeye_risk__intercept", ToolArgs: map[string]string{"action": "enable"}}); risk != tools.RiskLow {
+		t.Fatalf("HawkEye intercept enable should not interrupt the normal workflow, got %s", risk)
+	}
+	if risk, _ := classifyToolRisk(AgentAction{Type: ActionTool, ToolName: "hawkeye_risk__intercept", ToolArgs: map[string]string{"action": "release"}}); risk != tools.RiskHigh {
+		t.Fatalf("HawkEye intercept release should be high risk, got %s", risk)
+	}
+	if risk, _ := classifyToolRisk(AgentAction{Type: ActionTool, ToolName: "hawkeye_risk__evaluate", ToolArgs: map[string]string{"code": "1+1"}}); risk != tools.RiskHigh {
+		t.Fatalf("HawkEye evaluate should remain high risk, got %s", risk)
+	}
+}
+
+func TestClassifyFofaMapMCPUsesLocalActionRisk(t *testing.T) {
+	handler := func(map[string]string) (string, error) { return "ok", nil }
+	register := func(canonical, original string) {
+		mcp.Global().RegisterHandler(canonical, mcp.ExternalTool{
+			Name: canonical, OriginalName: original, Server: "fofamap-risk-test",
+		}, handler)
+	}
+	register("fofamap_risk__search", "fofa_search")
+	register("fofamap_risk__export", "fofa_export")
+	register("fofamap_risk__plan", "nuclei_plan")
+	register("fofamap_risk__execute", "nuclei_execute")
+
+	tests := []struct {
+		name string
+		want string
+	}{
+		{"fofamap_risk__search", tools.RiskLow},
+		{"fofamap_risk__export", tools.RiskMedium},
+		{"fofamap_risk__plan", tools.RiskMedium},
+		{"fofamap_risk__execute", tools.RiskHigh},
+	}
+	for _, test := range tests {
+		if risk, _ := classifyToolRisk(AgentAction{Type: ActionTool, ToolName: test.name}); risk != test.want {
+			t.Fatalf("%s risk=%s, want %s", test.name, risk, test.want)
+		}
+	}
+}
+
+func TestResolveZIPPasswordRecoverRiskUsesAction(t *testing.T) {
+	tool, ok := tools.Get("zip_password_recover")
+	if !ok {
+		t.Fatal("zip_password_recover tool should exist")
+	}
+	if risk, _ := resolveToolRisk(AgentAction{ToolName: tool.Name, ToolArgs: map[string]string{"action": "inspect", "source": "/tmp/evidence.zip"}}, tool); risk != tools.RiskLow {
+		t.Fatalf("ZIP inspect should be low risk, got %s", risk)
+	}
+	for _, action := range []string{"recover", "repair", "auto", "crc32"} {
+		if risk, _ := resolveToolRisk(AgentAction{ToolName: tool.Name, ToolArgs: map[string]string{"action": action, "source": "/tmp/evidence.zip"}}, tool); risk != tools.RiskHigh {
+			t.Fatalf("ZIP %s should be high risk, got %s", action, risk)
+		}
 	}
 }
 

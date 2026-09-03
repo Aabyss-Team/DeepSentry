@@ -57,6 +57,6 @@ jobs:
 
       - name: Verify release binaries
         run: |
-          test "$(find build -maxdepth 1 -type f -name 'deepsentry-*' | wc -l)" -eq 7
+          test "$(find build -maxdepth 1 -type f \( -name 'deepsentry-darwin-*' -o -name 'deepsentry-linux-*' -o -name 'deepsentry-windows-*.exe' \) | wc -l)" -eq 7
           ./build/deepsentry-linux-amd64 --version
           (cd build && shasum -c SHA256SUMS)

@@ -81,6 +81,9 @@ func TestLoadCatalogHonorsClaudeAndCodexInvocationPolicies(t *testing.T) {
 	if strings.Contains(prompt, "**explicit**") || strings.Contains(prompt, "**codex-policy**") || !strings.Contains(prompt, "**model-only**") {
 		t.Fatalf("invocation policy not reflected in catalog prompt:\n%s", prompt)
 	}
+	if !strings.Contains(prompt, "skill(name=") || !strings.Contains(prompt, "再动手") {
+		t.Fatalf("catalog prompt should teach skill-first loading:\n%s", prompt)
+	}
 }
 
 func TestFormatCatalogPromptHasBoundedProgressiveDisclosure(t *testing.T) {
@@ -200,5 +203,107 @@ func TestCatalogDisabledSkillPolicySurvivesReloadAndCanBeEnabled(t *testing.T) {
 	}
 	if _, ok := catalog.FindSkill("alpha"); !ok {
 		t.Fatal("enabled skill was not rediscovered without restart")
+	}
+}
+
+func TestBundledBilibiliPlaySkillIsLoadable(t *testing.T) {
+	root := filepath.Join("..", "..", "skills")
+	catalog, err := LoadCatalog([]string{root})
+	if err != nil {
+		t.Fatalf("load bundled skills: %v", err)
+	}
+	for _, name := range []string{"bilibili-play", "zipcracker", "fofamap"} {
+		if _, ok := catalog.FindSkill(name); !ok {
+			t.Fatalf("bundled %s skill missing; got %#v", name, catalog.Skills)
+		}
+	}
+	meta, _ := catalog.FindSkill("bilibili-play")
+	if !strings.Contains(meta.Description, "B站") && !strings.Contains(strings.ToLower(meta.Description), "bilibili") {
+		t.Fatalf("bilibili-play description should mention Bilibili: %q", meta.Description)
+	}
+	content, err := LoadSkillContent(*meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"playbackRate", "press_key", "canvas", "drawImage", "?p=N"} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("bilibili-play skill missing %q", want)
+		}
+	}
+	zipMeta, _ := catalog.FindSkill("zipcracker")
+	zipContent, err := LoadSkillContent(*zipMeta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"zip_password_recover", "伪加密", "CRC32", "bkcrack"} {
+		if !strings.Contains(zipContent, want) {
+			t.Fatalf("zipcracker skill missing %q", want)
+		}
+	}
+	fofaMeta, _ := catalog.FindSkill("fofamap")
+	fofaContent, err := LoadSkillContent(*fofaMeta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"fofa_rules", "fofa_validate_query", "next_cursor", "nuclei_plan", "fofa_recon.py"} {
+		if !strings.Contains(fofaContent, want) {
+			t.Fatalf("fofamap skill missing %q", want)
+		}
+	}
+}
+
+func TestLoadCatalogPrefersMCPFofaMapOverPythonPlaybook(t *testing.T) {
+	root := t.TempDir()
+	bundled := filepath.Join(root, "bundled", "fofamap")
+	market := filepath.Join(root, "market", "fofamap")
+	if err := os.MkdirAll(filepath.Join(market, "scripts"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(bundled, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mcpSkill := `---
+name: fofamap
+description: Use FofaMap MCP tools for FOFA search. Trigger fofa_account then fofa_search.
+---
+
+# FofaMap MCP
+Call fofa_account then fofa_search. Never run scripts/fofa_recon.py.
+`
+	pythonSkill := `---
+name: fofamap
+description: Run FOFA recon through python helper scripts.
+---
+
+# fofamap
+Use scripts/fofa_recon.py search --query 'app="nginx"'
+`
+	if err := os.WriteFile(filepath.Join(bundled, "SKILL.md"), []byte(mcpSkill), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(market, "SKILL.md"), []byte(pythonSkill), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(market, "scripts", "fofa_recon.py"), []byte("print('not mcp')\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	catalog, err := LoadCatalog([]string{filepath.Join(root, "bundled"), filepath.Join(root, "market")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta, ok := catalog.FindSkill("fofamap")
+	if !ok {
+		t.Fatal("expected fofamap skill")
+	}
+	if meta.Dir != bundled {
+		t.Fatalf("python playbook overwrote MCP skill: dir=%s", meta.Dir)
+	}
+	content, err := LoadSkillContent(*meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(content, "fofa_account") || strings.Contains(content, "app=\"nginx\"") {
+		t.Fatalf("unexpected fofamap skill content:\n%s", content)
 	}
 }

@@ -213,13 +213,15 @@ type ActionResult struct {
 	SkipApproval bool // filesystem read/ls 等低风险操作
 	Streamed     bool // execute 已经实时输出过，经典 stdout 结束时只显示摘要
 	ToolResults  []ToolCallResult
+	Attachments  []analyzer.ImageAttachment
 }
 
 type ToolCallResult struct {
-	ID     string
-	Name   string
-	Output string
-	Error  string
+	ID          string
+	Name        string
+	Output      string
+	Error       string
+	Attachments []analyzer.ImageAttachment
 }
 
 // Middleware 中间件接口（对标 deepagents middleware stack）

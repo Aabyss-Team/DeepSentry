@@ -1,22 +1,24 @@
 module ai-edr
 
-go 1.25.12
+go 1.26.8
 
 require (
 	github.com/AlecAivazis/survey/v2 v2.3.7
 	github.com/google/gopacket v1.1.19
 	github.com/pkg/sftp v1.13.10
 	github.com/spf13/viper v1.21.0
-	golang.org/x/crypto v0.53.0
-	golang.org/x/sys v0.46.0
-	golang.org/x/text v0.40.0
+	github.com/yeka/zip v0.0.0-20231116150916-03d6312748a9
+	golang.org/x/crypto v0.56.0
+	golang.org/x/sys v0.47.0
+	golang.org/x/text v0.41.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
 	github.com/chromedp/chromedp v0.14.2
+	github.com/ebitengine/purego v0.9.0
 	github.com/modelcontextprotocol/go-sdk v1.6.1
-	golang.org/x/net v0.56.0
+	golang.org/x/net v0.57.0
 )
 
 require (
@@ -68,5 +70,5 @@ require (
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
 	go.yaml.in/yaml/v3 v3.0.4 // indirect
 	golang.org/x/sync v0.22.0 // indirect
-	golang.org/x/term v0.44.0
+	golang.org/x/term v0.45.0
 )

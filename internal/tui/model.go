@@ -79,6 +79,14 @@ type tokenStats struct {
 // one-rune sentinel preserves real multiline drafts and stable cursor indexes.
 const inputLineBreak = '\uE000'
 
+// Claude Code collapses a paste only when it would crowd the prompt:
+// more than 2 lines or more than 800 characters. A 2-line, 16-character
+// mask (often copied with a trailing newline) stays visible inline.
+const (
+	largePasteMaxLines = 2
+	largePasteMaxRunes = 800
+)
+
 var slashCommands = []slashCommand{
 	{Name: "help", Description: "显示快捷键和斜杠命令"},
 	{Name: "new", Description: "开启全新任务/会话；可直接 /new 任务"},
@@ -87,6 +95,7 @@ var slashCommands = []slashCommand{
 	{Name: "status", Description: "显示运行状态、步骤和连接"},
 	{Name: "cost", Description: "显示会话轮次、消息数和估算 token"},
 	{Name: "model", Description: "显示当前模型"},
+	{Name: "image", Description: "附加图片：/image [路径]；省略路径读取剪贴板"},
 	{Name: "compact", Description: "折叠长输出并整理上下文"},
 	{Name: "memory", Description: "Memory 管理：/memory list|clues|clear [all|target|global]"},
 	{Name: "agents", Description: "AGENTS.md 管理：/agents status|clear"},
@@ -95,7 +104,7 @@ var slashCommands = []slashCommand{
 	{Name: "tsecbench", Description: "进入 TSecBench 跑分模式；可追加题目或目标说明"},
 	{Name: "config", Description: "显示连接与模型配置"},
 	{Name: "sudo", Description: "由系统安全验证/刷新本机 sudo 授权（密码不进入程序）"},
-	{Name: "mcp", Description: "MCP 管理：/mcp status|add|import|resources|prompts"},
+	{Name: "mcp", Description: "MCP 管理：/mcp status|reconnect|add|import|resources|prompts"},
 	{Name: "skill", Description: "Skill 管理：list 查看；on/off [name] 启停；only <name> 仅启用一个"},
 	{Name: "exit", Description: "退出 TUI"},
 	{Name: "quit", Description: "退出 TUI"},
@@ -173,6 +182,7 @@ type AgentModel struct {
 	inputHistory   []string
 	historyIdx     int
 	draftParts     []inputDraftPart
+	draftImages    []analyzer.ImageAttachment
 	slashSelected  int
 	cursorAnchor   *inputCursorAnchorState
 	footerVersion  uint64
@@ -401,6 +411,52 @@ func (m AgentModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case imageAttachResultMsg:
+		if msg.err != nil {
+			m.appendLine("error", "附加图片失败: "+msg.err.Error(), msg.err.Error())
+		} else if len(m.draftImages) >= analyzer.MaxImagesPerMessage {
+			m.appendLine("error", fmt.Sprintf("单条消息最多允许 %d 张图片", analyzer.MaxImagesPerMessage), "too many images")
+		} else if draftImageBytes(m.draftImages)+msg.attachment.Size > analyzer.MaxImageBatchBytes {
+			m.appendLine("error", fmt.Sprintf("单条消息图片总大小不能超过 %d MiB", analyzer.MaxImageBatchBytes>>20), "image batch too large")
+		} else {
+			m.draftImages = append(m.draftImages, msg.attachment)
+			m.appendLine("info", fmt.Sprintf("✓ 已从%s附加图片：%s · %s · %.1f KiB", msg.source, msg.attachment.Name, msg.attachment.MediaType, float64(msg.attachment.Size)/1024), msg.attachment.Path)
+		}
+		m.recalcLayout()
+		m.refreshViewport()
+		if m.inputFocused() {
+			m.scheduleInputCursorAnchor()
+		}
+		return m, nil
+
+	case macosCmdVMsg:
+		if !m.inputFocused() || m.pendingConfirm != nil {
+			return m, nil
+		}
+		sessionID := ""
+		if m.ctrl != nil {
+			sessionID = m.ctrl.Stats().SessionID
+		}
+		return m, pasteClipboardImageOnlyCmd(sessionID)
+
+	case macosCmdVIgnoredMsg:
+		return m, nil
+
+	case clipboardPasteResultMsg:
+		if msg.err != nil {
+			m.appendLine("error", "粘贴剪贴板失败: "+msg.err.Error(), msg.err.Error())
+		} else if msg.attachment.Path != "" {
+			return m.Update(imageAttachResultMsg{attachment: msg.attachment, source: "剪贴板"})
+		} else {
+			m.acceptPaste(msg.text)
+		}
+		m.recalcLayout()
+		m.refreshViewport()
+		if m.inputFocused() {
+			m.scheduleInputCursorAnchor()
+		}
+		return m, nil
+
 	case confirmMsg:
 		restoreInput := m.inputFocused()
 		m.pendingConfirm = &confirmState{action: msg.action, prompt: msg.prompt, respCh: msg.respCh, restoreInput: restoreInput}
@@ -416,6 +472,7 @@ func (m AgentModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.input.Focus()
 		m.input.SetValue("")
 		m.draftParts = nil
+		m.draftImages = nil
 		m.appendAskLine(msg.prompt, msg.options)
 		m.recalcLayout()
 		m.refreshViewport()
@@ -463,6 +520,7 @@ func (m AgentModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.pendingAsk = nil
 		m.input.SetValue("")
 		m.draftParts = nil
+		m.draftImages = nil
 		m.input.Width = ChromeContentWidth(m.width) - 2
 		m.input.Focus()
 		m.recalcLayout()
@@ -673,7 +731,38 @@ func (m AgentModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
+		// Handle the raw control-key type before bracketed paste. Some terminal
+		// stacks mark Ctrl+V as an empty paste event; letting that event reach the
+		// generic paste branch silently inserts nothing and makes image paste look
+		// broken. A real Ctrl+V always means "read the OS clipboard" here.
+		if m.inputFocused() && isClipboardPasteShortcut(msg) {
+			sessionID := ""
+			if m.ctrl != nil {
+				sessionID = m.ctrl.Stats().SessionID
+			}
+			m.appendLine("info", "正在读取剪贴板（图片优先）…", "clipboard paste")
+			m.refreshViewport()
+			return m, pasteClipboardCmd(sessionID)
+		}
+
 		if m.inputFocused() && msg.Paste {
+			// An empty bracketed-paste payload is what a few terminals emit when
+			// their paste command sees an image clipboard. Use the same native
+			// clipboard reader instead of treating it as an empty text insertion.
+			sessionID := ""
+			if m.ctrl != nil {
+				sessionID = m.ctrl.Stats().SessionID
+			}
+			if len(msg.Runes) == 0 {
+				m.appendLine("info", "正在读取剪贴板（图片优先）…", "clipboard paste")
+				m.refreshViewport()
+				return m, pasteClipboardCmd(sessionID)
+			}
+			if path, ok := looksLikeLocalImagePath(string(msg.Runes)); ok {
+				m.appendLine("info", "正在附加粘贴的图片文件…", "clipboard paste")
+				m.refreshViewport()
+				return m, attachImageCmd(path, sessionID)
+			}
 			m.acceptPaste(string(msg.Runes))
 			m.recalcLayout()
 			m.refreshViewport()
@@ -717,7 +806,7 @@ func (m AgentModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.scheduleInputCursorAnchor()
 				return m, nil
 			case "backspace", "delete":
-				if len(m.draftParts) > 0 && m.input.Value() == "" {
+				if (len(m.draftParts) > 0 || len(m.draftImages) > 0) && m.input.Value() == "" {
 					if key == "backspace" {
 						m.removeLastDraftPart()
 					}
@@ -905,7 +994,7 @@ func (m *AgentModel) submitAskResponse() tea.Cmd {
 	m.input.Blur()
 	cancelInputCursorAnchor()
 	m.returnToLiveTail()
-	m.appendSubmittedUserLine(text, pasted, draftSummary)
+	m.appendSubmittedUserLine(text, pasted, draftSummary, nil)
 	m.recalcLayout()
 	m.refreshViewport()
 	if ch != nil {
@@ -917,11 +1006,15 @@ func (m *AgentModel) submitAskResponse() tea.Cmd {
 func (m *AgentModel) tryInterruptSubmit() tea.Cmd {
 	pasted := m.hasPasteBlocks()
 	draftSummary := m.submittedDraftSummary()
+	images := append([]analyzer.ImageAttachment(nil), m.draftImages...)
 	text := strings.TrimSpace(m.currentInputValue())
-	if text == "" || m.ctrl == nil {
+	if (text == "" && len(images) == 0) || m.ctrl == nil {
 		return nil
 	}
-	if !m.ctrl.InterruptWithInput(text) {
+	if text == "" {
+		text = "请分析所附图片，并结合当前任务继续。"
+	}
+	if !m.ctrl.InterruptWithAttachments(text, images) {
 		return nil
 	}
 	if runewidth.StringWidth(text) <= 4000 {
@@ -931,7 +1024,7 @@ func (m *AgentModel) tryInterruptSubmit() tea.Cmd {
 	m.input.Blur()
 	cancelInputCursorAnchor()
 	m.returnToLiveTail()
-	m.appendSubmittedUserLine(text, pasted, draftSummary)
+	m.appendSubmittedUserLine(text, pasted, draftSummary, images)
 	m.appendLine("info", "↳ 已注入新指令，当前轮停止后会按最新目标继续。", text)
 	m.recalcLayout()
 	m.refreshViewport()
@@ -946,12 +1039,19 @@ func summarizeIfNeeded(text string) string {
 	return text
 }
 
-func (m *AgentModel) appendSubmittedUserLine(text string, pasted bool, draftSummary string) {
+func (m *AgentModel) appendSubmittedUserLine(text string, pasted bool, draftSummary string, images []analyzer.ImageAttachment) {
 	text = normalizeInputNewlines(text)
 	draftSummary = normalizeInputNewlines(draftSummary)
 	content := "You: " + summarizeIfNeeded(text)
 	if pasted {
 		content = "You:\n" + strings.TrimSpace(draftSummary)
+	}
+	if len(images) > 0 {
+		names := make([]string, 0, len(images))
+		for _, image := range images {
+			names = append(names, image.Name)
+		}
+		content += fmt.Sprintf("\n[图片 %d 张：%s]", len(images), strings.Join(names, ", "))
 	}
 	m.appendLine("user", content, text)
 	if pasted && len(m.lines) > 0 {
@@ -1065,14 +1165,21 @@ func (m *AgentModel) trySubmit() tea.Cmd {
 	pasted := m.hasPasteBlocks()
 	draftSummary := m.submittedDraftSummary()
 	savedParts := append([]inputDraftPart(nil), m.draftParts...)
+	savedImages := append([]analyzer.ImageAttachment(nil), m.draftImages...)
 	savedInput := m.input.Value()
 	savedCursor := m.input.Position()
 	text := strings.TrimSpace(m.currentInputValue())
-	if text == "" {
+	if text == "" && len(savedImages) == 0 {
 		return nil
 	}
 	if !pasted && strings.HasPrefix(text, "/") {
-		return m.handleSlashCommand(text)
+		cmd, _ := splitSlashCommand(text)
+		if len(savedImages) == 0 || cmd == "image" {
+			return m.handleSlashCommand(text)
+		}
+	}
+	if text == "" {
+		text = "请分析所附图片，并结合当前任务继续。"
 	}
 	if runewidth.StringWidth(text) <= 4000 {
 		m.inputHistory = append(m.inputHistory, text)
@@ -1090,17 +1197,17 @@ func (m *AgentModel) trySubmit() tea.Cmd {
 	m.sessionLive = true
 	m.returnToLiveTail()
 	m.recalcLayout()
-	m.appendSubmittedUserLine(text, pasted, draftSummary)
+	m.appendSubmittedUserLine(text, pasted, draftSummary, savedImages)
 	m.refreshViewport()
 
 	var ok bool
 	if followUp {
-		ok = m.ctrl.PrepareFollowUp(text)
+		ok = m.ctrl.PrepareFollowUpWithAttachments(text, savedImages)
 	} else if firstTurn {
-		m.ctrl.SetInitialGoal(text)
+		m.ctrl.SetInitialGoalWithAttachments(text, savedImages)
 		ok = m.ctrl.beginRun()
 	} else {
-		ok = m.ctrl.PrepareFollowUp(text)
+		ok = m.ctrl.PrepareFollowUpWithAttachments(text, savedImages)
 		followUp = true
 	}
 
@@ -1113,6 +1220,7 @@ func (m *AgentModel) trySubmit() tea.Cmd {
 		}
 		m.input.Focus()
 		m.draftParts = savedParts
+		m.draftImages = savedImages
 		m.input.SetValue(savedInput)
 		m.input.SetCursor(savedCursor)
 		m.appendLine("error", "Agent 仍在运行，请稍候", "busy")
@@ -1176,6 +1284,21 @@ func (m *AgentModel) recallInputHistory(delta int) {
 
 func (m *AgentModel) handleSlashCommand(text string) tea.Cmd {
 	cmd, arg := splitSlashCommand(text)
+	if cmd == "image" {
+		m.draftParts = nil
+		m.input.SetValue("")
+		m.input.SetCursor(0)
+		m.slashSelected = 0
+		m.returnToLiveTail()
+		m.recalcLayout()
+		m.appendLine("info", "正在附加图片…", text)
+		m.refreshViewport()
+		sessionID := ""
+		if m.ctrl != nil {
+			sessionID = m.ctrl.Stats().SessionID
+		}
+		return attachImageCmd(arg, sessionID)
+	}
 	m.clearInputDraft()
 	// Slash commands are submissions too. When the user invokes one while
 	// reading older output, keep the result visible instead of silently
@@ -1571,6 +1694,19 @@ func (m *AgentModel) handleMCPSlash(arg string) tea.Cmd {
 				}
 				return "MCP OAuth 登录成功并已实时连接: " + cfg.Name, nil
 			})
+		case "reconnect", "retry":
+			if len(fields) < 2 {
+				m.appendLine("error", "用法: /mcp reconnect <server>", arg)
+				return nil
+			}
+			name := fields[1]
+			m.appendLine("info", "正在重新连接 MCP Server: "+name, name)
+			return mcpQueryCmd("reconnect", func() (string, error) {
+				if err := mcp.Reconnect(name); err != nil {
+					return "", err
+				}
+				return "MCP 已重新连接（不会自动重放上一次工具调用）: " + name, nil
+			})
 		case "off", "disable":
 			if len(fields) < 2 {
 				m.appendLine("error", "用法: /mcp off <name>", arg)
@@ -1593,7 +1729,7 @@ func (m *AgentModel) handleMCPSlash(arg string) tea.Cmd {
 			args = map[string]string{"action": "remove_mcp_server", "name": fields[1]}
 			action = "remove"
 		default:
-			m.appendLine("info", "用法: /mcp status | import <claude.json> | add <name> <command|url> | login <name> | resources/read | prompts/prompt | off/on/remove", arg)
+			m.appendLine("info", "用法: /mcp status | reconnect <name> | import <claude.json> | add <name> <command|url> | login <name> | resources/read | prompts/prompt | off/on/remove", arg)
 			return nil
 		}
 	}
@@ -1773,7 +1909,11 @@ func (m *AgentModel) formatLocalSkillList() string {
 }
 
 func (m *AgentModel) handleSkillSlash(arg string) tea.Cmd {
-	fields := strings.Fields(arg)
+	fields, parseErr := splitSkillCommandFields(arg)
+	if parseErr != nil {
+		m.appendLine("error", "Skill 命令参数无效: "+parseErr.Error(), arg)
+		return nil
+	}
 	args := map[string]string{"action": "status"}
 	action := "status"
 	if len(fields) > 0 {
@@ -1845,9 +1985,9 @@ func (m *AgentModel) handleSkillSlash(arg string) tea.Cmd {
 			m.appendLine("info", "正在检查 Skill 来源与安全状态…", fields[1])
 			m.refreshViewport()
 			return skillMarketCmd("inspect", marketArgs)
-		case "install":
+		case "install", "import":
 			if len(fields) < 2 {
-				m.appendLine("error", "用法: /skill install <source> [acknowledge-risk] [force]", arg)
+				m.appendLine("error", "用法: /skill import </path/name.skill> [acknowledge-risk] [force]\n或: /skill install <source> [acknowledge-risk] [force]", arg)
 				return nil
 			}
 			marketArgs, _ := parseSkillMarketArgs(fields[2:])
@@ -1862,7 +2002,11 @@ func (m *AgentModel) handleSkillSlash(arg string) tea.Cmd {
 					marketArgs["force"] = "true"
 				}
 			}
-			m.appendLine("info", "正在下载并静态审查 Skill；不会执行其中脚本…", fields[1])
+			if fields[0] == "import" || strings.HasSuffix(strings.ToLower(fields[1]), ".skill") || strings.HasPrefix(fields[1], "/") || strings.HasPrefix(fields[1], "~/") {
+				m.appendLine("info", "正在读取本地 .skill，校验路径并静态审查；不会执行包内脚本…", fields[1])
+			} else {
+				m.appendLine("info", "正在下载并静态审查 Skill；不会执行其中脚本…", fields[1])
+			}
 			m.refreshViewport()
 			return skillMarketCmd("install", marketArgs)
 		case "managed", "installed":
@@ -1942,7 +2086,7 @@ func (m *AgentModel) handleSkillSlash(arg string) tea.Cmd {
 			args = map[string]string{"action": "remove_skill_source", "source": source}
 			action = "remove"
 		default:
-			m.appendLine("info", "用法: /skill list | on|off（全局） | on|off <name>（单项） | only <name>（仅启用一个） | load <name> | find|inspect|install | managed|updates|update|pin|unpin|uninstall|rollback|audit | add|source-off|source-on|remove <dir>", arg)
+			m.appendLine("info", "用法: /skill list | on|off（全局） | on|off <name>（单项） | only <name>（仅启用一个） | load <name> | find|inspect|install|import <file.skill> | managed|updates|update|pin|unpin|uninstall|rollback|audit | add|source-off|source-on|remove <dir>", arg)
 			return nil
 		}
 	}
@@ -1961,6 +2105,54 @@ func (m *AgentModel) handleSkillSlash(arg string) tea.Cmd {
 	message := out + "\nSkill 配置已立即刷新；当前会话已加载的有效 Skill 也已重读。"
 	m.appendResultLine(message, message)
 	return nil
+}
+
+// splitSkillCommandFields is a deliberately small, non-executing command-line
+// lexer. It lets users drag a quoted .skill path containing spaces into the
+// TUI without invoking a shell or expanding variables/globs.
+func splitSkillCommandFields(input string) ([]string, error) {
+	var fields []string
+	var current strings.Builder
+	var quote rune
+	flush := func() {
+		if current.Len() > 0 {
+			fields = append(fields, current.String())
+			current.Reset()
+		}
+	}
+	runes := []rune(input)
+	for i := 0; i < len(runes); i++ {
+		r := runes[i]
+		if r == '\\' && i+1 < len(runes) {
+			next := runes[i+1]
+			if next == '\\' || next == '\'' || next == '"' || unicode.IsSpace(next) {
+				current.WriteRune(next)
+				i++
+				continue
+			}
+		}
+		if quote != 0 {
+			if r == quote {
+				quote = 0
+			} else {
+				current.WriteRune(r)
+			}
+			continue
+		}
+		switch r {
+		case '\'', '"':
+			quote = r
+		case ' ', '\t', '\r', '\n':
+			flush()
+		default:
+			current.WriteRune(r)
+		}
+	}
+	if quote != 0 {
+		return nil, fmt.Errorf("引号未闭合")
+	}
+	flush()
+	return fields, nil
 }
 
 func parseSkillMarketArgs(fields []string) (map[string]string, string) {
@@ -2281,11 +2473,24 @@ func (m AgentModel) hasPasteBlocks() bool {
 	return false
 }
 
+func draftImageBytes(images []analyzer.ImageAttachment) int64 {
+	var total int64
+	for _, image := range images {
+		if image.Size > 0 {
+			total += image.Size
+		}
+	}
+	return total
+}
+
 func (m AgentModel) draftDisplayPrefix() string {
-	if len(m.draftParts) == 0 {
+	if len(m.draftParts) == 0 && len(m.draftImages) == 0 {
 		return ""
 	}
 	var rows []string
+	for i, image := range m.draftImages {
+		rows = append(rows, fmt.Sprintf("[图片 %d] %s · %.1f KiB", i+1, image.Name, float64(image.Size)/1024))
+	}
 	pasteIndex := 0
 	for _, part := range m.draftParts {
 		if part.pasted {
@@ -2304,10 +2509,13 @@ func (m AgentModel) draftDisplayPrefix() string {
 }
 
 func (m AgentModel) submittedDraftSummary() string {
-	if !m.hasPasteBlocks() {
+	if !m.hasPasteBlocks() && len(m.draftImages) == 0 {
 		return ""
 	}
 	lines := make([]string, 0, len(m.draftParts)+1)
+	for i, image := range m.draftImages {
+		lines = append(lines, fmt.Sprintf("图片 %d：%s (%s, %.1f KiB)", i+1, image.Name, image.MediaType, float64(image.Size)/1024))
+	}
 	pasteIndex := 0
 	for _, part := range m.draftParts {
 		if part.pasted {
@@ -2421,6 +2629,7 @@ func (m *AgentModel) moveInputCursorLine(delta int) bool {
 
 func (m *AgentModel) clearInputDraft() {
 	m.draftParts = nil
+	m.draftImages = nil
 	m.input.SetValue("")
 	m.input.SetCursor(0)
 	m.slashSelected = 0
@@ -2462,6 +2671,9 @@ func (m *AgentModel) acceptPaste(text string) {
 
 func (m *AgentModel) removeLastDraftPart() {
 	if len(m.draftParts) == 0 {
+		if len(m.draftImages) > 0 {
+			m.draftImages = m.draftImages[:len(m.draftImages)-1]
+		}
 		return
 	}
 	last := m.draftParts[len(m.draftParts)-1]
@@ -2493,7 +2705,15 @@ func (m *AgentModel) appendInputNewline() {
 }
 
 func isLargePaste(s string) bool {
-	return strings.Contains(s, "\n") || len([]rune(s)) > 300 || runewidth.StringWidth(s) > 300
+	s = normalizeInputNewlines(s)
+	if s == "" {
+		return false
+	}
+	// Match Claude Code: keep short clips (including a 2-line mask with a
+	// trailing newline) inline; only collapse dumps that would blow the prompt.
+	// See https://github.com/anthropics/claude-code/issues/85453
+	lines := strings.Count(s, "\n") + 1
+	return lines > largePasteMaxLines || len([]rune(s)) > largePasteMaxRunes
 }
 
 // toggleAllCollapsible treats e as a global two-state switch. If anything is
@@ -3738,9 +3958,9 @@ func (m AgentModel) footerHelpText() string {
 	}
 	if m.inputFocused() {
 		if m.running {
-			return "Esc 中断任务 · Enter 发送 · Shift+Enter 换行 · ↑↓ 历史 · Ctrl+U 清空 · Esc 退出输入 · Tab 浏览"
+			return "Esc 中断 · Enter 发送 · Shift+Enter 换行 · " + pasteShortcutHelp() + " · ↑↓ 历史 · Ctrl+U 清空 · Tab 浏览"
 		}
-		return "Enter 发送 · Shift+Enter 换行 · ↑↓ 历史 · PgUp 翻阅 · Ctrl+Home 顶部 · Ctrl+End 底部 · Esc 退出输入 · /help"
+		return "Enter 发送 · Shift+Enter 换行 · " + pasteShortcutHelp() + " · ↑↓ 历史 · PgUp 翻阅 · Ctrl+Home/End 顶/底 · /help"
 	}
 	if m.running {
 		return "Tab 输入新指令并 Enter 可中途打断 · Esc 停止 · ↑↓/jk 滚动 · g/Home 顶部 · G 底部 · e 全展/全折 · Y/N 确认"

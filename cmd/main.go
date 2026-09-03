@@ -547,7 +547,6 @@ func runCLI() (exitCode int) {
 		startup.Hostname = sysCtx.Hostname
 		startup.ModelInfo = config.GlobalConfig.ModelDisplayInfo()
 		startup.TargetCount = len(config.GlobalConfig.Targets)
-		startup.MCPCount = len(config.GlobalConfig.MCPServers)
 		startup.NativeTools = config.GlobalConfig.UseNativeTools
 		executor.SetModeOutputEnabled(false)
 	} else {
@@ -587,7 +586,9 @@ func runCLI() (exitCode int) {
 		ui.Exit(1)
 	}
 	if *tuiMode {
-		startup.MCPCount = len(mcp.Global().ListNames())
+		inventory := mcp.ConnectedInventory()
+		startup.MCPCount = len(inventory)
+		startup.MCPSummary = mcp.FormatConnectedInventory()
 	}
 
 	if sessionID != "" {
@@ -1783,23 +1784,25 @@ func validateCustomContextWindow(value interface{}) error {
 }
 
 var wizardProviderOptions = []string{
-	"DeepSeek (deepseek-v4-pro)",
-	"Qwen / 阿里百炼 (qwen-plus)",
+	"DeepSeek（推荐 · deepseek-v4-flash-vision-exp · 多模态）",
+	"Qwen / 阿里百炼 (qwen3.7-plus)",
 	"百度千帆 Coding Plan (qianfan-code-latest)",
 	"火山方舟 Coding Plan (ark-code-latest)",
 	"中国电信星辰 TeleAI (GLM-5-Pro)",
-	"腾讯混元 Hunyuan (hunyuan-turbos-latest)",
-	"OpenAI (gpt-5.5)",
-	"Anthropic Claude (claude-opus-4-8)",
-	"Google Gemini (gemini-3.5-flash)",
-	"MiniMax (MiniMax-M3)",
-	"智谱 GLM (glm-5.2)",
-	"Xiaomi MiMo Token Plan / MiMo Claw (mimo-v2.5-pro)",
-	"xAI Grok (grok-4)",
+	"腾讯混元 Hunyuan / TokenHub (hy4-preview)",
+	"OpenAI (gpt-5.6)",
+	"Anthropic Claude (claude-opus-5)",
+	"Google Gemini (gemini-3.8-flash)",
+	"MiniMax (MiniMax-M3 · 多模态)",
+	"智谱 GLM (glm-5.3-flash · 多模态)",
+	"Xiaomi MiMo Token Plan / MiMo Claw (mimo-v2.5 · 多模态)",
+	"xAI Grok (grok-4.6)",
 	"Ollama (本地运行)",
 	"LM Studio (本地运行)",
 	"其他 (自定义/中转)",
 }
+
+const wizardRecommendedProvider = "DeepSeek（推荐 · deepseek-v4-flash-vision-exp · 多模态）"
 
 func wizardProviderID(providerLabel string) string {
 	switch {
@@ -1889,7 +1892,7 @@ func runElegantWizard() error {
 	providerPrompt := &survey.Select{
 		Message: ui.Prefix("🤖", "[AI]") + "请选择您的 AI 模型服务商:",
 		Options: wizardProviderOptions,
-		Default: "DeepSeek (deepseek-v4-pro)",
+		Default: wizardRecommendedProvider,
 	}
 	if err := askOne(providerPrompt, &providerLabel); err != nil {
 		return err
@@ -1901,6 +1904,22 @@ func runElegantWizard() error {
 	urlHelp := "请输入 API Base URL（可只填 /v1，自动补全 chat/completions）"
 
 	switch providerID {
+	case "deepseek":
+		urlHelp = "DeepSeek 官方 OpenAI 兼容 Base URL；推荐模型支持图片与 MCP 截图回灌"
+	case "openai":
+		urlHelp = "OpenAI 官方 Base URL；默认 gpt-5.6（旗舰 alias）。官方推荐 Responses 时可把协议改成 openai_responses"
+	case "anthropic":
+		urlHelp = "Anthropic 官方 Messages API Base URL；默认 claude-opus-5，长程 Agent 也可改 claude-fable-5-1"
+	case "google":
+		urlHelp = "Gemini 官方 OpenAI 兼容 Base URL；默认 gemini-3.8-flash"
+	case "qwen":
+		urlHelp = "阿里云百炼 OpenAI 兼容 Base URL；默认 qwen3.7-plus，最强推理可改 qwen3.8-max"
+	case "hunyuan":
+		urlHelp = "腾讯云 TokenHub OpenAI 兼容 Base URL；hunyuan-turbos-latest 已下线，默认 hy4-preview"
+	case "minimax":
+		urlHelp = "MiniMax 中国站 OpenAI 兼容 Base URL；MiniMax-M3 支持图片/视频输入、1M 上下文和工具调用"
+	case "glm":
+		urlHelp = "智谱标准 API Base URL；glm-5.3-flash 支持图片/视频/文件输入、1M 上下文和工具调用"
 	case "qianfan":
 		urlHelp = "千帆 Coding Plan 官方 OpenAI 兼容 Base URL；使用 Coding Plan 订阅 API Key"
 	case "volcengine":
@@ -1946,7 +1965,7 @@ func runElegantWizard() error {
 			Prompt: &survey.Input{
 				Message: ui.Prefix("🧠", "[MODEL]") + "模型名称 (Model ID):",
 				Default: defaultModel,
-				Help:    "例如: deepseek-v4-pro, qwen-plus, hunyuan-turbos-latest, GLM-5-Pro 等",
+				Help:    "例如: deepseek-v4-flash-vision-exp、gpt-5.6、claude-opus-5、gemini-3.8-flash、qwen3.7-plus、hy4-preview；精确 ID 会自动识别上下文和视觉能力",
 			},
 			Validate: survey.Required,
 		},
@@ -2049,6 +2068,7 @@ func runElegantWizard() error {
 	viper.Set("api_key", answers.ApiKey)
 	viper.Set("model_profile", "auto")
 	viper.Set("context_window_tokens", contextWindowTokens)
+	viper.Set("vision_mode", "auto")
 	if providerID == "ollama" || providerID == "lmstudio" {
 		viper.Set("model_parameter_b", answers.ModelParameterB)
 	}

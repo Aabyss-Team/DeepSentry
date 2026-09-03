@@ -9,6 +9,7 @@ var bannerTips = []string{
 	"任务运行中也可 Tab 输入新指令，Enter 打断并续跑",
 	"Esc 退出输入模式，↑↓/jk 滚动日志",
 	"Shift+Enter / Alt+Enter 可在输入框内换行",
+	"macOS 可直接 ⌘V 粘贴截图，Windows/Linux 用 Ctrl+V",
 	"Ctrl+U 清空当前输入，Ctrl+L 清屏",
 	"按 G 快速跳到日志底部",
 	"PgUp / PgDown 翻页浏览 Agent 输出",
@@ -35,6 +36,7 @@ var bannerTips = []string{
 	"/memory clues 查看当前会话自动汇聚的 IP、CVE、哈希和路径",
 	"/memory clues clear 只清空当前会话线索，不删除长期 Memory",
 	"/mcp 可查看、导入和管理 MCP 扩展服务",
+	"/mcp status 可看每个已连接 MCP 以及各自暴露了多少工具",
 	"/skill 查看已发现的专业 Skill，Agent 也会按需加载",
 	"/sudo 把密码验证交给系统终端，密码不进入模型上下文",
 
@@ -72,6 +74,16 @@ var bannerTips = []string{
 	"enabled_tools / disabled_tools 可做内置工具白名单与黑名单",
 	"MCP 工具与内置工具可并用，优先选有结构化参数契约的路径",
 	"可直接导入 Claude Desktop MCP JSON，无需逐个重写 server 配置",
+	"FofaMap MCP 连通后走 fofa_account → rules → search，不要 execute fofa_recon.py",
+	"产品/OA/VPN 查询先 fofa_rules，原样使用返回的 app=，不要编造",
+	"ZIP 解密第一步 zip_password_recover；有掩码用 recover+mask",
+	"HawkEye 已连接时浏览网页走 HawkEye，不要再用内置 browser_browse",
+	"B 站播放/倍速/全屏先 load_skill(\"bilibili-play\")，合集用 ?p=N",
+	"解出 flag{...} 后 finish 提交，不要把它当成 shell 命令 execute",
+	"mcp_server_configs 请写 Python 与 mcp_server.py 的绝对路径",
+	"/skill only fofamap 可只保留当前需要的一个 Skill",
+	"SSH 默认兼容老设备；不需要旧算法时设 ssh_legacy_compat: false",
+	"Nuclei 必须先 nuclei_plan，确认一次性令牌后再 nuclei_execute",
 
 	// 多轮与会话
 	"任务完成后可直接追问，上下文会自动保留",
@@ -169,7 +181,7 @@ var bannerTips = []string{
 	// 评测与其他
 	"Benchmark TUI: go run ./cmd/benchmark/ -c config.yaml --tui",
 	"快速门禁: go run ./cmd/benchmark/ -skip-llm -skip-remote",
-	"MCP 扩展工具可在 config.yaml 的 mcp_servers 中配置",
+	"MCP 用 mcp_server_configs 配置；启动 Banner 会列出每个连接的工具数",
 	"enabled_tools / disabled_tools 可精确控制内置工具集",
 	"max_steps 可在 config.yaml 调整单任务最大推理步数",
 	"思考流默认折叠，按 e 可展开 AI 推理与 JSON 动作",

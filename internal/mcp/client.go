@@ -14,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"ai-edr/internal/ui"
 )
 
 // ExternalTool MCP 发现的外部工具
@@ -23,6 +25,21 @@ type ExternalTool struct {
 	Description  string
 	Server       string
 	InputSchema  map[string]interface{}
+	Annotations  ToolAnnotations
+}
+
+// ToolAnnotations keeps the safety hints advertised by an MCP server. These
+// are hints rather than trust decisions; DeepSentry only uses them together
+// with a locally known server profile (for example HawkEye's versioned tool
+// contract) and otherwise keeps the conservative external-tool policy.
+type ToolAnnotations struct {
+	Present          bool
+	ReadOnlyHint     bool
+	DestructiveHint  bool
+	DestructiveKnown bool
+	IdempotentHint   bool
+	OpenWorldHint    bool
+	OpenWorldKnown   bool
 }
 
 // ToolHandler 外部工具执行回调
@@ -244,11 +261,32 @@ func (r *Registry) FormatPrompt() string {
 	var b strings.Builder
 	b.WriteString("\n【MCP 扩展工具】\n")
 	b.WriteString("格式: {\"action\":\"tool\",\"tool_name\":\"mcp:<name>\",\"tool_args\":{...}}\n\n")
+	hasHawkEye := false
+	hasFofaMap := false
 	names := make([]string, 0, len(r.tools))
-	for name := range r.tools {
+	for name, tool := range r.tools {
 		names = append(names, name)
+		if isHawkEyeExternalToolInSet(tool, r.tools) {
+			hasHawkEye = true
+		}
+		if isFofaMapExternalToolInSet(tool, r.tools) {
+			hasFofaMap = true
+		}
 	}
-	sort.Strings(names)
+	if hasHawkEye {
+		b.WriteString(hawkEyeWorkflowPrompt())
+	}
+	if hasFofaMap {
+		b.WriteString(fofaMapWorkflowPrompt())
+	}
+	sort.Slice(names, func(i, j int) bool {
+		left := maxMCPProfilePriority(hawkEyeToolPromptPriorityInSet(r.tools[names[i]], r.tools), fofaMapToolPromptPriorityInSet(r.tools[names[i]], r.tools))
+		right := maxMCPProfilePriority(hawkEyeToolPromptPriorityInSet(r.tools[names[j]], r.tools), fofaMapToolPromptPriorityInSet(r.tools[names[j]], r.tools))
+		if left == right {
+			return names[i] < names[j]
+		}
+		return left > right
+	})
 	const promptBudget = 12000
 	omitted := 0
 	for _, name := range names {
@@ -265,6 +303,63 @@ func (r *Registry) FormatPrompt() string {
 	}
 	b.WriteString(FormatServerInstructions())
 	return b.String()
+}
+
+func maxMCPProfilePriority(values ...int) int {
+	best := 0
+	for _, value := range values {
+		if value > best {
+			best = value
+		}
+	}
+	return best
+}
+
+func isHawkEyeExternalTool(tool *ExternalTool) bool {
+	return IsHawkEyeTool(tool, nil)
+}
+
+func hawkEyeWorkflowPrompt() string {
+	return `【HawkEye MCP 1.0.6 深度适配工作流】
+HawkEye 已出现在本会话工具列表中，就等于已经连通。禁止再用 execute/ls/md5/lsof/config_manage 做安装、端口或文件自检；直接完成用户任务。
+覆盖：本会话禁止用内置 browser_browse/browser_interact 打开、播放或全屏网页。真实浏览器一律走 HawkEye。
+- B站/哔哩哔哩/播放/倍速/全屏：第一步必须 load_skill("bilibili-play")，然后严格按该 skill 执行。合集第 N 集用 https://www.bilibili.com/video/BV...?p=N，不要靠连点播放器碰运气。
+- 打开页面：已知 URL 用 browser_navigate。搜索结果里出现 BV/番剧链接后，再 navigate 到完整 https URL（优先导航，不要点搜索卡片）。整次任务最多 browser_tabs action=new 一次；list 不绑定，已打开的页用 select。
+- 交互顺序：snapshot（看本轮无障碍树，禁止 read_file artifact）→ 高层工具 → snapshot(diff=true) 验证。精确点击必须同时传 text=无障碍名称 和 ref；element 只是说明。清晰度等下拉才用 browser_select_option，value 传可见项（如 1080P）；不要点装饰箭头后满页盲点。
+- 播放/倍速/全屏（对标成功会话）：hawkeye_evaluate 读 video 的 paused/currentTime/playbackRate。倍速主路径是一次 evaluate 设置 video.playbackRate=2，不要点「倍速」菜单。全屏主路径是聚焦播放器后 browser_press_key key=f inputMode=trusted；用 document.fullscreenElement 验证（B站常见 bpx-player-container）。trusted 失败时不得用 JS dispatchEvent 伪装成功，也不得连点「全屏」按钮。
+- 黑屏截图不是没在播：B站全屏走 GPU 层，browser_screenshot 常黑。currentTime 递增才算在播。需要画面时用 hawkeye_evaluate 对 video 做 canvas.drawImage，不要反复截图。
+- 真实用户手势：clickMode=trusted / inputMode=trusted。Chrome 走 CDP trusted input，Firefox 走 native-input relay。
+- 大页面：优先 browser_find/read_text；complete=false 时传 next_cursor。不要对 HawkEye snapshot artifact 做 execute/grep。
+- 抓包：capture_state/start → 触发请求 → history → inspect/request_get。GET 无 body 不是漏抓。
+- 主动验证：先 scope get，仅授权 host 上 mutate → replay/compare；fuzz 需 fuzzingEnabled。
+- 拦截必须收尾：enable → queue → release/drop → disable。
+- 验证码：captcha_assist 先 analyze；第三方挑战请用户手动完成。
+- 不要并行修改同一标签、抓包或拦截状态。evaluate 用于校验播放状态、设 playbackRate、canvas 抓帧；不能代替 trusted 全屏手势。
+
+`
+}
+
+func fofaMapWorkflowPrompt() string {
+	return `【FofaMap MCP v2.0.1 深度适配工作流】
+FofaMap 已出现在本会话工具列表中，就等于已经连通。第一步 load_skill("fofamap")，然后调用 fofa_account / fofa_search 等 MCP 工具。禁止 execute scripts/fofa_recon.py（那是 ClawHub Skill 包装，不是 MCP 2.0.1），禁止 curl/wget 打 FOFA API 或自检密钥。
+- 查询前置：先 fofa_account + fofa_fields 确认账户、vip_level、字段权限和额度。注册用户没有 Host API；个人/教育账户没有 stats API，不要对这类账户调用 fofa_host_profile/fofa_stats。
+- 产品/OA/VPN/中间件/摄像头/CMS：检索前先 fofa_rules（空 keyword 可列出内置目录，不耗额度），原样使用返回的 query/app=；不要凭模型记忆编造 FOFA 产品名。
+- 安全查询：每个消耗额度的查询先 fofa_validate_query；验证通过后再 fofa_search。继续翻页时把 next_cursor 原样交给 fofa_search_next 的 cursor 参数（DeepSentry 也会把 next_cursor 别名成 cursor），不得解析或自行生成 cursor。
+- 嵌套参数：fofa_export / nuclei_plan 的 schema 需要 request 对象。可以直接传 request JSON，也可以扁平传 query/targets，DeepSentry 会自动包进 request。fields 可传 JSON 数组或逗号分隔。
+- 结果处理：小批量聚合用 fofa_stats/fofa_host_profile/icon_search；大结果集使用 fofa_export，记录返回的本地绝对路径和条数，用 fofa_job_status 或 Resource fofamap://jobs/{id} 轮询。宽泛自然语言资产测绘用 fofa_agent_run，组织官网结果保留 website_candidates 的 corroborated/observed/candidate，不要拍板成已确认归属。
+- 主动扫描必须显式授权：仅当用户明确要求扫描其有权测试的目标时，先 nuclei_plan 展示范围、模板和预计影响；获得用户确认后，才把计划返回的一次性令牌原样传给 nuclei_execute。不得跳过 plan，不得复用或伪造令牌。
+- 查询结果仅代表 FOFA 数据快照，不能把网络空间测绘命中直接表述为已验证漏洞；需要区分暴露面线索、被动证据和主动验证结论。认证/额度/超时错误不能当成空结果。
+
+`
+}
+
+func firstNonEmptyMCP(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 // Run 执行 MCP 工具
@@ -364,7 +459,7 @@ func ConnectStdio(cfg ServerConfig) error {
 		"params": map[string]interface{}{
 			"protocolVersion": "2024-11-05",
 			"capabilities":    map[string]interface{}{},
-			"clientInfo":      map[string]string{"name": "deepsentry", "version": "1.0"},
+			"clientInfo":      map[string]string{"name": "deepsentry", "version": ui.Version},
 		},
 	}
 	if err := writeJSONRPC(stdin, initReq); err != nil {
@@ -636,6 +731,10 @@ func validateAndCoerceMCPArgs(schema map[string]interface{}, args map[string]str
 	}
 	if allow, ok := schema["additionalProperties"].(bool); ok && !allow {
 		for name := range args {
+			if isMCPEnvelopeArg(name) {
+				delete(args, name)
+				continue
+			}
 			if _, exists := properties[name]; !exists {
 				return nil, fmt.Errorf("未知参数 %s", name)
 			}
@@ -644,11 +743,15 @@ func validateAndCoerceMCPArgs(schema map[string]interface{}, args map[string]str
 
 	out := make(map[string]interface{}, len(args))
 	for name, raw := range args {
+		if isMCPEnvelopeArg(name) {
+			continue
+		}
 		spec, _ := properties[name].(map[string]interface{})
-		value, err := coerceMCPValue(raw, spec)
+		value, err := coerceMCPValue(raw, spec, schema)
 		if err != nil {
 			return nil, fmt.Errorf("参数 %s: %w", name, err)
 		}
+		spec = resolveMCPSchemaRef(spec, schema)
 		if enum, ok := spec["enum"].([]interface{}); ok && len(enum) > 0 {
 			matched := false
 			for _, allowed := range enum {
@@ -666,9 +769,95 @@ func validateAndCoerceMCPArgs(schema map[string]interface{}, args map[string]str
 	return out, nil
 }
 
-func coerceMCPValue(raw string, spec map[string]interface{}) (interface{}, error) {
-	typeName, _ := spec["type"].(string)
-	switch typeName {
+func isMCPEnvelopeArg(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "thought", "reasoning", "reasoning_content", "is_finished", "final_report", "risk_level", "tool_name", "tool_args", "skill_name":
+		return true
+	default:
+		return false
+	}
+}
+
+func resolveMCPSchemaRef(spec, root map[string]interface{}) map[string]interface{} {
+	if spec == nil {
+		return map[string]interface{}{}
+	}
+	ref, _ := spec["$ref"].(string)
+	if ref == "" || root == nil {
+		return spec
+	}
+	name := ""
+	switch {
+	case strings.HasPrefix(ref, "#/$defs/"):
+		name = strings.TrimPrefix(ref, "#/$defs/")
+	case strings.HasPrefix(ref, "#/definitions/"):
+		name = strings.TrimPrefix(ref, "#/definitions/")
+	default:
+		return spec
+	}
+	defs, _ := root["$defs"].(map[string]interface{})
+	if defs == nil {
+		defs, _ = root["definitions"].(map[string]interface{})
+	}
+	def, _ := defs[name].(map[string]interface{})
+	if def == nil {
+		return spec
+	}
+	merged := make(map[string]interface{}, len(def)+len(spec))
+	for key, value := range def {
+		merged[key] = value
+	}
+	for key, value := range spec {
+		if key == "$ref" {
+			continue
+		}
+		merged[key] = value
+	}
+	return merged
+}
+
+func mcpSchemaType(spec map[string]interface{}) string {
+	if spec == nil {
+		return ""
+	}
+	if typeName, ok := spec["type"].(string); ok {
+		return typeName
+	}
+	types, _ := spec["type"].([]interface{})
+	for _, item := range types {
+		typeName, _ := item.(string)
+		if typeName != "" && typeName != "null" {
+			return typeName
+		}
+	}
+	return ""
+}
+
+func coerceMCPValue(raw string, spec, root map[string]interface{}) (interface{}, error) {
+	spec = resolveMCPSchemaRef(spec, root)
+	if anyOf, ok := spec["anyOf"].([]interface{}); ok && len(anyOf) > 0 {
+		var lastErr error
+		for _, item := range anyOf {
+			itemSpec, _ := item.(map[string]interface{})
+			if mcpSchemaType(resolveMCPSchemaRef(itemSpec, root)) == "null" && strings.TrimSpace(raw) == "" {
+				return nil, nil
+			}
+			value, err := coerceMCPValueWithoutAnyOf(raw, itemSpec, root)
+			if err == nil {
+				return value, nil
+			}
+			lastErr = err
+		}
+		if lastErr != nil {
+			return nil, lastErr
+		}
+	}
+	return coerceMCPValueWithoutAnyOf(raw, spec, root)
+}
+
+func coerceMCPValueWithoutAnyOf(raw string, spec, root map[string]interface{}) (interface{}, error) {
+	spec = resolveMCPSchemaRef(spec, root)
+	switch mcpSchemaType(spec) {
 	case "integer":
 		value, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
 		if err != nil {
@@ -688,11 +877,26 @@ func coerceMCPValue(raw string, spec map[string]interface{}) (interface{}, error
 		}
 		return value, nil
 	case "array":
+		trimmed := strings.TrimSpace(raw)
 		var value []interface{}
-		if err := json.Unmarshal([]byte(raw), &value); err != nil {
-			return nil, fmt.Errorf("需要 JSON array，收到 %q", raw)
+		if err := json.Unmarshal([]byte(trimmed), &value); err == nil {
+			return value, nil
 		}
-		return value, nil
+		if trimmed != "" && !strings.HasPrefix(trimmed, "[") {
+			parts := strings.Split(trimmed, ",")
+			out := make([]interface{}, 0, len(parts))
+			for _, part := range parts {
+				part = strings.TrimSpace(part)
+				if part == "" {
+					continue
+				}
+				out = append(out, part)
+			}
+			if len(out) > 0 {
+				return out, nil
+			}
+		}
+		return nil, fmt.Errorf("需要 JSON array，收到 %q", raw)
 	case "object":
 		var value map[string]interface{}
 		if err := json.Unmarshal([]byte(raw), &value); err != nil {
@@ -700,6 +904,19 @@ func coerceMCPValue(raw string, spec map[string]interface{}) (interface{}, error
 		}
 		return value, nil
 	default:
+		trimmed := strings.TrimSpace(raw)
+		if strings.HasPrefix(trimmed, "{") {
+			var value map[string]interface{}
+			if err := json.Unmarshal([]byte(trimmed), &value); err == nil {
+				return value, nil
+			}
+		}
+		if strings.HasPrefix(trimmed, "[") {
+			var value []interface{}
+			if err := json.Unmarshal([]byte(trimmed), &value); err == nil {
+				return value, nil
+			}
+		}
 		return raw, nil
 	}
 }

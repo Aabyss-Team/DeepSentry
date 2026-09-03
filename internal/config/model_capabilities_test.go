@@ -75,3 +75,40 @@ func TestModelDisplayInfoDistinguishesConfiguredFromAssumedContext(t *testing.T)
 		t.Fatalf("unexpected configured label: %q", configured)
 	}
 }
+
+func TestEffectiveVisionCapabilityRecognizesDeepSeekVisionAndExplicitOverrides(t *testing.T) {
+	auto := (Config{ModelName: "deepseek-v4-flash-vision-exp", VisionMode: "auto"}).EffectiveModelCapabilities()
+	if !auto.SupportsVision || auto.VisionSource != "model-catalog" || auto.ContextWindowTokens != 1_000_000 || auto.DetectionSource != "model-catalog" {
+		t.Fatalf("DeepSeek vision model was not recognized: %#v", auto)
+	}
+	disabled := (Config{ModelName: "deepseek-v4-flash-vision-exp", VisionMode: "disabled"}).EffectiveModelCapabilities()
+	if disabled.SupportsVision || disabled.VisionSource != "config" {
+		t.Fatalf("explicit vision disable did not win: %#v", disabled)
+	}
+	enabled := (Config{ModelName: "private-model", VisionMode: "enabled"}).EffectiveModelCapabilities()
+	if !enabled.SupportsVision || enabled.VisionSource != "config" {
+		t.Fatalf("explicit vision enable did not win: %#v", enabled)
+	}
+}
+
+func TestOfficialChineseMultimodalModelsAreAutoDetected(t *testing.T) {
+	for _, test := range []struct {
+		provider string
+		model    string
+		context  int
+	}{
+		{"deepseek", "deepseek-v4-flash-vision-exp", 1_000_000},
+		{"glm", "glm-5.3-flash", 1_000_000},
+		{"minimax", "MiniMax-M3", 1_000_000},
+		{"mimo", "mimo-v2.5", 1_000_000},
+		{"openai", "gpt-5.6", 1_050_000},
+		{"anthropic", "claude-opus-5", 1_000_000},
+		{"google", "gemini-3.8-flash", 1_048_576},
+		{"qwen", "qwen3.7-plus", 1_000_000},
+	} {
+		capabilities := (Config{Provider: test.provider, ModelName: test.model, VisionMode: "auto"}).EffectiveModelCapabilities()
+		if !capabilities.SupportsVision || capabilities.VisionSource != "model-catalog" || capabilities.ContextWindowTokens != test.context {
+			t.Fatalf("%s/%s capabilities=%#v", test.provider, test.model, capabilities)
+		}
+	}
+}

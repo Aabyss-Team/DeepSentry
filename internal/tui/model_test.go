@@ -8,8 +8,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
+	"image/color"
+	"image/png"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -18,6 +22,204 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/spf13/viper"
 )
+
+func writeTUIImageFixture(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "screen.png")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	img := image.NewRGBA(image.Rect(0, 0, 2, 2))
+	img.Set(0, 0, color.RGBA{B: 255, A: 255})
+	if err := png.Encode(file, img); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestImageSlashCommandAddsValidatedDraftChip(t *testing.T) {
+	m := NewAgentModel(nil, "deepseek-v4-flash-vision-exp", "local", 30, true, false, StartupInfo{})
+	m.width, m.height = 100, 24
+	m.recalcLayout()
+	cmd := m.handleSlashCommand("/image " + writeTUIImageFixture(t))
+	if cmd == nil {
+		t.Fatal("/image did not start attachment preparation")
+	}
+	updated, _ := m.Update(cmd())
+	m = updated.(AgentModel)
+	if len(m.draftImages) != 1 || m.draftImages[0].MediaType != "image/png" {
+		t.Fatalf("image draft missing: %#v", m.draftImages)
+	}
+	if rendered := stripANSIForTest(m.draftDisplayPrefix()); !strings.Contains(rendered, "[图片 1]") || !strings.Contains(rendered, "screen.png") {
+		t.Fatalf("image chip missing: %q", rendered)
+	}
+	m.clearInputDraft()
+	if len(m.draftImages) != 0 {
+		t.Fatal("clearing input must remove image drafts")
+	}
+}
+
+func TestImageSlashCommandRejectsNonImageFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "not-image.png")
+	if err := os.WriteFile(path, []byte("not an image"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m := NewAgentModel(nil, "model", "local", 30, true, false, StartupInfo{})
+	cmd := m.handleSlashCommand("/image " + path)
+	updated, _ := m.Update(cmd())
+	m = updated.(AgentModel)
+	if len(m.draftImages) != 0 || len(m.lines) == 0 || !strings.Contains(m.lines[len(m.lines)-1].content, "附加图片失败") {
+		t.Fatalf("invalid image was accepted or error missing: images=%#v lines=%#v", m.draftImages, m.lines)
+	}
+}
+
+func TestCtrlVPrioritizesClipboardImageAndFallsBackToText(t *testing.T) {
+	imagePath := writeTUIImageFixture(t)
+	imageResult := resolveClipboardPaste(
+		"session",
+		func(string) (string, error) { return imagePath, nil },
+		func() (string, error) { return "text fallback must not win", nil },
+		analyzer.PrepareImageAttachment,
+	)
+	if imageResult.err != nil || imageResult.attachment.Path == "" || imageResult.text != "" {
+		t.Fatalf("Ctrl+V did not prioritize image: %#v", imageResult)
+	}
+
+	textResult := resolveClipboardPaste(
+		"session",
+		func(string) (string, error) { return "", errors.New("no image") },
+		func() (string, error) { return "clipboard text", nil },
+		analyzer.PrepareImageAttachment,
+	)
+	if textResult.err != nil || textResult.text != "clipboard text" || textResult.attachment.Path != "" {
+		t.Fatalf("Ctrl+V text fallback failed: %#v", textResult)
+	}
+
+	m := NewAgentModel(nil, "vision-model", "local", 30, true, false, StartupInfo{})
+	m.input.Focus()
+	updated, _ := m.Update(imageResult)
+	m = updated.(AgentModel)
+	if len(m.draftImages) != 1 {
+		t.Fatalf("Ctrl+V image was not attached to draft: %#v", m.draftImages)
+	}
+	updated, _ = m.Update(textResult)
+	m = updated.(AgentModel)
+	if got := decodeInputValue(m.input.Value()); got != "clipboard text" {
+		t.Fatalf("Ctrl+V text was not inserted: %q", got)
+	}
+}
+
+func TestCtrlVRemovesRejectedClipboardImage(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "clipboard.png")
+	if err := os.WriteFile(path, []byte("not an image"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result := resolveClipboardPaste(
+		"session",
+		func(string) (string, error) { return path, nil },
+		func() (string, error) { return "unused", nil },
+		analyzer.PrepareImageAttachment,
+	)
+	if result.err == nil {
+		t.Fatal("invalid clipboard image was accepted")
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("rejected clipboard image was not removed: %v", err)
+	}
+}
+
+func TestCtrlVShortcutStartsDirectClipboardPaste(t *testing.T) {
+	m := NewAgentModel(nil, "vision-model", "local", 30, true, false, StartupInfo{})
+	m.input.Focus()
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlV})
+	m = updated.(AgentModel)
+	if cmd == nil {
+		t.Fatal("Ctrl+V did not start clipboard paste")
+	}
+	if len(m.lines) == 0 || !strings.Contains(m.lines[len(m.lines)-1].content, "图片优先") {
+		t.Fatalf("Ctrl+V feedback missing: %#v", m.lines)
+	}
+}
+
+func TestCmdVShortcutStartsDirectClipboardPaste(t *testing.T) {
+	m := NewAgentModel(nil, "vision-model", "local", 30, true, false, StartupInfo{})
+	m.input.Focus()
+	if !isClipboardPasteShortcut(tea.KeyMsg{Type: tea.KeyCtrlV}) {
+		t.Fatal("ctrl+v must be a paste shortcut")
+	}
+	updated, cmd := m.Update(macosCmdVMsg{})
+	m = updated.(AgentModel)
+	if cmd == nil {
+		t.Fatal("macOS Command+V watcher message did not start image paste")
+	}
+	updated, _ = m.Update(macosCmdVIgnoredMsg{})
+	if _, ok := updated.(AgentModel); !ok {
+		t.Fatal("ignored Command+V image miss should be a no-op")
+	}
+}
+
+func TestLooksLikeLocalImagePath(t *testing.T) {
+	path := writeTUIImageFixture(t)
+	if got, ok := looksLikeLocalImagePath(path); !ok || got != path {
+		t.Fatalf("absolute image path should attach: got=%q ok=%v", got, ok)
+	}
+	if _, ok := looksLikeLocalImagePath("not-an-image.txt"); ok {
+		t.Fatal("non-image path was treated as an image")
+	}
+}
+
+func TestCtrlVIsNotSwallowedWhenTerminalMarksItAsPaste(t *testing.T) {
+	m := NewAgentModel(nil, "vision-model", "local", 30, true, false, StartupInfo{})
+	m.input.Focus()
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlV, Paste: true})
+	m = updated.(AgentModel)
+	if cmd == nil {
+		t.Fatal("Ctrl+V with Paste=true was swallowed as an empty text paste")
+	}
+	if len(m.lines) == 0 || !strings.Contains(m.lines[len(m.lines)-1].content, "正在读取剪贴板") {
+		t.Fatalf("Ctrl+V feedback missing: %#v", m.lines)
+	}
+}
+
+func TestEmptyBracketedPasteFallsBackToNativeClipboardReader(t *testing.T) {
+	m := NewAgentModel(nil, "vision-model", "local", 30, true, false, StartupInfo{})
+	m.input.Focus()
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Paste: true})
+	m = updated.(AgentModel)
+	if cmd == nil {
+		t.Fatal("empty bracketed paste did not start native clipboard read")
+	}
+}
+
+func TestSkillCommandFieldsAcceptQuotedAndEscapedPackagePaths(t *testing.T) {
+	fields, err := splitSkillCommandFields(`import "/tmp/My Skills/demo.skill" acknowledge-risk`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"import", "/tmp/My Skills/demo.skill", "acknowledge-risk"}
+	if !reflect.DeepEqual(fields, want) {
+		t.Fatalf("quoted fields=%#v want=%#v", fields, want)
+	}
+	fields, err = splitSkillCommandFields(`/skill\ packages/demo.skill force`)
+	if err != nil || len(fields) != 2 || fields[0] != "/skill packages/demo.skill" {
+		t.Fatalf("escaped fields=%#v err=%v", fields, err)
+	}
+}
+
+func TestImageDraftRejectsBatchOverSizeLimitBeforeSubmit(t *testing.T) {
+	m := NewAgentModel(nil, "vision-model", "local", 30, true, false, StartupInfo{})
+	m.draftImages = []analyzer.ImageAttachment{{Name: "first.png", Size: analyzer.MaxImageBatchBytes - 1}}
+	updated, _ := m.Update(imageAttachResultMsg{attachment: analyzer.ImageAttachment{Name: "second.png", MediaType: "image/png", Size: 2}, source: "文件"})
+	m = updated.(AgentModel)
+	if len(m.draftImages) != 1 || len(m.lines) == 0 || !strings.Contains(m.lines[len(m.lines)-1].content, "总大小") {
+		t.Fatalf("oversized image batch was accepted: images=%#v lines=%#v", m.draftImages, m.lines)
+	}
+}
 
 func TestRestoreConversationHistoryShowsDialogueWithoutToolFeedback(t *testing.T) {
 	m := NewAgentModel(nil, "model", "local", 30, false, false, StartupInfo{})
@@ -1026,6 +1228,45 @@ func TestFocusedInputWrapsAndGrowsWithLongText(t *testing.T) {
 	}
 }
 
+func TestShortPasteStaysInlineInsteadOfChip(t *testing.T) {
+	m := NewAgentModel(nil, "model", "local", 30, true, false, StartupInfo{})
+	m.width, m.height = 80, 24
+	m.recalcLayout()
+	mask := "'?uali?s?d?d?d'\n"
+	m.acceptPaste(mask)
+	m.recalcLayout()
+
+	if m.hasPasteBlocks() {
+		t.Fatalf("short 2-line paste must stay inline, parts=%#v", m.draftParts)
+	}
+	if got := decodeInputValue(m.input.Value()); got != mask {
+		t.Fatalf("short paste should insert original text, got %q", got)
+	}
+	rows, _, _ := m.focusedInputRows(ChromeContentWidth(m.width) - 2)
+	rendered := stripANSIForTest(strings.Join(rows, "\n"))
+	if strings.Contains(rendered, "粘贴文本") {
+		t.Fatalf("short paste must not render a chip, got %q", rendered)
+	}
+	if !strings.Contains(rendered, "?uali?s?d?d?d") {
+		t.Fatalf("short paste should show original content, got %q", rendered)
+	}
+}
+
+func TestIsLargePasteMatchesClaudeCodeThreshold(t *testing.T) {
+	if isLargePaste("'?uali?s?d?d?d'\n") {
+		t.Fatal("2-line 16-character paste should stay inline")
+	}
+	if isLargePaste(strings.Repeat("a", largePasteMaxRunes)) {
+		t.Fatal("exactly 800 characters should stay inline")
+	}
+	if !isLargePaste(strings.Repeat("a", largePasteMaxRunes+1)) {
+		t.Fatal("801 characters should collapse")
+	}
+	if !isLargePaste("one\ntwo\nthree") {
+		t.Fatal("3-line paste should collapse")
+	}
+}
+
 func TestLargePasteStillUsesSummaryInsteadOfExpandingInput(t *testing.T) {
 	m := NewAgentModel(nil, "model", "local", 30, true, false, StartupInfo{})
 	m.width = 80
@@ -1051,8 +1292,8 @@ func TestMultipleLargePastesRenderSeparateChipsAndPreservePayload(t *testing.T) 
 	m.width = 120
 	m.height = 24
 	m.recalcLayout()
-	first := strings.Repeat("甲", 400)
-	second := strings.Repeat("乙", 500)
+	first := strings.Repeat("甲", 801)
+	second := strings.Repeat("乙", 900)
 	m.acceptPaste(first)
 	m.acceptPaste(second)
 	m.recalcLayout()
@@ -1064,7 +1305,7 @@ func TestMultipleLargePastesRenderSeparateChipsAndPreservePayload(t *testing.T) 
 		t.Fatalf("full payload mismatch: got=%d runes want=%d", len([]rune(got)), len([]rune(want)))
 	}
 	rendered := stripANSIForTest(m.renderFocusedInputContent(ChromeContentWidth(m.width) - 2))
-	for _, want := range []string{"[粘贴文本 #1 · 1 行 · 400 字符]", "[粘贴文本 #2 · 1 行 · 500 字符]"} {
+	for _, want := range []string{"[粘贴文本 #1 · 1 行 · 801 字符]", "[粘贴文本 #2 · 1 行 · 900 字符]"} {
 		if !strings.Contains(rendered, want) {
 			t.Fatalf("missing independent paste chip %q in %q", want, rendered)
 		}
@@ -1174,7 +1415,7 @@ func TestTypingAfterLargePasteStaysVisibleAndPreservesFullDraft(t *testing.T) {
 	m.width = 120
 	m.height = 24
 	m.recalcLayout()
-	pasted := strings.Repeat("证据", 180)
+	pasted := strings.Repeat("证据", 401)
 	m.acceptPaste(pasted)
 
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("补充说明")})
@@ -1196,8 +1437,8 @@ func TestSubmittedPastesEchoIndependentPreviewsAndTypedSuffix(t *testing.T) {
 	m.width, m.height = 120, 24
 	m.pendingAsk = &askState{respCh: make(chan string, 1)}
 	m.input.Focus()
-	first := "FIRST_PREVIEW " + strings.Repeat("甲", 360)
-	second := "SECOND_PREVIEW " + strings.Repeat("乙", 380)
+	first := "FIRST_PREVIEW " + strings.Repeat("甲", 801)
+	second := "SECOND_PREVIEW " + strings.Repeat("乙", 801)
 	m.acceptPaste(first)
 	m.acceptPaste(second)
 	m.input.SetValue("你好呀")

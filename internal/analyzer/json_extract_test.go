@@ -247,7 +247,7 @@ func TestAgentToolDefinitionsExposeBuiltinsDirectly(t *testing.T) {
 	for _, def := range defs {
 		byName[def.Function.Name] = def.Function
 	}
-	for _, name := range []string{"agent_action", "tool_catalog", "config_manage", "fleet_inventory", "fleet_exec", "fleet_file"} {
+	for _, name := range []string{"agent_action", "tool_catalog", "skill", "config_manage", "fleet_inventory", "fleet_exec", "fleet_file"} {
 		if _, ok := byName[name]; !ok {
 			t.Fatalf("native tool %s missing; got %d definitions", name, len(defs))
 		}
@@ -273,5 +273,22 @@ func TestParseNamedToolCallMapsToHarnessAction(t *testing.T) {
 	}
 	if resp.Action != "tool" || resp.ToolName != "fleet_exec" || resp.ToolArgs["concurrency"] != "3" {
 		t.Fatalf("unexpected mapped response: %#v", resp)
+	}
+}
+
+func TestParseNamedToolCallMapsSkillToLoadSkill(t *testing.T) {
+	resp, err := ParseNamedToolCall("skill", `{"name":"bilibili-play"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Action != "load_skill" || resp.SkillName != "bilibili-play" {
+		t.Fatalf("skill native tool should map to load_skill: %#v", resp)
+	}
+	alias, err := ParseNamedToolCall("load_skill", `{"skill_name":"zipcracker"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if alias.Action != "load_skill" || alias.SkillName != "zipcracker" {
+		t.Fatalf("load_skill alias should map: %#v", alias)
 	}
 }

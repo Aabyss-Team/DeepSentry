@@ -10,6 +10,7 @@ import (
 
 func TestNormalizeChatURL(t *testing.T) {
 	cases := map[string]string{
+		"https://api.deepseek.com":                          "https://api.deepseek.com/chat/completions",
 		"https://token-plan-cn.xiaomimimo.com/v1":           "https://token-plan-cn.xiaomimimo.com/v1/chat/completions",
 		"https://qianfan.baidubce.com/v2/coding":            "https://qianfan.baidubce.com/v2/coding/chat/completions",
 		"https://ark.cn-beijing.volces.com/api/coding/v3":   "https://ark.cn-beijing.volces.com/api/coding/v3/chat/completions",
@@ -17,6 +18,7 @@ func TestNormalizeChatURL(t *testing.T) {
 		"https://api.anthropic.com/v1":                      "https://api.anthropic.com/v1/messages",
 		"https://dashscope.aliyuncs.com/compatible-mode/v1": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
 		"https://api.hunyuan.cloud.tencent.com/v1":          "https://api.hunyuan.cloud.tencent.com/v1/chat/completions",
+		"https://tokenhub.tencentmaas.com/v1":               "https://tokenhub.tencentmaas.com/v1/chat/completions",
 	}
 	for in, want := range cases {
 		got := NormalizeChatURL(in)
@@ -26,14 +28,29 @@ func TestNormalizeChatURL(t *testing.T) {
 	}
 }
 
-func TestApplyProviderDefaultsMimo(t *testing.T) {
-	cfg := &Config{Provider: "mimo", ApiURL: "", ModelName: ""}
-	ApplyProviderDefaults(cfg)
-	if cfg.ModelName != "mimo-v2.5-pro" {
-		t.Fatalf("unexpected default model: %s", cfg.ModelName)
+func TestApplyProviderDefaultsLatestChineseVisionModels(t *testing.T) {
+	tests := []struct {
+		provider string
+		model    string
+		url      string
+	}{
+		{"deepseek", "deepseek-v4-flash-vision-exp", "https://api.deepseek.com/chat/completions"},
+		{"glm", "glm-5.3-flash", "https://open.bigmodel.cn/api/paas/v4/chat/completions"},
+		{"minimax", "MiniMax-M3", "https://api.minimax.cn/v1/chat/completions"},
+		{"mimo", "mimo-v2.5", "https://token-plan-cn.xiaomimimo.com/v1/chat/completions"},
 	}
-	if cfg.ApiURL != "https://token-plan-cn.xiaomimimo.com/v1/chat/completions" {
-		t.Fatalf("unexpected url: %s", cfg.ApiURL)
+	for _, test := range tests {
+		t.Run(test.provider, func(t *testing.T) {
+			cfg := &Config{Provider: test.provider}
+			ApplyProviderDefaults(cfg)
+			if cfg.ModelName != test.model || cfg.ApiURL != test.url || cfg.APIProtocol != ProtocolOpenAIChat {
+				t.Fatalf("unexpected defaults: %+v", cfg)
+			}
+			capabilities := cfg.EffectiveModelCapabilities()
+			if !capabilities.SupportsVision || capabilities.ContextWindowTokens != 1_000_000 {
+				t.Fatalf("unexpected capabilities: %+v", capabilities)
+			}
+		})
 	}
 }
 
@@ -43,11 +60,11 @@ func TestProviderDefaultsChineseOpenAICompatible(t *testing.T) {
 		urlPart  string
 		model    string
 	}{
-		{"qwen", "dashscope.aliyuncs.com", "qwen-plus"},
+		{"qwen", "dashscope.aliyuncs.com", "qwen3.7-plus"},
 		{"qianfan", "qianfan.baidubce.com", "qianfan-code-latest"},
 		{"volcengine", "ark.cn-beijing.volces.com", "ark-code-latest"},
-		{"hunyuan", "hunyuan.cloud.tencent.com", "hunyuan-turbos-latest"},
-		{"tencent_hy", "hunyuan.cloud.tencent.com", "hunyuan-turbos-latest"},
+		{"hunyuan", "tokenhub.tencentmaas.com", "hy4-preview"},
+		{"tencent_hy", "tokenhub.tencentmaas.com", "hy4-preview"},
 		{"teleai", "ctyun.cn", "GLM-5-Pro"},
 		{"ctyun", "ctyun.cn", "GLM-5-Pro"},
 	}
@@ -82,10 +99,58 @@ func TestCodingPlanProviderPresets(t *testing.T) {
 	}
 }
 
+func TestFindModelPresetPreservesTextOnlyVariants(t *testing.T) {
+	for _, test := range []struct {
+		provider string
+		model    string
+		vision   bool
+		context  int
+	}{
+		{"deepseek", "deepseek-v4-pro", false, 1_000_000},
+		{"minimax", "MiniMax-M2.7-highspeed", false, 204_800},
+		{"mimo", "mimo-v2.5-pro", false, 1_000_000},
+		{"custom", "GLM-5.3-FLASH", true, 1_000_000},
+		{"openai", "gpt-5.6", true, 1_050_000},
+		{"anthropic", "claude-opus-5", true, 1_000_000},
+		{"google", "gemini-3.8-flash", true, 1_048_576},
+		{"qwen", "qwen3.7-plus", true, 1_000_000},
+		{"tencent_hy", "hy4-preview", false, 1_000_000},
+		{"grok", "grok-4.6", true, 500_000},
+	} {
+		preset, ok := FindModelPreset(test.provider, test.model)
+		if !ok || preset.SupportsVision != test.vision || preset.ContextWindowTokens != test.context {
+			t.Fatalf("FindModelPreset(%q,%q)=%+v,%v", test.provider, test.model, preset, ok)
+		}
+	}
+}
+
+func TestProviderDefaultsOfficialLatestModels(t *testing.T) {
+	tests := []struct {
+		provider string
+		model    string
+		urlPart  string
+		protocol string
+	}{
+		{"openai", "gpt-5.6", "api.openai.com/v1", ProtocolOpenAIChat},
+		{"anthropic", "claude-opus-5", "api.anthropic.com/v1", ProtocolAnthropicMessages},
+		{"google", "gemini-3.8-flash", "generativelanguage.googleapis.com/v1beta/openai", ProtocolOpenAIChat},
+		{"qwen", "qwen3.7-plus", "dashscope.aliyuncs.com/compatible-mode/v1", ProtocolOpenAIChat},
+		{"hunyuan", "hy4-preview", "tokenhub.tencentmaas.com/v1", ProtocolOpenAIChat},
+		{"xai", "grok-4.6", "api.x.ai/v1", ProtocolOpenAIChat},
+	}
+	for _, test := range tests {
+		cfg := &Config{Provider: test.provider}
+		ApplyProviderDefaults(cfg)
+		if cfg.ModelName != test.model || !contains(cfg.ApiURL, test.urlPart) || cfg.APIProtocol != test.protocol {
+			t.Fatalf("%s unexpected defaults: %+v", test.provider, cfg)
+		}
+	}
+}
+
 func TestProviderDefaultsXAIAndLMStudio(t *testing.T) {
 	xai := &Config{Provider: "xai"}
 	ApplyProviderDefaults(xai)
-	if xai.ModelName == "" || !contains(xai.ApiURL, "api.x.ai") || xai.APIProtocol != ProtocolOpenAIChat {
+	if xai.ModelName != "grok-4.6" || !contains(xai.ApiURL, "api.x.ai") || xai.APIProtocol != ProtocolOpenAIChat {
 		t.Fatalf("unexpected xai defaults: %+v", xai)
 	}
 

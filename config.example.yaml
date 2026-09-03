@@ -3,17 +3,17 @@
 # 支持 api_protocol: auto | openai_chat | anthropic_messages | openai_responses
 
 # 各 provider 的内置预设模型（model_name 留空时自动使用；可随时显式覆盖）:
-#   openai: gpt-5.5 | anthropic: claude-opus-4-8 | google: gemini-3.5-flash
-#   deepseek: deepseek-v4-pro | qwen: qwen-plus | hunyuan/tencent_hy: hunyuan-turbos-latest
+#   openai: gpt-5.6 | anthropic: claude-opus-5 | google: gemini-3.8-flash
+#   deepseek: deepseek-v4-flash-vision-exp | qwen: qwen3.7-plus | hunyuan/tencent_hy: hy4-preview
 #   qianfan: qianfan-code-latest | volcengine: ark-code-latest | teleai/ctyun: GLM-5-Pro
-#   minimax: MiniMax-M3 | glm: glm-5.2 | mimo Token Plan / MiMo Claw: mimo-v2.5-pro
-#   xai/grok: grok-4 | ollama: llama3.3 | lmstudio: local-model
+#   minimax: MiniMax-M3 | glm: glm-5.3-flash | mimo Token Plan / MiMo Claw: mimo-v2.5
+#   xai/grok: grok-4.6 | ollama: llama3.3 | lmstudio: local-model
 
-provider: mimo
+provider: deepseek
 api_protocol: auto
-api_url: https://token-plan-cn.xiaomimimo.com/v1   # 可只填 base /v1，自动补 /chat/completions
+api_url: https://api.deepseek.com                  # 可只填 base，自动补 /chat/completions
 api_key: YOUR_API_KEY
-model_name: mimo-v2.5-pro                          # 留空则用 provider 预设默认模型（见下表）
+model_name: deepseek-v4-flash-vision-exp           # 默认推荐：1M 上下文、多模态图片输入
 temperature: 0.0                                  # 0~2；安全运维/比赛建议保持 0，减少随机漂移
 
 # Agent 运行时。v3 已是默认；遇到兼容问题可显式设为 legacy 回滚。
@@ -31,8 +31,8 @@ terminal_theme: auto                    # auto | dark | light
 # models:
 #   - id: primary
 #     role: primary
-#     provider: mimo
-#     model_name: mimo-v2.5-pro
+#     provider: deepseek
+#     model_name: deepseek-v4-flash-vision-exp
 #     max_retries: 3
 #   - id: local-fallback
 #     role: fallback
@@ -62,6 +62,10 @@ context_window_tokens: 0            # 最重要：服务端实际窗口；0=自�
 context_utilization: 0              # 0=自动；可选 0.40~0.90，为输出和 provider 开销留余量
 reserved_output_tokens: 0           # 0=按窗口自动；也是 API 的输出上限建议值
 native_tool_limit: 0                # 0=按 profile 自动；compact=8, balanced=20, full=全部
+vision_mode: auto                   # auto|enabled|disabled；内置官方模型目录优先，其次按名称保守识别
+# auto 已精确识别：deepseek-v4-flash-vision-exp、glm-5.3-flash、MiniMax-M3、mimo-v2.5、
+# gpt-5.6、claude-opus-5、gemini-3.8-flash、qwen3.7-plus。
+# 已知纯文本变体不会因同厂商而误开图片；代理/自定义模型无法识别时再显式设 enabled。
 # 例：Gemini 1M 可显式填 1048576。Ollama/LM Studio 必须填实际 num_ctx/max_model_len，
 # 不要只按模型卡的理论上限；未配置的本地服务会先按 32768 安全窗口运行。
 
@@ -136,11 +140,14 @@ ssh_host: ""                              # 例："192.0.2.10:22"（文档保留
 ssh_user: root
 ssh_password: ""
 ssh_key_path: ""
+ssh_key_passphrase: ""                     # 加密私钥口令；未加密可留空
 ssh_host_key_policy: accept-new            # strict | accept-new | insecure；正式环境禁止 insecure
 ssh_known_hosts_path: ~/.deepsentry/known_hosts
-ssh_device_type: auto                      # auto | linux | huawei | h3c | ruijie | cisco | generic
+ssh_legacy_compat: true                    # 默认兼容老 OpenSSH / 交换机的 ssh-rsa、DH-SHA1、CBC
+ssh_connect_timeout_sec: 25                # 老设备握手慢时可加大
+ssh_device_type: auto                      # auto | linux | huawei | h3c | ruijie | cisco | asa | juniper | fortinet | paloalto | hillstone | sangfor | checkpoint | generic
 ssh_prompt: ""                             # 网络设备交互 CLI prompt；留空自动探测
-ssh_enable_password: ""                    # 华为/H3C 用于 super，Cisco/锐捷用于 enable；留空不自动提权
+ssh_enable_password: ""                    # 华为/H3C 用于 super，Cisco/锐捷/ASA/山石/深信服用于 enable；留空不自动提权
 
 # Telnet 远程模式（老设备/极简环境，无端口时默认 :23）
 telnet_host: ""
@@ -245,6 +252,31 @@ ftp_transfer_timeout_sec: 90
 #     disabled_tools: ["delete"]
 #     startup_timeout_sec: 30
 #     tool_timeout_sec: 120
+#     required: false
+#     disabled: false
+#
+# FofaMap v2.0.1 MCP 深度适配（先在 FofaMap 目录运行 fofamap init，将密钥保存到系统钥匙串）：
+#   - name: fofamap
+#     type: stdio
+#     # 使用绝对路径，避免 GUI/服务进程没有继承 shell PATH。
+#     command: "/absolute/path/FofaMap/.venv/bin/python"
+#     args: ["/absolute/path/FofaMap/mcp_server.py"]
+#     # 0/省略 = DeepSentry 分工具超时：搜索/导出 120s、Agent 300s、Nuclei 600s。
+#     tool_timeout_sec: 0
+#     startup_timeout_sec: 30
+#     required: false
+#     disabled: false
+#
+# HawkEye MCP 深度适配示例（路径换成本机实际位置）：
+#   - name: hawkeye
+#     type: stdio
+#     command: node
+#     args: ["/absolute/path/Hx0-HawkEye/mcp-server/hawkeye-mcp-server.mjs"]
+#     # 0/省略 = 使用 DeepSentry 的 HawkEye 分工具超时：Research 205s，
+#     # Search/Fetch/Captcha/Fuzz 130s，快照/导航等 100s，其余 60s。
+#     # 如显式填写 tool_timeout_sec，则始终以用户值为准。
+#     tool_timeout_sec: 0
+#     startup_timeout_sec: 30
 #     required: false
 #     disabled: false
 

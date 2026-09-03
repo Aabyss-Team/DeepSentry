@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -69,10 +70,16 @@ func CallLLMWithRetryContext(ctx context.Context, messages []Message, useNativeT
 	}
 	baseCfg := config.GlobalConfig
 	models := baseCfg.EffectiveModels()
+	hasImages := MessagesHaveImages(messages)
 	var lastErr error
 	totalAttempts := 0
+	compatibleModels := 0
 	for modelIndex, model := range models {
 		cfg := baseCfg.ConfigForModel(model)
+		if hasImages && !cfg.EffectiveModelCapabilities().SupportsVision {
+			continue
+		}
+		compatibleModels++
 		retries := model.MaxRetries
 		for attempt := 0; attempt <= retries; attempt++ {
 			totalAttempts++
@@ -104,6 +111,12 @@ func CallLLMWithRetryContext(ctx context.Context, messages []Message, useNativeT
 		if modelIndex+1 >= len(models) || !shouldFailover(baseCfg, lastErr) {
 			break
 		}
+	}
+	if hasImages && compatibleModels == 0 {
+		return LLMResult{}, errors.New("当前模型链没有启用视觉能力；请将视觉模型的 vision_mode 设为 enabled，或使用名称包含 vision/VL 的模型")
+	}
+	if lastErr == nil {
+		lastErr = errors.New("没有可用的模型")
 	}
 	return LLMResult{}, fmt.Errorf("LLM 调用失败(总尝试 %d 次): %w", totalAttempts, lastErr)
 }
@@ -190,10 +203,22 @@ func llmRetryDelay(attempt int) time.Duration {
 }
 
 type responsesRequest struct {
-	Model           string  `json:"model"`
-	Input           string  `json:"input"`
-	Temperature     float64 `json:"temperature,omitempty"`
-	MaxOutputTokens int     `json:"max_output_tokens,omitempty"`
+	Model           string      `json:"model"`
+	Input           interface{} `json:"input"`
+	Temperature     float64     `json:"temperature,omitempty"`
+	MaxOutputTokens int         `json:"max_output_tokens,omitempty"`
+}
+
+type responsesInputMessage struct {
+	Role    string                  `json:"role"`
+	Content []responsesContentBlock `json:"content"`
+}
+
+type responsesContentBlock struct {
+	Type     string `json:"type"`
+	Text     string `json:"text,omitempty"`
+	ImageURL string `json:"image_url,omitempty"`
+	Detail   string `json:"detail,omitempty"`
 }
 
 type responsesResponse struct {
@@ -224,9 +249,13 @@ func callOpenAIResponses(ctx context.Context, cfg config.Config, messages []Mess
 			url += "/v1/responses"
 		}
 	}
+	input, err := buildOpenAIResponsesInput(messages)
+	if err != nil {
+		return LLMResult{}, err
+	}
 	reqBody := responsesRequest{
 		Model:           cfg.ModelName,
-		Input:           messagesToTranscript(messages),
+		Input:           input,
 		Temperature:     effectiveTemperature(cfg),
 		MaxOutputTokens: cfg.EffectiveModelCapabilities().ReservedOutputTokens,
 	}
@@ -276,9 +305,43 @@ func messagesToTranscript(messages []Message) string {
 		b.WriteString(role)
 		b.WriteString(":\n")
 		b.WriteString(m.Content)
+		if summary := attachmentSummary(m.Attachments); summary != "" {
+			if strings.TrimSpace(m.Content) != "" {
+				b.WriteString("\n")
+			}
+			b.WriteString(summary)
+		}
 		b.WriteString("\n\n")
 	}
 	return b.String()
+}
+
+func buildOpenAIResponsesInput(messages []Message) (interface{}, error) {
+	if !MessagesHaveImages(messages) {
+		return messagesToTranscript(messages), nil
+	}
+	blocks := []responsesContentBlock{{Type: "input_text", Text: messagesToTranscript(messages)}}
+	for _, message := range messages {
+		if len(message.Attachments) == 0 {
+			continue
+		}
+		images, err := materializeImages(message.Attachments)
+		if err != nil {
+			return nil, err
+		}
+		for _, image := range images {
+			detail := image.Attachment.Detail
+			if detail == "" {
+				detail = "auto"
+			}
+			blocks = append(blocks, responsesContentBlock{
+				Type:     "input_image",
+				ImageURL: "data:" + image.Attachment.MediaType + ";base64," + base64.StdEncoding.EncodeToString(image.Data),
+				Detail:   detail,
+			})
+		}
+	}
+	return []responsesInputMessage{{Role: "user", Content: blocks}}, nil
 }
 
 func isRetryable(err error) bool {
@@ -339,9 +402,13 @@ func isMaxTokensUnsupported(err error) bool {
 func callOpenAICompatible(ctx context.Context, cfg config.Config, messages []Message, withTools bool, onStream func(string)) (LLMResult, error) {
 	url := config.NormalizeChatURL(cfg.ApiURL)
 	useStream := onStream != nil
+	chatMessages, err := buildOpenAIChatMessages(messages)
+	if err != nil {
+		return LLMResult{}, err
+	}
 	reqBody := ChatRequest{
 		Model:       cfg.ModelName,
-		Messages:    messages,
+		Messages:    chatMessages,
 		Stream:      useStream,
 		Temperature: effectiveTemperature(cfg),
 		MaxTokens:   cfg.EffectiveModelCapabilities().ReservedOutputTokens,
@@ -429,7 +496,7 @@ func pinnedNativeToolNames(messages []Message) []string {
 	}
 	selected := make(map[string]bool)
 	for _, message := range messages {
-		if message.Role == "tool" && known[message.Name] && message.Name != "tool_catalog" && message.Name != "agent_action" {
+		if message.Role == "tool" && known[message.Name] && !alwaysVisibleNativeTool(message.Name) {
 			selected[message.Name] = true
 		}
 		if message.Role != "system" {
@@ -447,7 +514,7 @@ func pinnedNativeToolNames(messages []Message) []string {
 			}
 			for _, name := range strings.Split(list, ",") {
 				name = strings.TrimSpace(name)
-				if known[name] && name != "tool_catalog" && name != "agent_action" {
+				if known[name] && !alwaysVisibleNativeTool(name) {
 					selected[name] = true
 				}
 			}
@@ -608,8 +675,20 @@ type anthropicRequest struct {
 }
 
 type anthropicMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role    string      `json:"role"`
+	Content interface{} `json:"content"`
+}
+
+type anthropicContentBlock struct {
+	Type   string                `json:"type"`
+	Text   string                `json:"text,omitempty"`
+	Source *anthropicImageSource `json:"source,omitempty"`
+}
+
+type anthropicImageSource struct {
+	Type      string `json:"type"`
+	MediaType string `json:"media_type"`
+	Data      string `json:"data"`
 }
 
 type anthropicResponse struct {
@@ -644,7 +723,26 @@ func callAnthropic(ctx context.Context, cfg config.Config, messages []Message) (
 				}
 				content = "Tool calls requested: " + strings.Join(calls, ", ")
 			}
-			if strings.TrimSpace(content) != "" {
+			if len(m.Attachments) > 0 {
+				if m.Role != "user" {
+					return LLMResult{}, errors.New("Anthropic 图片附件只能出现在 user 消息中")
+				}
+				images, err := materializeImages(m.Attachments)
+				if err != nil {
+					return LLMResult{}, err
+				}
+				if strings.TrimSpace(content) == "" {
+					content = "请分析所附图片，并结合当前任务继续。"
+				}
+				blocks := []anthropicContentBlock{{Type: "text", Text: content}}
+				for _, image := range images {
+					blocks = append(blocks, anthropicContentBlock{Type: "image", Source: &anthropicImageSource{
+						Type: "base64", MediaType: image.Attachment.MediaType,
+						Data: base64.StdEncoding.EncodeToString(image.Data),
+					}})
+				}
+				msgs = append(msgs, anthropicMessage{Role: m.Role, Content: blocks})
+			} else if strings.TrimSpace(content) != "" {
 				msgs = append(msgs, anthropicMessage{Role: m.Role, Content: content})
 			}
 		case "tool":

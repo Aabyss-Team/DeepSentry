@@ -237,6 +237,36 @@ var explicitContracts = map[string]ToolContract{
 	},
 	"archive_pack":    archiveContract("将 source 打包到 dest"),
 	"archive_extract": archiveContract("将 source 安全解压到 dest"),
+	"zip_password_recover": {
+		Args: []ArgSpec{
+			{Name: "action", Type: "string", Description: "ZIP 解密第一步就调这个。默认 auto（伪加密→CRC32→字典/掩码）；有 -m 用 recover 并原样传 mask。不要先 python/unzip", Enum: []string{"auto", "inspect", "repair", "crc32", "recover"}},
+			{Name: "source", Type: "string", Description: "控制端本地 ZIP 文件路径；每次调用必填", Required: true, Example: "/tmp/evidence.zip"},
+			{Name: "dictionary", Type: "string", Description: "字典文件/目录，或 builtin/6000.txt 使用内置约 6000 条弱口令"},
+			{Name: "passwords", Type: "string", Description: "候选口令，使用换行或逗号分隔"},
+			{Name: "mask", Type: "string", Description: "掩码：?d 数字、?l 小写、?u 大写、?s 符号（Python punctuation）、?? 字面问号；字面字母直接写，如 ?uali?s?d?d?d", Example: "?uali?s?d?d?d"},
+			{Name: "workers", Type: "integer", Description: "并发数；默认 CPU 数，最大 64"},
+			{Name: "max_attempts", Type: "integer", Description: "最大尝试次数；默认 1200000，最大 100000000"},
+			{Name: "timeout_sec", Type: "integer", Description: "超时秒数；默认 300，最大 3600"},
+			{Name: "extract", Type: "boolean", Description: "成功后是否安全解压；auto 默认 true，其余默认 false"},
+			{Name: "dest", Type: "string", Description: "extract 的输出目录，或 repair 的新 ZIP 路径；不覆盖已有路径"},
+		},
+		Actions: []ActionSpec{
+			{Name: "auto", Description: "ZipCracker 默认顺序：伪加密修复 → 1-6 字节 CRC32 内容恢复 → 内置 6000 字典 → 1-6 位数字", Required: []string{"source"}},
+			{Name: "inspect", Description: "只读检查条目、加密类型、短明文 CRC32 候选，并给出带 source 的下一步", Required: []string{"source"}},
+			{Name: "repair", Description: "清除 ZIP 伪加密标志并完整校验，在新文件写出", Required: []string{"source"}},
+			{Name: "crc32", Description: "对 1～6 字节条目按记录的 CRC32 枚举可打印明文；命中的是文件内容而不是口令", Required: []string{"source"}},
+			{Name: "recover", Description: "按显式候选、字典和掩码恢复口令；未提供策略时使用内置 6000 字典与 1-6 位数字", Required: []string{"source"}},
+		},
+		Examples: []map[string]string{
+			{"action": "auto", "source": "/tmp/evidence.zip", "extract": "true"},
+			{"action": "inspect", "source": "/tmp/evidence.zip"},
+			{"action": "repair", "source": "/tmp/evidence.zip", "dest": "/tmp/evidence.repaired.zip"},
+			{"action": "crc32", "source": "/tmp/evidence.zip", "extract": "true"},
+			{"action": "recover", "source": "/tmp/evidence.zip", "dictionary": "6000.txt", "max_attempts": "1000000"},
+			{"action": "recover", "source": "/tmp/evidence.zip", "mask": "team?d?d?d?d", "extract": "true", "dest": "/tmp/evidence-unpacked"},
+			{"action": "recover", "source": "/tmp/test04.zip", "mask": "?uali?s?d?d?d", "extract": "true"},
+		},
+	},
 	"script_run": {
 		Args: []ArgSpec{
 			{Name: "language", Type: "string", Description: "脚本语言，默认 python", Enum: []string{"python", "shell"}},
@@ -308,10 +338,10 @@ var explicitContracts = map[string]ToolContract{
 	},
 	"skill_market": {
 		Args: []ArgSpec{
-			{Name: "action", Type: "string", Description: "Skill 市场动作", Required: true, Enum: []string{"search", "inspect", "install", "managed", "check_updates", "update", "pin", "unpin", "uninstall", "rollback", "audit"}},
+			{Name: "action", Type: "string", Description: "Skill 搜索/本地导入/管理动作", Required: true, Enum: []string{"search", "inspect", "install", "import", "managed", "check_updates", "update", "pin", "unpin", "uninstall", "rollback", "audit"}},
 			{Name: "query", Type: "string", Description: "search 的关键词"},
 			{Name: "market", Type: "string", Description: "搜索市场，默认 all", Enum: []string{"all", "clawhub", "skills.sh"}},
-			{Name: "source", Type: "string", Description: "inspect/install 的来源引用，例如 clawhub:slug 或 skills:owner/repo@skill"},
+			{Name: "source", Type: "string", Description: "inspect/install/import 的来源；支持本地 /path/name.skill、clawhub:slug 或 skills:owner/repo@skill"},
 			{Name: "limit", Type: "integer", Description: "每个市场最多返回数量，默认 8，最大 30"},
 			{Name: "confirm_install", Type: "boolean", Description: "确认用户明确要求安装第三方 Skill；install 必填 true"},
 			{Name: "acknowledge_risk", Type: "boolean", Description: "当市场标为可疑或本地静态审查发现风险，且用户复核后仍明确同意时传 true"},
@@ -327,6 +357,7 @@ var explicitContracts = map[string]ToolContract{
 			{Name: "search", Description: "跨市场只读搜索，不安装或执行第三方代码", Required: []string{"query"}},
 			{Name: "inspect", Description: "检查来源、流行度、版本和市场安全状态", Required: []string{"source"}},
 			{Name: "install", Description: "下载、静态审查并原子安装；必须基于用户明确要求", Required: []string{"source", "confirm_install"}},
+			{Name: "import", Description: "导入本地 .skill（ZIP 包或单文件 Skill），静态审查后原子安装", Required: []string{"source", "confirm_install"}},
 			{Name: "managed", Description: "列出由 DeepSentry 市场安装并锁定来源的 Skill"},
 			{Name: "check_updates", Description: "只读检查远端版本，不下载或执行代码"},
 			{Name: "update", Description: "更新一个或全部未冻结 Skill，并保留旧版本备份", Required: []string{"confirm_update"}},
@@ -336,7 +367,7 @@ var explicitContracts = map[string]ToolContract{
 			{Name: "rollback", Description: "从受控备份恢复旧版本", Required: []string{"name", "confirm_rollback"}},
 			{Name: "audit", Description: "静态审查用户 Skill 的格式、体积、链接与危险模式"},
 		},
-		Examples: []map[string]string{{"action": "search", "query": "log analysis", "market": "all"}, {"action": "inspect", "source": "clawhub:security-audit"}},
+		Examples: []map[string]string{{"action": "search", "query": "log analysis", "market": "all"}, {"action": "import", "source": "/tmp/log-forensics.skill", "confirm_install": "true"}, {"action": "inspect", "source": "clawhub:security-audit"}},
 	},
 	"mcp_resource": {
 		Args: []ArgSpec{
@@ -499,6 +530,44 @@ func JSONSchema(name string) map[string]interface{} {
 	return schema
 }
 
+// coerceShadowActionArgs drops mistaken extra keys that duplicate an action
+// name (for example crc32=true alongside action=auto). If action is empty and
+// the extra key looks truthy, it becomes the action.
+func coerceShadowActionArgs(contract ToolContract, args map[string]string) {
+	if len(args) == 0 || len(contract.Actions) == 0 {
+		return
+	}
+	knownArgs := make(map[string]bool, len(contract.Args))
+	for _, spec := range contract.Args {
+		knownArgs[spec.Name] = true
+	}
+	actions := make(map[string]bool, len(contract.Actions))
+	for _, spec := range contract.Actions {
+		actions[spec.Name] = true
+	}
+	current := strings.TrimSpace(args["action"])
+	for key, value := range args {
+		if knownArgs[key] || !actions[key] {
+			continue
+		}
+		if current == "" && isTruthyActionShadow(value, key) {
+			args["action"] = key
+			current = key
+		}
+		delete(args, key)
+	}
+}
+
+func isTruthyActionShadow(value, action string) bool {
+	value = strings.TrimSpace(strings.ToLower(value))
+	switch value {
+	case "", "true", "1", "yes", "on", strings.ToLower(action):
+		return true
+	default:
+		return false
+	}
+}
+
 // ValidateCall catches hallucinated/omitted parameters before a tool mutates
 // state. It deliberately validates canonical names; legacy aliases remain an
 // implementation compatibility detail rather than something taught to models.
@@ -507,6 +576,7 @@ func ValidateCall(name string, args map[string]string) error {
 	if !ok {
 		return fmt.Errorf("未知工具 %q%s", name, suggestionSuffix(name, ListNames()))
 	}
+	coerceShadowActionArgs(contract, args)
 	known := make(map[string]ArgSpec, len(contract.Args))
 	for _, spec := range contract.Args {
 		known[spec.Name] = spec

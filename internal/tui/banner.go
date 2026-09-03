@@ -31,6 +31,7 @@ type StartupInfo struct {
 	SubAgentCount int
 	SkillCount    int
 	MCPCount      int
+	MCPSummary    string // 例如 "2 个已连接 · fofamap 15 · hx0-hawkeye 51"
 	TargetCount   int
 	MaxSteps      int
 	BatchMode     bool
@@ -86,9 +87,15 @@ func renderCompactWelcomeBanner(info StartupInfo, width int) string {
 	for _, line := range wrapPlain(brandTagline, innerW) {
 		rows = append(rows, centerStyledLine(styleBannerTagline.Render(line), innerW))
 	}
+	rows = append(rows, centerStyledLine(styleBannerLabel.Render(ui.StudioSiteLine), innerW))
 	rows = append(rows,
 		compactBannerSection("模型", firstNonEmpty(info.ModelInfo, "-"), innerW),
 		compactBannerSection("连接", firstNonEmpty(info.ConnInfo, "本地模式"), innerW),
+	)
+	if summary := strings.TrimSpace(info.MCPSummary); summary != "" {
+		rows = append(rows, compactBannerSection("MCP", summary, innerW))
+	}
+	rows = append(rows,
 		compactBannerSection("小技巧", firstNonEmpty(info.Tip, "Tab 聚焦输入框"), innerW),
 		compactBannerSection("就绪", compactReadyText(info), innerW),
 	)
@@ -122,8 +129,9 @@ func buildBannerLeft(info StartupInfo, colW int) []string {
 	for _, line := range wrapPlain(brandTagline, colW) {
 		lines = append(lines, centerStyledLine(styleBannerTagline.Render(line), colW))
 	}
-	meta := fmt.Sprintf("Build · %s · Hx0 Team", sanitizeTUIText(firstNonEmpty(info.BuildTime, "dev")))
+	meta := fmt.Sprintf("Build · %s · %s", sanitizeTUIText(firstNonEmpty(info.BuildTime, "dev")), ui.StudioName)
 	lines = append(lines, centerStyledLine(styleBannerLabel.Render(meta), colW))
+	lines = append(lines, centerStyledLine(styleBannerLabel.Render(ui.StudioSiteLine), colW))
 	return lines
 }
 
@@ -216,8 +224,10 @@ func buildBannerRight(info StartupInfo, width int, tip string) []string {
 	if info.SkillCount > 0 {
 		capability += fmt.Sprintf(" · %d Skills", info.SkillCount)
 	}
-	if info.MCPCount > 0 {
-		capability += fmt.Sprintf(" · %d MCP", info.MCPCount)
+
+	mcpSummary := strings.TrimSpace(info.MCPSummary)
+	if mcpSummary == "" && info.MCPCount > 0 {
+		mcpSummary = fmt.Sprintf("%d 个已连接", info.MCPCount)
 	}
 
 	steps := fmt.Sprintf("最多 %d 步/任务", max(info.MaxSteps, 30))
@@ -232,13 +242,18 @@ func buildBannerRight(info StartupInfo, width int, tip string) []string {
 		ready = "描述安全任务后 Enter 开始"
 	}
 
-	lines := bannerTipLines(tip, width)
+	lines := bannerLabeledLines("小技巧", tip, width)
 	lines = append(lines,
 		bannerSection("环境", runtime, width),
 		bannerSection("主机", firstNonEmpty(info.Hostname, "-"), width),
 		bannerSection("连接", conn, width),
 		bannerSection("模型", firstNonEmpty(info.ModelInfo, "-"), width),
 		bannerSection("能力", capability, width),
+	)
+	if mcpSummary != "" {
+		lines = append(lines, bannerLabeledLines("MCP", mcpSummary, width)...)
+	}
+	lines = append(lines,
 		bannerSection("步数", steps, width),
 		bannerSection("时间", firstNonEmpty(info.StartedAt, time.Now().Format("2006-01-02 15:04:05")), width),
 		bannerSection("目录", truncatePath(info.WorkDir, width), width),
@@ -255,11 +270,11 @@ func buildBannerRight(info StartupInfo, width int, tip string) []string {
 	return lines
 }
 
-// bannerTipLines 给更长的新功能提示预留两行，避免启动页只显示前半句。
+// bannerLabeledLines 给更长的新功能提示或 MCP 清单预留两行。
 // 第二行与值列对齐，保持“小技巧 ·”标签和右侧信息列的视觉节奏。
-func bannerTipLines(value string, width int) []string {
+func bannerLabeledLines(title, value string, width int) []string {
 	value = sanitizeTUIText(value)
-	label := styleBannerHeading.Render("小技巧")
+	label := styleBannerHeading.Render(sanitizeTUIText(title))
 	sep := styleBannerLabel.Render(" · ")
 	prefixW := lipgloss.Width(label) + lipgloss.Width(sep)
 	valueW := max(1, width-prefixW)
@@ -299,9 +314,9 @@ func bannerSection(title, value string, width int) string {
 }
 
 func joinBannerRows(left, right []string, leftW, rightW, innerW int) []string {
-	height := max(len(left), len(right))
-	left = padLines(left, height)
-	right = padLines(right, height)
+	height := max(len(left), len(right)) + 2
+	left = padLinesCentered(left, height)
+	right = padLinesCentered(right, height)
 	div := styleBannerDivider.Render("│")
 	rows := make([]string, height)
 	for i := 0; i < height; i++ {
@@ -376,11 +391,20 @@ func shortenModeLine(line string) string {
 	return truncateStr(line, 20)
 }
 
-func padLines(lines []string, n int) []string {
+// padLinesCentered vertically centers a column inside the banner box.
+// Odd leftover rows go above so content sits a touch lower than mathematical
+// center (the robot antenna otherwise looks top-heavy).
+func padLinesCentered(lines []string, n int) []string {
 	if len(lines) >= n {
 		return lines
 	}
-	out := append([]string(nil), lines...)
+	gap := n - len(lines)
+	top := (gap + 1) / 2
+	out := make([]string, 0, n)
+	for i := 0; i < top; i++ {
+		out = append(out, "")
+	}
+	out = append(out, lines...)
 	for len(out) < n {
 		out = append(out, "")
 	}

@@ -14,6 +14,10 @@ func copyToClipboard(text string) error {
 	return clipboard.WriteAll(text)
 }
 
+func readClipboardText() (string, error) {
+	return clipboard.ReadAll()
+}
+
 func stripANSI(s string) string {
 	var b strings.Builder
 	inSeq := false

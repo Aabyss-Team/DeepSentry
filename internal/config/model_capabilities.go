@@ -33,6 +33,8 @@ func (c Config) ModelDisplayInfo() string {
 		source = "名称推断"
 	case "provider-default":
 		source = "厂商预设"
+	case "model-catalog":
+		source = "官方模型目录"
 	}
 	return fmt.Sprintf("%s / %s · ctx%s%s[%s]", provider, model, operator, formatModelTokenCapacity(capabilities.ContextWindowTokens), source)
 }
@@ -69,6 +71,8 @@ type ModelCapabilities struct {
 	SummaryChunkTokens   int
 	SystemPromptTokens   int
 	DetectionSource      string
+	SupportsVision       bool
+	VisionSource         string
 }
 
 func (c Config) EffectiveModelCapabilities() ModelCapabilities {
@@ -79,14 +83,16 @@ func (c Config) EffectiveModelCapabilities() ModelCapabilities {
 	}
 	window, source := c.ContextWindowTokens, "config"
 	if window <= 0 {
-		if hinted := inferContextWindow(c.ModelName); hinted > 0 {
+		if preset, ok := FindModelPreset(c.Provider, c.ModelName); ok && preset.ContextWindowTokens > 0 {
+			window, source = preset.ContextWindowTokens, "model-catalog"
+		} else if hinted := inferContextWindow(c.ModelName); hinted > 0 {
 			window, source = hinted, "model-name"
 		} else if strings.EqualFold(c.Provider, string(ProviderGoogle)) || strings.Contains(strings.ToLower(c.ModelName), "gemini") {
 			// Current Gemini text families expose 1M context. Explicit config
 			// always wins if a specific variant differs.
 			window, source = 1_048_576, "provider-default"
 		} else if strings.EqualFold(c.Provider, string(ProviderAnthropic)) {
-			window, source = 200_000, "provider-default"
+			window, source = 1_000_000, "provider-default"
 		} else if local {
 			// Local servers often lower the model's advertised context via
 			// num_ctx/max_model_len. Stay conservative unless configured.
@@ -153,6 +159,7 @@ func (c Config) EffectiveModelCapabilities() ModelCapabilities {
 	}
 	summaryChunk = maxInt(2_048, summaryChunk)
 
+	vision, visionSource := c.effectiveVisionCapability()
 	return ModelCapabilities{
 		Local:                local,
 		ParameterBillions:    parameterB,
@@ -164,7 +171,36 @@ func (c Config) EffectiveModelCapabilities() ModelCapabilities {
 		KeepRecentMessages:   keepRecent,
 		SummaryChunkTokens:   summaryChunk,
 		DetectionSource:      source,
+		SupportsVision:       vision,
+		VisionSource:         visionSource,
 	}
+}
+
+func (c Config) effectiveVisionCapability() (bool, string) {
+	mode := strings.ToLower(strings.TrimSpace(c.VisionMode))
+	switch mode {
+	case "enabled", "enable", "true", "required", "on":
+		return true, "config"
+	case "disabled", "disable", "false", "off":
+		return false, "config"
+	}
+	model := strings.ToLower(strings.TrimSpace(c.ModelName))
+	if preset, ok := FindModelPreset(c.Provider, c.ModelName); ok {
+		return preset.SupportsVision, "model-catalog"
+	}
+	hints := []string{
+		"vision", "multimodal", "gpt-4o", "gpt-4.1", "gpt-5", "claude-", "gemini-",
+		"qwen-vl", "qwen2-vl", "qwen3-vl", "deepseek-vl", "llava", "pixtral", "internvl", "minicpm-v",
+	}
+	for _, hint := range hints {
+		if strings.Contains(model, hint) {
+			return true, "model-name"
+		}
+	}
+	if strings.HasSuffix(model, "-vl") || strings.Contains(model, "-vl-") {
+		return true, "model-name"
+	}
+	return false, "safe-default"
 }
 
 func (m ModelCapabilities) HistoryBudgetTokens(systemPromptTokens int) int {

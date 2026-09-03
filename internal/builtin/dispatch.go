@@ -182,6 +182,8 @@ func Run(name string, args map[string]string, rt Runtime) (string, error) {
 		return ArchivePack(rt, arg(args, "format", "type"), arg(args, "source", "src", "path"), arg(args, "dest", "dst", "output"))
 	case "archive_extract":
 		return ArchiveExtract(rt, arg(args, "format", "type"), arg(args, "source", "src", "path"), arg(args, "dest", "dst", "output"))
+	case "zip_password_recover":
+		return ZipPasswordRecover(rt, args)
 	case "tcp_forward":
 		return TCPForward(rt, arg(args, "action"), arg(args, "listen_host", "lhost"), arg(args, "listen_port", "lport"), arg(args, "target_host", "rhost", "host"), arg(args, "target_port", "rport", "port"))
 	case "socks5_proxy":

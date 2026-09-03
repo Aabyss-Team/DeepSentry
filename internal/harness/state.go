@@ -2,23 +2,35 @@ package harness
 
 import (
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
 
 // AgentState 持久化 Agent 运行时状态（对标 DeepAgentState）
 type AgentState struct {
-	Todos              []TodoItem
-	LoadedSkills       map[string]string // skill name -> full content
-	Memory             map[string]string // 会话内临时 KV（不落盘）
-	CoreClues          []CoreClue        // 会话级核心线索，checkpoint 持久化并共享给子 Agent
-	SelectedTools      map[string]bool   // 当前任务经 tool_search/实际调用验证过的工具
-	PendingToolCalls   map[string]ToolCallRecord
-	CompletedToolCalls map[string]ToolCallRecord
-	Artifacts          []ArtifactRecord
-	WorkspaceDir       string // 工具输出卸载目录
-	SessionID          string // checkpoint/session id，用于隔离输出卸载文件
-	mu                 sync.RWMutex
+	Todos                 []TodoItem
+	LoadedSkills          map[string]string // skill name -> full content
+	Memory                map[string]string // 会话内临时 KV（不落盘）
+	CoreClues             []CoreClue        // 会话级核心线索，checkpoint 持久化并共享给子 Agent
+	SelectedTools         map[string]bool   // 当前任务经 tool_search/实际调用验证过的工具
+	TriedTools            map[string]bool   `json:"tried_tools,omitempty"` // 本会话已真正执行过的工具（用于 ZIP 原生优先等路由）
+	PendingToolCalls      map[string]ToolCallRecord
+	CompletedToolCalls    map[string]ToolCallRecord
+	Artifacts             []ArtifactRecord
+	WorkspaceDir          string // 工具输出卸载目录
+	SessionID             string // checkpoint/session id，用于隔离输出卸载文件
+	LastActionFingerprint string
+	LastActionRepeat      int
+	LastOutputHash        string
+	LastFailed            bool
+	LastErrorClass        string
+	StallCount            int
+	FailStreak            int
+	NoProgressStreak      int
+	TimeoutStreak         int
+	StepsSinceTodo        int
+	mu                    sync.RWMutex
 }
 
 // NewAgentState 创建初始状态
@@ -33,6 +45,7 @@ func NewAgentStateWithSession(workspaceDir, sessionID string) *AgentState {
 		Memory:             make(map[string]string),
 		CoreClues:          []CoreClue{},
 		SelectedTools:      make(map[string]bool),
+		TriedTools:         make(map[string]bool),
 		PendingToolCalls:   make(map[string]ToolCallRecord),
 		CompletedToolCalls: make(map[string]ToolCallRecord),
 		Artifacts:          []ArtifactRecord{},
@@ -79,6 +92,47 @@ func (s *AgentState) MarkSelectedTool(name string) {
 		s.SelectedTools = make(map[string]bool)
 	}
 	s.SelectedTools[name] = true
+}
+
+func (s *AgentState) MarkTriedTool(name string) {
+	if s == nil || name == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.markTriedToolLocked(name)
+}
+
+func (s *AgentState) markTriedToolLocked(name string) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return
+	}
+	if s.TriedTools == nil {
+		s.TriedTools = make(map[string]bool)
+	}
+	s.TriedTools[name] = true
+}
+
+func (s *AgentState) HasTriedTool(name string) bool {
+	if s == nil || name == "" {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.hasTriedToolLocked(name)
+}
+
+func (s *AgentState) hasTriedToolLocked(name string) bool {
+	if s.TriedTools[name] {
+		return true
+	}
+	for _, record := range s.CompletedToolCalls {
+		if strings.EqualFold(record.Name, name) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *AgentState) SelectedToolNames() []string {

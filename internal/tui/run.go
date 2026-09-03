@@ -58,6 +58,7 @@ func Run(cfg SessionConfig) error {
 	m.refreshViewport()
 	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseAllMotion(), tea.WithOutput(newInputCursorOutput(os.Stdout, m.cursorAnchor)))
 	ctrl.SetProgram(p)
+	defer startMacOSCmdVWatcher(p)()
 
 	go ctrl.pumpEvents()
 

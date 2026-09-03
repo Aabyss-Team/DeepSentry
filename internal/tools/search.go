@@ -57,6 +57,7 @@ var toolSearchAliases = map[string][]string{
 	"file_hash":              {"伪装二进制", "文件哈希", "sha256", "完整性"},
 	"pcap_analyze":           {"pcap", "恶意域名", "tls sni", "流量线索"},
 	"document_parse":         {"office文档", "docx", "xlsx", "文档元信息"},
+	"zip_password_recover":   {"zipcracker", "zip密码", "压缩包密码", "伪加密", "zipcrypto", "winzip aes", "字典爆破", "掩码爆破", "crc32", "四位数字"},
 	"fleet_inventory":        {"fleet清单", "多目标清单", "目标盘点"},
 	"fleet_exec":             {"fleet批量", "批量端口", "多目标健康", "ssh中断", "批量巡检"},
 	"fleet_file":             {"多目标证据文件", "批量文件", "fleet file"},

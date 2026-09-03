@@ -153,6 +153,8 @@ func TestTelnetPromptAndVendorAutoDetection(t *testing.T) {
 		{"H3C Comware Software", "<H3C-Core>", "h3c"},
 		{"Ruijie RGOS", "RG-S5750#", "ruijie"},
 		{"Cisco IOS Software", "edge(config)#", "cisco"},
+		{"Juniper Junos", "admin@srx>", "juniper"},
+		{"FortiGate-60E", "FGT #", "fortinet"},
 		{"Ubuntu Linux", "admin@host:$", "linux"},
 	} {
 		if got := detectTelnetDeviceType("auto", test.banner, test.prompt); got != test.want {

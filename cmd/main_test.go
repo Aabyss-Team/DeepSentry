@@ -109,9 +109,18 @@ func TestValidateCustomContextWindow(t *testing.T) {
 
 func TestWizardProviderOptionsMapToBuiltInPresets(t *testing.T) {
 	expected := map[string]string{
-		"百度千帆 Coding Plan (qianfan-code-latest)":             "qianfan",
-		"火山方舟 Coding Plan (ark-code-latest)":                 "volcengine",
-		"Xiaomi MiMo Token Plan / MiMo Claw (mimo-v2.5-pro)": "mimo",
+		wizardRecommendedProvider:                              "deepseek",
+		"百度千帆 Coding Plan (qianfan-code-latest)":               "qianfan",
+		"火山方舟 Coding Plan (ark-code-latest)":                   "volcengine",
+		"Qwen / 阿里百炼 (qwen3.7-plus)":                           "qwen",
+		"腾讯混元 Hunyuan / TokenHub (hy4-preview)":                "hunyuan",
+		"OpenAI (gpt-5.6)":                                     "openai",
+		"Anthropic Claude (claude-opus-5)":                     "anthropic",
+		"Google Gemini (gemini-3.8-flash)":                     "google",
+		"MiniMax (MiniMax-M3 · 多模态)":                           "minimax",
+		"智谱 GLM (glm-5.3-flash · 多模态)":                         "glm",
+		"Xiaomi MiMo Token Plan / MiMo Claw (mimo-v2.5 · 多模态)": "mimo",
+		"xAI Grok (grok-4.6)":                                  "xai",
 	}
 	for label, wantID := range expected {
 		if got := wizardProviderID(label); got != wantID {
@@ -131,6 +140,20 @@ func TestWizardProviderOptionsMapToBuiltInPresets(t *testing.T) {
 		if !found {
 			t.Fatalf("wizard option %q is not selectable", label)
 		}
+	}
+}
+
+func TestWizardRecommendedProviderIsFirstAndVisionCapable(t *testing.T) {
+	if wizardProviderOptions[0] != wizardRecommendedProvider {
+		t.Fatalf("recommended provider must remain first, got %q", wizardProviderOptions[0])
+	}
+	preset, ok := config.FindProvider(wizardProviderID(wizardRecommendedProvider))
+	if !ok || preset.Model != "deepseek-v4-flash-vision-exp" {
+		t.Fatalf("unexpected recommended preset: %#v", preset)
+	}
+	capabilities := (config.Config{Provider: string(preset.ID), ModelName: preset.Model}).EffectiveModelCapabilities()
+	if !capabilities.SupportsVision || capabilities.ContextWindowTokens != 1_000_000 {
+		t.Fatalf("recommended model capabilities=%#v", capabilities)
 	}
 }
 

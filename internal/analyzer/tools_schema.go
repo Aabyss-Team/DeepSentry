@@ -49,7 +49,7 @@ func agentToolDefinitionsForContext(limit int, contextText string, pinned []stri
 			Type: "function",
 			Function: FunctionDef{
 				Name:        "agent_action",
-				Description: "Execute a DeepSentry action that is not already exposed as a direct native function. Never wrap a visible built-in in agent_action; call that native function directly. Prefer action=execute for ordinary shell work.",
+				Description: "Execute a DeepSentry action that is not already exposed as a direct native function. Never wrap a visible built-in in agent_action; call that native function directly. Prefer action=execute for ordinary shell work. When a Skill catalog entry matches the task, call skill(name) first instead of burying load_skill here.",
 				Parameters: map[string]interface{}{
 					"type": "object",
 					"properties": map[string]interface{}{
@@ -127,7 +127,30 @@ func agentToolDefinitionsForContext(limit int, contextText string, pinned []stri
 			Parameters:  deepsentrytools.JSONSchema("tool_catalog"),
 		},
 	})
-	names := selectNativeToolNamesWithPinned(deepsentrytools.ListNames(), limit, contextText, pinned)
+	definitions = append(definitions, ToolDefinition{
+		Type: "function",
+		Function: FunctionDef{
+			Name:        "skill",
+			Description: "Load a Skill playbook before acting when the task matches a catalog name/description (B站/播放, ZIP/伪加密, FOFA/测绘, etc.). Call this first. If 【已加载 Skills】 already contains it, follow that playbook; do not probe pwd/ls or open extra tabs.",
+			Parameters: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"name": map[string]string{"type": "string", "description": "Exact Skill name from the catalog, e.g. bilibili-play, zipcracker, fofamap"},
+				},
+				"required": []string{"name"},
+			},
+		},
+	})
+	mcpTools := selectMCPToolsForContext(mcp.Global().ListTools(), limit, contextText, pinned)
+	builtInLimit := limit
+	if limit > 0 && len(mcpTools) > 0 {
+		builtInLimit = limit - len(mcpTools)
+		if builtInLimit < 1 {
+			builtInLimit = 1
+			mcpTools = mcpTools[:maxAnalyzerInt(0, limit-builtInLimit)]
+		}
+	}
+	names := selectNativeToolNamesWithPinned(deepsentrytools.ListNames(), builtInLimit, contextText, pinned)
 	for _, name := range names {
 		tool, ok := deepsentrytools.Get(name)
 		if !ok {
@@ -149,30 +172,289 @@ func agentToolDefinitionsForContext(limit int, contextText string, pinned []stri
 			},
 		})
 	}
-	// Full native-tool profiles expose MCP tools with the server-provided JSON
-	// schema, matching first-class MCP clients. Limited profiles keep the
-	// compact agent_action compatibility path to stay within provider limits.
-	if limit <= 0 {
-		for _, tool := range mcp.Global().ListTools() {
-			parameters := tool.InputSchema
-			if parameters == nil {
-				parameters = map[string]interface{}{"type": "object", "additionalProperties": true}
-			}
-			description := truncateToolDescription(tool.Description, 800)
-			if description == "" {
-				description = "MCP tool exposed by server " + tool.Server
-			}
-			definitions = append(definitions, ToolDefinition{
-				Type: "function",
-				Function: FunctionDef{
-					Name:        tool.Name,
-					Description: description,
-					Parameters:  parameters,
-				},
-			})
+	// MCP tools use the server-provided schema in every profile. Limited models
+	// receive a context-ranked subset (especially the current HawkEye workflow)
+	// instead of being forced to guess string arguments through agent_action.
+	for _, tool := range mcpTools {
+		parameters := tool.InputSchema
+		if parameters == nil {
+			parameters = map[string]interface{}{"type": "object", "additionalProperties": true}
 		}
+		description := truncateToolDescription(tool.Description, 800)
+		if description == "" {
+			description = "MCP tool exposed by server " + tool.Server
+		}
+		if mcp.IsHawkEyeTool(&tool, mcpTools) {
+			if overlay := mcp.HawkEyeToolDescriptionOverlay(tool.OriginalName); overlay != "" {
+				description = truncateToolDescription(tool.Description, 420) + " " + overlay
+			}
+		}
+		if mcp.IsFofaMapTool(&tool, mcpTools) {
+			if overlay := mcp.FofaMapToolDescriptionOverlay(tool.OriginalName); overlay != "" {
+				description = truncateToolDescription(tool.Description, 420) + " " + overlay
+			}
+		}
+		definitions = append(definitions, ToolDefinition{
+			Type: "function",
+			Function: FunctionDef{
+				Name:        tool.Name,
+				Description: description,
+				Parameters:  parameters,
+			},
+		})
 	}
 	return definitions
+}
+
+// alwaysVisibleNativeSchemaCount is agent_action + tool_catalog + skill.
+const alwaysVisibleNativeSchemaCount = 3
+
+func alwaysVisibleNativeTool(name string) bool {
+	switch strings.TrimSpace(name) {
+	case "agent_action", "tool_catalog", "skill":
+		return true
+	default:
+		return false
+	}
+}
+
+func selectMCPToolsForContext(tools []mcp.ExternalTool, limit int, contextText string, pinned []string) []mcp.ExternalTool {
+	if limit <= 0 {
+		return tools
+	}
+	maxMCP := limit / 2
+	query := strings.ToLower(contextText)
+	if hawkEyeTaskIntent(query) || fofaMapTaskIntent(query) {
+		for i := range tools {
+			if mcp.IsHawkEyeTool(&tools[i], tools) || mcp.IsFofaMapTool(&tools[i], tools) {
+				// HawkEye and FofaMap workflows commonly need a 4-6 tool chain.
+				// Give their exact MCP schemas more room while retaining at least
+				// two DeepSentry built-ins.
+				maxMCP = (limit * 2) / 3
+				if maxMCP > limit-2 {
+					maxMCP = limit - 2
+				}
+				break
+			}
+		}
+	}
+	if maxMCP < 1 {
+		return nil
+	}
+	pinnedSet := make(map[string]bool, len(pinned))
+	for _, name := range pinned {
+		pinnedSet[strings.TrimSpace(name)] = true
+	}
+	type scoredTool struct {
+		tool  mcp.ExternalTool
+		score int
+	}
+	scored := make([]scoredTool, 0, len(tools))
+	for _, tool := range tools {
+		score := 0
+		if pinnedSet[tool.Name] {
+			score += 10000
+		}
+		original := strings.ToLower(strings.TrimSpace(tool.OriginalName))
+		if original == "" {
+			original = strings.ToLower(tool.Name)
+		}
+		if strings.Contains(query, strings.ToLower(tool.Name)) || strings.Contains(query, original) {
+			score += 2000
+		}
+		if mcp.IsHawkEyeTool(&tool, tools) {
+			score += hawkEyeMCPContextScore(original, query)
+		} else if mcp.IsFofaMapTool(&tool, tools) {
+			score += fofaMapMCPContextScore(original, query)
+		} else {
+			for _, token := range strings.FieldsFunc(strings.ReplaceAll(original, "_", " "), func(r rune) bool { return r == '-' || r == ' ' }) {
+				if len(token) >= 4 && strings.Contains(query, token) {
+					score += 40
+				}
+			}
+		}
+		if score > 0 {
+			scored = append(scored, scoredTool{tool: tool, score: score})
+		}
+	}
+	sort.Slice(scored, func(i, j int) bool {
+		if scored[i].score == scored[j].score {
+			return scored[i].tool.Name < scored[j].tool.Name
+		}
+		return scored[i].score > scored[j].score
+	})
+	if len(scored) > maxMCP {
+		scored = scored[:maxMCP]
+	}
+	out := make([]mcp.ExternalTool, 0, len(scored))
+	for _, item := range scored {
+		out = append(out, item.tool)
+	}
+	return out
+}
+
+func fofaMapTaskIntent(query string) bool {
+	for _, value := range []string{
+		"fofamap", "fofa", "资产测绘", "网络空间测绘", "公网资产", "互联网资产", "暴露面",
+		"app=", "icon_hash", "host profile", "host_profile", "nuclei", "指纹规则", "fofa 查询",
+		"测绘", "空间搜索", "致远", "vpn", "favicon", "网站发现", "icon hash", "资产发现",
+	} {
+		if strings.Contains(query, value) {
+			return true
+		}
+	}
+	return false
+}
+
+func fofaMapMCPContextScore(name, query string) int {
+	if !fofaMapTaskIntent(query) {
+		return 0
+	}
+	containsAny := func(values ...string) bool {
+		for _, value := range values {
+			if strings.Contains(query, value) {
+				return true
+			}
+		}
+		return false
+	}
+	score := 0
+	add := func(points int, names ...string) {
+		for _, candidate := range names {
+			if name == candidate {
+				score += points
+				return
+			}
+		}
+	}
+	// Account, fields and validation are the safe preflight for every search.
+	add(760, "fofa_account", "fofa_fields", "fofa_validate_query")
+	if containsAny("产品", "oa", "vpn", "规则", "指纹", "app=", "rule", "fingerprint") {
+		add(1000, "fofa_rules")
+		add(620, "fofa_syntax")
+	}
+	if containsAny("搜索", "查询", "资产", "测绘", "暴露面", "search", "query", "fofa") {
+		add(920, "fofa_search")
+		add(700, "fofa_search_next")
+	}
+	if containsAny("下一页", "翻页", "cursor", "继续查询", "next") {
+		add(1100, "fofa_search_next")
+	}
+	if containsAny("图标", "icon", "favicon") {
+		add(1050, "fofa_icon_search")
+	}
+	if containsAny("主机画像", "host profile", "host_profile", "聚合", "统计", "stats") {
+		add(980, "fofa_host_profile", "fofa_stats")
+	}
+	if containsAny("导出", "保存结果", "大批量", "export", "csv", "jsonl") {
+		add(1100, "fofa_export")
+	}
+	if containsAny("自然语言", "自动分析", "agent", "广泛调研") {
+		add(900, "fofa_agent_run")
+	}
+	// Active tools only enter the preferred set on explicit scan intent.
+	if containsAny("主动扫描", "漏洞扫描", "nuclei", "执行扫描", "scan") {
+		add(1000, "nuclei_plan")
+		add(820, "nuclei_execute")
+	}
+	if containsAny("任务状态", "job", "进度") {
+		add(820, "fofa_job_status")
+	}
+	return score
+}
+
+func hawkEyeTaskIntent(query string) bool {
+	for _, value := range []string{
+		"hawkeye", "鹰眼", "hx0", "浏览器", "页面", "网页", "browser", "bilibili", "b站",
+		"抓包", "流量", "请求头", "请求体", "capture", "traffic", "request", "header", "body",
+		"拦截", "改包", "intercept", "release", "drop", "fuzz", "重放", "replay", "截图", "captcha",
+		"播放", "倍速", "全屏", "视频", "watch", "play", "fullscreen",
+	} {
+		if strings.Contains(query, value) {
+			return true
+		}
+	}
+	return false
+}
+
+func hawkEyeMCPContextScore(name, query string) int {
+	containsAny := func(values ...string) bool {
+		for _, value := range values {
+			if strings.Contains(query, value) {
+				return true
+			}
+		}
+		return false
+	}
+	browserIntent := containsAny("浏览器", "页面", "网页", "打开", "访问", "点击", "输入", "browser", "website", "navigate", "click", "b站", "bilibili", "播放", "视频", "watch", "play")
+	captureIntent := containsAny("抓包", "流量", "请求头", "请求体", "响应", "capture", "traffic", "request", "header", "body")
+	interceptIntent := containsAny("拦截", "改包", "放行", "丢弃", "intercept", "release", "drop")
+	securityIntent := containsAny("安全", "渗透", "漏洞", "审计", "ctf", "fuzz", "重放", "敏感", "暗链", "security", "pentest", "replay")
+	visualIntent := containsAny("截图", "图片", "视觉", "验证码", "screenshot", "image", "visual", "captcha")
+	researchIntent := containsAny("搜索", "调研", "资料", "research", "search")
+	activationIntent := containsAny("全屏", "真实手势", "真鼠标", "剪贴板", "useractivation", "fullscreen", "trusted")
+	playbackIntent := containsAny("播放", "倍速", "2倍", "2x", "playback", "speed", "视频", "b站", "bilibili")
+	fileIntent := containsAny("上传", "下载", "文件", "upload", "download", "file")
+	scriptIntent := containsAny("脚本", "注入", "编解码", "javascript", "script", "evaluate", "codec")
+	findingIntent := containsAny("报告", "发现", "敏感", "暗链", "finding", "sensitive", "darklink")
+	if !(browserIntent || captureIntent || interceptIntent || securityIntent || visualIntent || researchIntent || activationIntent || playbackIntent || fileIntent || scriptIntent || findingIntent || containsAny("hawkeye", "鹰眼", "hx0")) {
+		return 0
+	}
+	score := 0
+	add := func(points int, names ...string) {
+		for _, candidate := range names {
+			if name == candidate {
+				score += points
+				return
+			}
+		}
+	}
+	if browserIntent {
+		add(650, "browser_tabs", "browser_navigate", "browser_snapshot", "browser_find", "browser_read_text")
+		add(470, "browser_click", "browser_type", "browser_press_key", "browser_wait_for", "browser_scroll")
+		add(260, "browser_hover", "browser_select_option", "browser_fill_form", "browser_handle_dialog", "browser_reload")
+	}
+	if captureIntent {
+		add(760, "hawkeye_capture_state", "hawkeye_capture_start", "hawkeye_capture_history", "hawkeye_capture_inspect", "hawkeye_request_get")
+		add(420, "hawkeye_capture_stop")
+		add(350, "browser_tabs", "browser_snapshot")
+	}
+	if interceptIntent {
+		add(800, "hawkeye_scope", "hawkeye_intercept")
+		add(450, "hawkeye_capture_state", "hawkeye_capture_history", "hawkeye_request_get")
+	}
+	if securityIntent {
+		add(700, "hawkeye_scope", "hawkeye_request_get", "hawkeye_request_mutate", "hawkeye_request_replay", "hawkeye_response_compare")
+		add(550, "hawkeye_capture_history", "hawkeye_capture_inspect", "hawkeye_sensitive_scan", "hawkeye_darklink_scan", "hawkeye_findings", "hawkeye_fuzz_run", "browser_security")
+	}
+	if visualIntent {
+		add(900, "browser_screenshot", "browser_snapshot", "browser_captcha_assist")
+	}
+	if researchIntent {
+		add(800, "browser_research", "browser_search", "browser_fetch", "browser_read_text")
+	}
+	if activationIntent {
+		add(1000, "browser_tabs", "browser_snapshot", "browser_click", "browser_press_key")
+		add(380, "hawkeye_evaluate") // verification only; workflow prompt forbids synthetic-event fallback
+	}
+	if playbackIntent {
+		add(1100, "browser_navigate", "browser_snapshot", "browser_press_key", "hawkeye_evaluate")
+		add(700, "browser_click", "browser_find")
+		add(400, "browser_tabs", "browser_select_option")
+	}
+	if fileIntent {
+		add(850, "browser_file_upload", "browser_download_file", "browser_screenshot")
+	}
+	if scriptIntent {
+		add(820, "hawkeye_codec", "hawkeye_script_list", "hawkeye_script_run", "hawkeye_script_upsert", "hawkeye_evaluate")
+	}
+	if findingIntent {
+		add(820, "hawkeye_findings", "hawkeye_sensitive_scan", "hawkeye_darklink_scan", "hawkeye_request_get", "hawkeye_capture_inspect")
+	}
+	if containsAny("hawkeye", "鹰眼", "hx0") && !(browserIntent || captureIntent || interceptIntent || securityIntent || visualIntent || researchIntent) {
+		add(300, "browser_tabs", "browser_snapshot", "hawkeye_capture_state")
+	}
+	return score
 }
 
 func selectNativeToolNamesWithPinned(names []string, limit int, contextText string, pinned []string) []string {
@@ -322,6 +604,18 @@ func ParseNamedToolCall(name, toolCallArgs string) (AgentResponse, error) {
 	var raw map[string]interface{}
 	if err := json.Unmarshal([]byte(toolCallArgs), &raw); err != nil {
 		return AgentResponse{}, err
+	}
+	if name == "skill" || name == "load_skill" {
+		args := parseToolArgs(raw)
+		skillName := strings.TrimSpace(args["name"])
+		if skillName == "" {
+			skillName = strings.TrimSpace(args["skill_name"])
+		}
+		return AgentResponse{
+			Thought:   "加载 Skill " + skillName,
+			Action:    "load_skill",
+			SkillName: skillName,
+		}, nil
 	}
 	if name != "tool_catalog" {
 		if _, ok := deepsentrytools.Get(name); !ok {

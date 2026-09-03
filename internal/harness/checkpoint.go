@@ -220,6 +220,9 @@ func initializeCheckpointState(data *CheckpointData) {
 	if data.State.SelectedTools == nil {
 		data.State.SelectedTools = make(map[string]bool)
 	}
+	if data.State.TriedTools == nil {
+		data.State.TriedTools = make(map[string]bool)
+	}
 	if data.State.PendingToolCalls == nil {
 		data.State.PendingToolCalls = make(map[string]ToolCallRecord)
 	}

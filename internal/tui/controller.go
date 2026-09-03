@@ -26,6 +26,7 @@ type SessionController struct {
 	stopCh               chan struct{}
 	stopped              bool
 	pendingInterruptText string
+	pendingInterruptImgs []analyzer.ImageAttachment
 	cachedStats          SessionStats
 }
 
@@ -158,9 +159,16 @@ func (c *SessionController) RequestStop() {
 }
 
 func (c *SessionController) InterruptWithInput(text string) bool {
+	return c.InterruptWithAttachments(text, nil)
+}
+
+func (c *SessionController) InterruptWithAttachments(text string, attachments []analyzer.ImageAttachment) bool {
 	text = trimInput(text)
-	if text == "" {
+	if text == "" && len(attachments) == 0 {
 		return false
+	}
+	if text == "" {
+		text = "请分析所附图片，并结合当前任务继续。"
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -170,6 +178,7 @@ func (c *SessionController) InterruptWithInput(text string) bool {
 	// Do not append to History while RunLoop is using it. Queue the rewrite and
 	// commit it after the current run acknowledges stop, then start the next run.
 	c.pendingInterruptText = text
+	c.pendingInterruptImgs = append([]analyzer.ImageAttachment(nil), attachments...)
 	if !c.stopped {
 		if c.stopCh != nil {
 			close(c.stopCh)
@@ -204,9 +213,11 @@ func (c *SessionController) beginRun() bool {
 			c.mu.Lock()
 			c.running = false
 			interruptText := c.pendingInterruptText
+			interruptImages := append([]analyzer.ImageAttachment(nil), c.pendingInterruptImgs...)
 			c.pendingInterruptText = ""
+			c.pendingInterruptImgs = nil
 			if interruptText != "" && c.cfg.History != nil {
-				*c.cfg.History = append(*c.cfg.History, analyzer.Message{Role: "user", Content: "【用户中途打断/改写目标】" + interruptText})
+				*c.cfg.History = append(*c.cfg.History, analyzer.Message{Role: "user", Content: "【用户中途打断/改写目标】" + interruptText, Attachments: interruptImages})
 			}
 			c.refreshStatsLocked()
 			c.mu.Unlock()
@@ -270,9 +281,16 @@ func (c *SessionController) sudoAuthFn() bool {
 
 // PrepareFollowUp 追问：写入 history 并启动新一轮
 func (c *SessionController) PrepareFollowUp(text string) bool {
+	return c.PrepareFollowUpWithAttachments(text, nil)
+}
+
+func (c *SessionController) PrepareFollowUpWithAttachments(text string, attachments []analyzer.ImageAttachment) bool {
 	text = trimInput(text)
-	if text == "" {
+	if text == "" && len(attachments) == 0 {
 		return false
+	}
+	if text == "" {
+		text = "请分析所附图片，并结合当前任务继续。"
 	}
 	c.mu.Lock()
 	if c.running || c.cfg.History == nil {
@@ -280,7 +298,7 @@ func (c *SessionController) PrepareFollowUp(text string) bool {
 		return false
 	}
 	c.turn++
-	*c.cfg.History = append(*c.cfg.History, analyzer.Message{Role: "user", Content: text})
+	*c.cfg.History = append(*c.cfg.History, analyzer.Message{Role: "user", Content: text, Attachments: append([]analyzer.ImageAttachment(nil), attachments...)})
 	c.refreshStatsLocked()
 	c.mu.Unlock()
 	return c.beginRun()
@@ -288,16 +306,23 @@ func (c *SessionController) PrepareFollowUp(text string) bool {
 
 // SetInitialGoal 设置首条用户需求
 func (c *SessionController) SetInitialGoal(goal string) {
+	c.SetInitialGoalWithAttachments(goal, nil)
+}
+
+func (c *SessionController) SetInitialGoalWithAttachments(goal string, attachments []analyzer.ImageAttachment) {
 	goal = trimInput(goal)
-	if goal == "" {
+	if goal == "" && len(attachments) == 0 {
 		return
+	}
+	if goal == "" {
+		goal = "请分析所附图片，并结合当前任务继续。"
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.cfg.History == nil || c.running {
 		return
 	}
-	*c.cfg.History = append(*c.cfg.History, analyzer.Message{Role: "user", Content: "需求：" + goal})
+	*c.cfg.History = append(*c.cfg.History, analyzer.Message{Role: "user", Content: "需求：" + goal, Attachments: append([]analyzer.ImageAttachment(nil), attachments...)})
 	c.refreshStatsLocked()
 }
 
@@ -326,6 +351,7 @@ func (c *SessionController) StartNewSession(goal string) (string, bool, error) {
 	}
 	c.turn = 0
 	c.pendingInterruptText = ""
+	c.pendingInterruptImgs = nil
 	c.refreshStatsLocked()
 	c.stopped = false
 	c.stopCh = make(chan struct{})
@@ -379,6 +405,7 @@ func (c *SessionController) ResumeSession(sessionID, supplement string) (int, er
 	*c.cfg.History = history
 	c.turn = 0
 	c.pendingInterruptText = ""
+	c.pendingInterruptImgs = nil
 	c.refreshStatsLocked()
 	c.stopped = false
 	c.stopCh = make(chan struct{})
@@ -396,6 +423,11 @@ func estimateHistoryTokens(history []analyzer.Message) int {
 	totalBytes := 0
 	for _, msg := range history {
 		totalBytes += len(msg.Role) + len(msg.Content) + 8
+		for _, attachment := range msg.Attachments {
+			// Vision providers tokenize images differently; reserve a conservative
+			// metadata + visual budget without inflating checkpoints with base64.
+			totalBytes += len(attachment.Name) + 4096
+		}
 	}
 	if totalBytes == 0 {
 		return 0

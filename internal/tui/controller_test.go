@@ -44,6 +44,25 @@ func TestInterruptQueuesHistoryMutationUntilRunStops(t *testing.T) {
 	}
 }
 
+func TestControllerPreservesImageAttachmentsForInitialAndInterruptedTurns(t *testing.T) {
+	history := []analyzer.Message{}
+	attachment := analyzer.ImageAttachment{Path: "/tmp/evidence.png", Name: "evidence.png", MediaType: "image/png", SHA256: "abc"}
+	c := &SessionController{cfg: SessionConfig{History: &history}}
+	c.SetInitialGoalWithAttachments("分析截图", []analyzer.ImageAttachment{attachment})
+	if len(history) != 1 || len(history[0].Attachments) != 1 || history[0].Attachments[0].Path != attachment.Path {
+		t.Fatalf("initial image attachment lost: %#v", history)
+	}
+
+	c.running = true
+	c.stopCh = make(chan struct{})
+	if !c.InterruptWithAttachments("", []analyzer.ImageAttachment{attachment}) {
+		t.Fatal("image-only interrupt should be accepted")
+	}
+	if c.pendingInterruptText == "" || len(c.pendingInterruptImgs) != 1 {
+		t.Fatalf("interrupted image attachment not queued: text=%q images=%#v", c.pendingInterruptText, c.pendingInterruptImgs)
+	}
+}
+
 func TestStatsUsesSafeSnapshotWhileRunning(t *testing.T) {
 	history := []analyzer.Message{{Role: "user", Content: "first"}}
 	c := &SessionController{cfg: SessionConfig{History: &history}}

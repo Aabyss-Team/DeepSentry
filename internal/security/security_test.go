@@ -23,7 +23,7 @@ func TestCheckRiskOperationalReadOnlyCommands(t *testing.T) {
 		"systemctl status sshd",
 		`echo "=== LINGXI_SERVICE_STATUS ===" && systemctl status lingxi --no-pager -l 2>&1 && echo -e "\n=== LINGXI_MEMORY ===" && ps aux --sort=-%mem | grep -E 'lingxi|python.*app.py' | grep -v grep | head -10 && tail -30 /root/lingxi/data/lingxi.log 2>&1`,
 		`echo "a > b" && printf 'quoted >> text' 2>&1`,
-		"echo %USERNAME% && hostname && cd /d C:\\Users\\kaka && dir /b *.txt *.log *.cs",
+		"echo %USERNAME% && hostname && cd /d C:\\Users\\demo && dir /b *.txt *.log *.cs",
 	}
 
 	for _, cmd := range cases {
@@ -70,6 +70,33 @@ func TestRedactJSONPreservesSyntaxAndRedactsSensitiveKeys(t *testing.T) {
 	}
 	if !strings.Contains(string(raw), "HEAD") || !strings.Contains(string(raw), "TAIL") {
 		t.Fatalf("non-secret text was lost: %s", raw)
+	}
+}
+
+func TestLooksLikeFlagCommand(t *testing.T) {
+	for _, cmd := range []string{
+		"flag{Adm1N-B2G-kU-SZIP}",
+		` "flag{Adm1N-B2G-kU-SZIP}" `,
+		"FLAG{hello}",
+		"ctf{demo}",
+		"local_run flag{plain}",
+	} {
+		if !LooksLikeFlagCommand(cmd) {
+			t.Fatalf("expected flag payload %q", cmd)
+		}
+		if CanReviewHighRiskWithAI(cmd, "未识别指令") {
+			t.Fatalf("flag payload should not enter AI risk review: %q", cmd)
+		}
+	}
+	for _, cmd := range []string{
+		"echo flag{Adm1N-B2G-kU-SZIP}",
+		"cat flag.txt",
+		"unknown-mutator --apply",
+		"ls",
+	} {
+		if LooksLikeFlagCommand(cmd) {
+			t.Fatalf("did not expect flag payload %q", cmd)
+		}
 	}
 }
 

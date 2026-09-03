@@ -149,6 +149,68 @@ description: demo skill
 	}
 }
 
+func TestImportPlainSkillFile(t *testing.T) {
+	sourceDir := t.TempDir()
+	source := filepath.Join(sourceDir, "local-demo.skill")
+	doc := []byte("---\nname: local-demo\ndescription: Imported from a plain .skill file\n---\n# Local Demo\n")
+	if err := os.WriteFile(source, doc, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dest := t.TempDir()
+	out, err := ManageMarketplace(map[string]string{
+		"action": "import", "source": source, "confirm_install": "true", "dest": dest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"已安装 Skill: local-demo", "local:" + source, "sha256:"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %q in:\n%s", want, out)
+		}
+	}
+	data, err := os.ReadFile(filepath.Join(dest, "local-demo", "SKILL.md"))
+	if err != nil || !bytes.Equal(data, doc) {
+		t.Fatalf("plain .skill was not installed exactly: err=%v data=%q", err, data)
+	}
+}
+
+func TestImportZippedSkillFileWithNestedRoot(t *testing.T) {
+	source := filepath.Join(t.TempDir(), "portable.skill")
+	archive := skillZip(t, map[string]string{
+		"portable/SKILL.md":            "---\nname: portable\ndescription: Portable zipped Skill\n---\n# Portable\n",
+		"portable/references/guide.md": "guide",
+	})
+	if err := os.WriteFile(source, archive, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dest := t.TempDir()
+	if _, err := InstallMarketSkill(context.Background(), source, dest, false, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dest, "portable", "references", "guide.md")); err != nil {
+		t.Fatalf("zipped .skill reference missing: %v", err)
+	}
+	inspect, err := InspectMarketSkill(context.Background(), source)
+	if err != nil || !strings.Contains(inspect, "本地 Skill 包") || !strings.Contains(inspect, "portable") {
+		t.Fatalf("local inspect failed: err=%v\n%s", err, inspect)
+	}
+}
+
+func TestImportSkillFileRejectsArchiveTraversal(t *testing.T) {
+	source := filepath.Join(t.TempDir(), "unsafe.skill")
+	archive := skillZip(t, map[string]string{
+		"safe/SKILL.md": "---\nname: safe\ndescription: safe\n---\n",
+		"../escape":     "owned",
+	})
+	if err := os.WriteFile(source, archive, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := InstallMarketSkill(context.Background(), source, t.TempDir(), false, false)
+	if err == nil || !strings.Contains(err.Error(), "不安全路径") {
+		t.Fatalf("expected local .skill traversal rejection, got %v", err)
+	}
+}
+
 func TestInstallSkillsSHFetchesOnlyMatchingGitHubSkill(t *testing.T) {
 	skillDoc := `---
 name: log-forensics

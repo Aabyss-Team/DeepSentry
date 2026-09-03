@@ -108,11 +108,38 @@ func secondsOrDefault(value, fallback int) time.Duration {
 }
 
 func normalizeDeviceType(value string) string {
-	value = strings.ToLower(strings.TrimSpace(value))
-	if value == "" {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "auto":
 		return "auto"
+	case "vrp", "usg", "huawei":
+		return "huawei"
+	case "comware", "secpath", "dptech", "h3c":
+		return "h3c"
+	case "rgos", "red-giant", "redgiant", "ruijie":
+		return "ruijie"
+	case "ios", "ios-xe", "nxos", "nx-os", "ios-xr", "cisco":
+		return "cisco"
+	case "asa", "cisco-asa", "pix":
+		return "asa"
+	case "junos", "screenos", "netscreen", "juniper":
+		return "juniper"
+	case "fortios", "fortigate", "fortinet":
+		return "fortinet"
+	case "panos", "palo-alto", "paloalto":
+		return "paloalto"
+	case "stoneos", "hillstone":
+		return "hillstone"
+	case "sangfor":
+		return "sangfor"
+	case "gaia", "checkpoint":
+		return "checkpoint"
+	case "venustech", "topsec", "leadsec":
+		return "generic"
+	case "linux", "generic":
+		return strings.ToLower(strings.TrimSpace(value))
+	default:
+		return strings.ToLower(strings.TrimSpace(value))
 	}
-	return value
 }
 
 // networkPrivilegeCommand returns the vendor CLI privilege elevation command.
@@ -123,7 +150,7 @@ func networkPrivilegeCommand(deviceType string) string {
 	switch normalizeDeviceType(deviceType) {
 	case "huawei", "h3c":
 		return "super"
-	case "ruijie", "cisco":
+	case "ruijie", "cisco", "asa", "hillstone", "sangfor":
 		return "enable"
 	default:
 		return ""
@@ -136,7 +163,7 @@ func networkPrivilegeAlreadyActive(deviceType, prompt string) bool {
 	case "huawei", "h3c":
 		// A bracketed VRP/Comware prompt is already inside a configuration view.
 		return strings.HasPrefix(prompt, "[")
-	case "ruijie", "cisco":
+	case "ruijie", "cisco", "asa", "hillstone", "sangfor":
 		return strings.HasSuffix(prompt, "#")
 	default:
 		return true
@@ -152,7 +179,7 @@ func networkPrivilegePromptAccepted(deviceType, prompt string) bool {
 	case "huawei", "h3c":
 		// VRP/Comware `super` raises the user level without changing <hostname>.
 		return networkPromptRE.MatchString(prompt)
-	case "ruijie", "cisco":
+	case "ruijie", "cisco", "asa", "hillstone", "sangfor":
 		return strings.HasSuffix(prompt, "#")
 	default:
 		return false
@@ -518,14 +545,28 @@ func detectTelnetDeviceType(configured, banner, prompt string) string {
 	}
 	lower := strings.ToLower(banner + "\n" + prompt)
 	switch {
-	case strings.Contains(lower, "huawei"), strings.Contains(lower, "versatile routing platform"), strings.Contains(lower, "vrp"):
-		return "huawei"
-	case strings.Contains(lower, "h3c"), strings.Contains(lower, "comware"):
+	case strings.Contains(lower, "h3c"), strings.Contains(lower, "comware"), strings.Contains(lower, "secpath"), strings.Contains(lower, "dptech"), strings.Contains(lower, "迪普"):
 		return "h3c"
+	case strings.Contains(lower, "huawei"), strings.Contains(lower, "versatile routing platform"), strings.Contains(lower, "vrp"), strings.Contains(lower, "huawei usg"):
+		return "huawei"
 	case strings.Contains(lower, "ruijie"), strings.Contains(lower, "rgos"), strings.Contains(lower, "red-giant"):
 		return "ruijie"
-	case strings.Contains(lower, "cisco ios"), strings.Contains(lower, "cisco internetwork"):
+	case strings.Contains(lower, "cisco adaptive security"), strings.Contains(lower, "cisco asa"), strings.Contains(lower, "pix"):
+		return "asa"
+	case strings.Contains(lower, "cisco ios"), strings.Contains(lower, "cisco internetwork"), strings.Contains(lower, "nx-os"), strings.Contains(lower, "ios-xe"):
 		return "cisco"
+	case strings.Contains(lower, "junos"), strings.Contains(lower, "juniper"), strings.Contains(lower, "screenos"), strings.Contains(lower, "netscreen"):
+		return "juniper"
+	case strings.Contains(lower, "fortigate"), strings.Contains(lower, "fortios"), strings.Contains(lower, "fortinet"):
+		return "fortinet"
+	case strings.Contains(lower, "palo alto"), strings.Contains(lower, "pan-os"), strings.Contains(lower, "panos"):
+		return "paloalto"
+	case strings.Contains(lower, "hillstone"), strings.Contains(lower, "stoneos"), strings.Contains(lower, "山石"):
+		return "hillstone"
+	case strings.Contains(lower, "sangfor"), strings.Contains(lower, "深信服"):
+		return "sangfor"
+	case strings.Contains(lower, "checkpoint"), strings.Contains(lower, "check point"), strings.Contains(lower, "gaia"):
+		return "checkpoint"
 	case strings.HasSuffix(strings.TrimSpace(prompt), "$"), strings.Contains(lower, "linux"), strings.Contains(lower, "ubuntu"):
 		return "linux"
 	case networkPromptRE.MatchString(strings.TrimSpace(prompt)):
@@ -575,22 +616,35 @@ func (t *TelnetExecutor) enterPrivilegedMode() error {
 	return fmt.Errorf("等待 %s 特权 prompt 超时；最后响应: %s", command, diagnosticTail(transcript.String(), 240))
 }
 
-func (t *TelnetExecutor) disablePaging() {
-	var command string
-	switch t.deviceType {
+func networkPagingCommands(deviceType, prompt string) []string {
+	switch normalizeDeviceType(deviceType) {
 	case "huawei", "h3c":
-		command = "screen-length 0 temporary"
-	case "ruijie", "cisco":
-		command = "terminal length 0"
+		return []string{"screen-length 0 temporary"}
+	case "ruijie", "cisco", "hillstone", "sangfor":
+		return []string{"terminal length 0"}
+	case "asa":
+		return []string{"terminal pager 0"}
+	case "juniper":
+		return []string{"set cli screen-length 0"}
+	case "paloalto":
+		return []string{"set cli pager off"}
+	case "checkpoint":
+		return []string{"set clienv rows 0"}
 	case "generic":
-		if strings.HasPrefix(strings.TrimSpace(t.prompt), "<") || strings.HasPrefix(strings.TrimSpace(t.prompt), "[") {
-			command = "screen-length 0 temporary"
+		if strings.HasPrefix(strings.TrimSpace(prompt), "<") || strings.HasPrefix(strings.TrimSpace(prompt), "[") {
+			return []string{"screen-length 0 temporary"}
+		}
+		if strings.HasSuffix(strings.TrimSpace(prompt), "#") || strings.HasSuffix(strings.TrimSpace(prompt), ">") {
+			return []string{"terminal length 0"}
 		}
 	}
-	if command == "" {
-		return
+	return nil
+}
+
+func (t *TelnetExecutor) disablePaging() {
+	for _, command := range networkPagingCommands(t.deviceType, t.prompt) {
+		_, _ = t.runCLICommand(command, nil, minDuration(t.commandTimeout, 8*time.Second))
 	}
-	_, _ = t.runCLICommand(command, nil, minDuration(t.commandTimeout, 8*time.Second))
 }
 
 func minDuration(a, b time.Duration) time.Duration {

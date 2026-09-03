@@ -74,6 +74,7 @@ func networkDiagnosticCommands(profile, focus string) []string {
 	profile = strings.ToLower(strings.TrimSpace(profile))
 	focus = strings.ToLower(strings.TrimSpace(focus))
 	display := profile == "huawei" || profile == "h3c"
+	iosLike := profile == "ruijie" || profile == "cisco" || profile == "asa" || profile == "hillstone" || profile == "sangfor"
 	switch focus {
 	case "overview":
 		if display {
@@ -82,36 +83,51 @@ func networkDiagnosticCommands(profile, focus string) []string {
 		if profile == "ruijie" {
 			return []string{"show version", "show device", "show interfaces status"}
 		}
-		if profile == "cisco" {
+		if profile == "cisco" || profile == "asa" {
 			return []string{"show version", "show inventory", "show interfaces status"}
+		}
+		if extra := extraVendorCommands(profile, focus); extra != nil {
+			return extra
 		}
 	case "interfaces":
 		if display {
 			return []string{"display interface brief", "display ip interface brief", "display interface"}
 		}
-		if profile == "ruijie" || profile == "cisco" {
+		if iosLike {
 			return []string{"show interfaces status", "show ip interface brief", "show interfaces"}
+		}
+		if extra := extraVendorCommands(profile, focus); extra != nil {
+			return extra
 		}
 	case "routing":
 		if display {
 			return []string{"display ip routing-table", "display ospf peer brief", "display ip interface brief"}
 		}
-		if profile == "ruijie" || profile == "cisco" {
+		if iosLike {
 			return []string{"show ip route", "show ip ospf neighbor", "show ip interface brief"}
+		}
+		if extra := extraVendorCommands(profile, focus); extra != nil {
+			return extra
 		}
 	case "l2":
 		if display {
 			return []string{"display vlan summary", "display stp brief", "display mac-address"}
 		}
-		if profile == "ruijie" || profile == "cisco" {
+		if iosLike {
 			return []string{"show vlan brief", "show spanning-tree summary", "show mac address-table dynamic"}
+		}
+		if extra := extraVendorCommands(profile, focus); extra != nil {
+			return extra
 		}
 	case "logs":
 		if display {
 			return []string{"display logbuffer", "display alarm active"}
 		}
-		if profile == "ruijie" || profile == "cisco" {
+		if iosLike {
 			return []string{"show logging", "show clock"}
+		}
+		if extra := extraVendorCommands(profile, focus); extra != nil {
+			return extra
 		}
 	case "full":
 		return networkBaselineCommands(profile)
@@ -125,9 +141,69 @@ func networkBaselineCommands(profile string) []string {
 		return []string{"display version", "display device", "display interface brief", "display ip interface brief", "display ip routing-table", "display stp brief", "display logbuffer"}
 	case "ruijie":
 		return []string{"show version", "show device", "show interfaces status", "show ip interface brief", "show ip route", "show spanning-tree summary", "show logging"}
-	case "cisco":
+	case "cisco", "asa":
 		return []string{"show version", "show inventory", "show interfaces status", "show ip interface brief", "show ip route", "show spanning-tree summary", "show logging"}
+	case "hillstone", "sangfor":
+		return []string{"show version", "show interface", "show ip route", "show logging"}
+	case "juniper":
+		return []string{"show version", "show chassis hardware", "show interfaces terse", "show route", "show log messages"}
+	case "fortinet":
+		return []string{"get system status", "get system interface", "get router info routing-table all"}
+	case "paloalto":
+		return []string{"show system info", "show interface all", "show routing route"}
+	case "checkpoint":
+		return []string{"show version all", "show interface all", "show route"}
 	default:
 		return nil
 	}
+}
+
+func extraVendorCommands(profile, focus string) []string {
+	switch profile {
+	case "juniper":
+		switch focus {
+		case "overview":
+			return []string{"show version", "show chassis hardware", "show interfaces terse"}
+		case "interfaces":
+			return []string{"show interfaces terse", "show interfaces"}
+		case "routing":
+			return []string{"show route", "show ospf neighbor"}
+		case "l2":
+			return []string{"show vlans", "show spanning-tree"}
+		case "logs":
+			return []string{"show log messages"}
+		}
+	case "fortinet":
+		switch focus {
+		case "overview":
+			return []string{"get system status", "get system interface"}
+		case "interfaces":
+			return []string{"get system interface"}
+		case "routing":
+			return []string{"get router info routing-table all"}
+		case "logs":
+			return []string{"get log event"}
+		}
+	case "paloalto":
+		switch focus {
+		case "overview":
+			return []string{"show system info", "show interface all"}
+		case "interfaces":
+			return []string{"show interface all"}
+		case "routing":
+			return []string{"show routing route"}
+		case "logs":
+			return []string{"show log system"}
+		}
+	case "checkpoint":
+		switch focus {
+		case "overview":
+			return []string{"show version all", "show interface all"}
+		case "interfaces":
+			return []string{"show interface all"}
+		case "routing":
+			return []string{"show route"}
+		}
+	}
+	return nil
 }

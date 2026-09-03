@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
@@ -64,6 +66,22 @@ type ExternalResourceTemplate struct {
 	MIMEType    string
 }
 
+// ImageArtifact is a local, path-backed copy of MCP image content. The marker
+// embedded in tool text is consumed by the harness before the next LLM turn,
+// keeping base64 out of checkpoints while preserving vision input.
+type ImageArtifact struct {
+	Path      string `json:"path"`
+	Name      string `json:"name"`
+	MediaType string `json:"media_type"`
+	Size      int64  `json:"size"`
+	SHA256    string `json:"sha256"`
+}
+
+const (
+	imageArtifactMarker = "[DEEPSENTRY_MCP_IMAGE] "
+	maxMCPImageBytes    = 20 << 20
+)
+
 type sdkConnection struct {
 	mu          sync.RWMutex
 	refreshMu   sync.Mutex
@@ -74,11 +92,20 @@ type sdkConnection struct {
 	ctx         context.Context
 	cancel      context.CancelFunc
 	toolTimeout time.Duration
-	status      ServerStatus
-	resources   []ExternalResource
-	templates   []ExternalResourceTemplate
-	prompts     []ExternalPrompt
-	config      ServerConfig
+	// toolTimeoutExplicit preserves an operator's configured deadline. When it
+	// is false, known HawkEye long-running tools receive their documented
+	// per-tool deadline instead of the generic 60-second MCP default.
+	toolTimeoutExplicit   bool
+	hawkEye               bool
+	fofaMap               bool
+	hawkEyeInterceptArmed bool
+	hawkEyeCaptureOwned   bool
+	hawkEyeResizeChanged  bool
+	status                ServerStatus
+	resources             []ExternalResource
+	templates             []ExternalResourceTemplate
+	prompts               []ExternalPrompt
+	config                ServerConfig
 }
 
 var sdkConnections = struct {
@@ -178,6 +205,12 @@ func connectWithOAuthHandler(cfg ServerConfig, oauthHandler sdkauth.OAuthHandler
 	if transportName == "http" {
 		transportName = "streamable_http"
 	}
+	if transportName == "stdio" {
+		if reused, ok := preferExistingHawkEyeHTTP(cfg); ok {
+			cfg = reused
+			transportName = "streamable_http"
+		}
+	}
 	fingerprintRaw, _ := json.Marshal(cfg)
 	fingerprint := string(fingerprintRaw)
 	if oauthHandler != nil {
@@ -188,7 +221,12 @@ func connectWithOAuthHandler(cfg ServerConfig, oauthHandler sdkauth.OAuthHandler
 	existing := sdkConnections.byName[serverName]
 	sdkConnections.RUnlock()
 	if existing != nil && existing.fingerprint == fingerprint {
-		return nil
+		existing.mu.RLock()
+		connected := existing.session != nil && existing.status.State == "connected"
+		existing.mu.RUnlock()
+		if connected {
+			return nil
+		}
 	}
 	if existing != nil {
 		closeSDKConnection(existing)
@@ -263,19 +301,20 @@ func connectWithOAuthHandler(cfg ServerConfig, oauthHandler sdkauth.OAuthHandler
 	session, err := client.Connect(connectCtx, transport, nil)
 	if err != nil {
 		cancel()
-		setFailedServerStatus(serverName, transportName, err)
+		setFailedServerStatus(serverName, transportName, fingerprint, cfg, oauthHandler != nil, err)
 		return fmt.Errorf("MCP server %s 连接失败: %w", serverName, err)
 	}
 	init := session.InitializeResult()
 	conn = &sdkConnection{
-		serverName:  serverName,
-		transport:   transportName,
-		fingerprint: fingerprint,
-		session:     session,
-		ctx:         baseCtx,
-		cancel:      cancel,
-		toolTimeout: toolTimeout,
-		config:      cfg,
+		serverName:          serverName,
+		transport:           transportName,
+		fingerprint:         fingerprint,
+		session:             session,
+		ctx:                 baseCtx,
+		cancel:              cancel,
+		toolTimeout:         toolTimeout,
+		toolTimeoutExplicit: cfg.ToolTimeoutSec > 0,
+		config:              cfg,
 		status: ServerStatus{
 			Name:      serverName,
 			Transport: transportName,
@@ -290,7 +329,7 @@ func connectWithOAuthHandler(cfg ServerConfig, oauthHandler sdkauth.OAuthHandler
 	if err := conn.refreshCapabilities(); err != nil {
 		_ = session.Close()
 		cancel()
-		setFailedServerStatus(serverName, transportName, err)
+		setFailedServerStatus(serverName, transportName, fingerprint, cfg, oauthHandler != nil, err)
 		return fmt.Errorf("MCP server %s 能力发现失败: %w", serverName, err)
 	}
 	sdkConnections.Lock()
@@ -339,7 +378,10 @@ func (conn *sdkConnection) refreshCapabilities() error {
 			continue
 		}
 		schema, _ := tool.InputSchema.(map[string]interface{})
-		external := ExternalTool{Name: tool.Name, OriginalName: tool.Name, Description: tool.Description, Server: conn.serverName, InputSchema: schema}
+		external := ExternalTool{
+			Name: tool.Name, OriginalName: tool.Name, Description: tool.Description,
+			Server: conn.serverName, InputSchema: schema, Annotations: convertSDKToolAnnotations(tool.Annotations),
+		}
 		originalName := tool.Name
 		handler := func(args map[string]string) (string, error) {
 			return conn.callTool(originalName, schema, args)
@@ -347,6 +389,24 @@ func (conn *sdkConnection) refreshCapabilities() error {
 		discovered = append(discovered, serverToolHandler{tool: external, handler: handler})
 		toolCount++
 	}
+	discoveredTools := make([]ExternalTool, 0, len(discovered))
+	for _, item := range discovered {
+		discoveredTools = append(discoveredTools, item.tool)
+	}
+	hawkEye := false
+	fofaMap := false
+	for i := range discoveredTools {
+		if IsHawkEyeTool(&discoveredTools[i], discoveredTools) {
+			hawkEye = true
+		}
+		if IsFofaMapTool(&discoveredTools[i], discoveredTools) {
+			fofaMap = true
+		}
+	}
+	conn.mu.Lock()
+	conn.hawkEye = hawkEye
+	conn.fofaMap = fofaMap
+	conn.mu.Unlock()
 	globalRegistry.replaceServerHandlers(conn.serverName, discovered)
 
 	resources := make([]ExternalResource, 0)
@@ -398,6 +458,18 @@ func (conn *sdkConnection) toolEnabled(name string) bool {
 }
 
 func (conn *sdkConnection) callTool(name string, schema map[string]interface{}, args map[string]string) (string, error) {
+	conn.mu.RLock()
+	hawkEye := conn.hawkEye
+	fofaMap := conn.fofaMap
+	deadline := conn.toolTimeout
+	toolTimeoutExplicit := conn.toolTimeoutExplicit
+	conn.mu.RUnlock()
+	if hawkEye {
+		args = applyHawkEyeCallDefaults(name, args)
+	}
+	if fofaMap {
+		args = applyFofaMapCallDefaults(name, args)
+	}
 	coerced, err := validateAndCoerceMCPArgs(schema, args)
 	if err != nil {
 		return "", fmt.Errorf("MCP 工具 %s 参数无效: %w", name, err)
@@ -406,21 +478,197 @@ func (conn *sdkConnection) callTool(name string, schema map[string]interface{}, 
 	if baseCtx == nil {
 		baseCtx = context.Background()
 	}
-	ctx, cancel := context.WithTimeout(baseCtx, conn.toolTimeout)
+	if hawkEye {
+		deadline = HawkEyeToolTimeout(name, deadline, toolTimeoutExplicit)
+	}
+	if fofaMap {
+		deadline = FofaMapToolTimeout(name, deadline, toolTimeoutExplicit)
+	}
+	ctx, cancel := context.WithTimeout(baseCtx, deadline)
 	defer cancel()
 	result, err := conn.session.CallTool(ctx, &sdkmcp.CallToolParams{Name: name, Arguments: coerced})
 	if err != nil {
 		return "", err
 	}
+	if result == nil {
+		return "", fmt.Errorf("MCP 工具 %s 未返回结果", name)
+	}
 	out := formatMCPContent(result.Content, result.StructuredContent)
+	if hawkEye {
+		out = formatHawkEyeMCPContent(name, result.Content, result.StructuredContent, args)
+	}
 	if result.IsError {
+		if hawkEye && hawkEyeStaleNavigateError(name, out) {
+			urlValue := strings.TrimSpace(args["url"])
+			if urlValue != "" {
+				recoveryCtx, recoveryCancel := context.WithTimeout(baseCtx, minMCPDuration(deadline, 35*time.Second))
+				recovered, recoveryErr := conn.session.CallTool(recoveryCtx, &sdkmcp.CallToolParams{
+					Name: "browser_tabs",
+					Arguments: map[string]any{
+						"action": "new", "url": urlValue, "active": true, "bind": true,
+					},
+				})
+				recoveryCancel()
+				if recoveryErr == nil && recovered != nil && !recovered.IsError {
+					recoveryOut := formatMCPContent(recovered.Content, recovered.StructuredContent)
+					return "DeepSentry 已自动修复 HawkEye 陈旧标签绑定：新建目标页、置为活动并绑定到 MCP。\n" + recoveryOut + "\n下一步直接用 browser_find 定位文本，或 browser_snapshot 取得交互 ref。", nil
+				}
+				recoveryWhy := "未返回可用结果"
+				if recoveryErr != nil {
+					recoveryWhy = recoveryErr.Error()
+				}
+				return "MCP 工具返回可修正错误:\n" + out + "\nDeepSentry 尝试自动重建并绑定标签页失败: " + recoveryWhy, nil
+			}
+		}
 		return "MCP 工具返回可修正错误:\n" + out, nil
 	}
-	return out, nil
+	conn.recordHawkEyeState(name, args)
+	return compactHawkEyeMCPOutput(name, out), nil
+}
+
+func minMCPDuration(left, right time.Duration) time.Duration {
+	if left > 0 && left < right {
+		return left
+	}
+	return right
+}
+
+func applyHawkEyeCallDefaults(name string, args map[string]string) map[string]string {
+	copyArgs := make(map[string]string, len(args)+3)
+	for key, value := range args {
+		copyArgs[key] = value
+	}
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "browser_snapshot":
+		if strings.TrimSpace(copyArgs["context_budget_chars"]) == "" {
+			copyArgs["context_budget_chars"] = "30000"
+		}
+		if strings.TrimSpace(copyArgs["max_elements"]) == "" {
+			copyArgs["max_elements"] = "160"
+		}
+		if strings.TrimSpace(copyArgs["compact"]) == "" {
+			copyArgs["compact"] = "true"
+		}
+	case "browser_search", "browser_fetch":
+		if strings.TrimSpace(copyArgs["context_budget_chars"]) == "" {
+			copyArgs["context_budget_chars"] = "30000"
+		}
+	case "browser_research":
+		if strings.TrimSpace(copyArgs["context_budget_chars"]) == "" {
+			copyArgs["context_budget_chars"] = "50000"
+		}
+	case "browser_press_key":
+		if strings.TrimSpace(copyArgs["inputMode"]) == "" && strings.EqualFold(strings.TrimSpace(copyArgs["key"]), "f") {
+			copyArgs["inputMode"] = "trusted"
+		}
+	case "browser_click":
+		blob := strings.ToLower(copyArgs["text"] + " " + copyArgs["element"])
+		if strings.TrimSpace(copyArgs["clickMode"]) == "" && (strings.Contains(blob, "全屏") || strings.Contains(blob, "fullscreen")) {
+			copyArgs["clickMode"] = "trusted"
+		}
+	}
+	return copyArgs
+}
+
+func hawkEyeStaleNavigateError(name, output string) bool {
+	if !strings.EqualFold(strings.TrimSpace(name), "browser_navigate") {
+		return false
+	}
+	lower := strings.ToLower(output)
+	return strings.Contains(lower, "test tab no longer exists") ||
+		strings.Contains(lower, "bound tab no longer exists") ||
+		strings.Contains(lower, "target tab no longer exists")
+}
+
+func compactHawkEyeMCPOutput(name, output string) string {
+	limit := 0
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "browser_navigate":
+		limit = 20000
+	case "browser_snapshot", "browser_click", "browser_hover", "browser_type",
+		"browser_press_key", "browser_select_option", "browser_reload",
+		"browser_go_back", "browser_go_forward", "browser_scroll", "browser_wait_for",
+		"browser_fill_form", "browser_find", "browser_read_text":
+		limit = 24000
+	}
+	if limit == 0 || len(output) <= limit {
+		return output
+	}
+	return output[:limit] + fmt.Sprintf("\n\n[DeepSentry HawkEye 上下文优化：%s 结果共 %d 字符，已保留前 %d；请用 browser_find 定位目标，或 browser_snapshot 按 cursor 继续。不要对 artifact 执行本地 grep/read_file]\n", name, len(output), limit)
+}
+
+func formatHawkEyeMCPContent(name string, contents []sdkmcp.Content, structured any, args map[string]string) string {
+	dumpStructured := structured
+	if hawkEyeDropsStructuredDump(name) {
+		dumpStructured = nil
+	}
+	out := formatMCPContent(contents, dumpStructured)
+	if summary := hawkEyeStructuredSummary(name, structured); summary != "" {
+		out += "\n" + summary
+	}
+	if hint := hawkEyeClickMissingTextHint(name, args); hint != "" {
+		out += "\n" + hint
+	}
+	if hint := hawkEyeInteractionHint(name); hint != "" {
+		out += "\n" + hint
+	}
+	return compactHawkEyeMCPOutput(name, out)
+}
+
+func (conn *sdkConnection) recordHawkEyeState(name string, args map[string]string) {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	if !conn.hawkEye {
+		return
+	}
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "hawkeye_intercept":
+		switch hawkEyeArg(args, "action") {
+		case "enable":
+			conn.hawkEyeInterceptArmed = true
+		case "disable":
+			conn.hawkEyeInterceptArmed = false
+		}
+	case "hawkeye_capture_start":
+		conn.hawkEyeCaptureOwned = true
+	case "hawkeye_capture_stop":
+		conn.hawkEyeCaptureOwned = false
+	case "browser_resize":
+		if hawkEyeArg(args, "action") == "reset" {
+			conn.hawkEyeResizeChanged = false
+		} else {
+			conn.hawkEyeResizeChanged = true
+		}
+	}
+}
+
+func convertSDKToolAnnotations(in *sdkmcp.ToolAnnotations) ToolAnnotations {
+	if in == nil {
+		return ToolAnnotations{}
+	}
+	out := ToolAnnotations{
+		Present:        true,
+		ReadOnlyHint:   in.ReadOnlyHint,
+		IdempotentHint: in.IdempotentHint,
+	}
+	if in.DestructiveHint != nil {
+		out.DestructiveKnown = true
+		out.DestructiveHint = *in.DestructiveHint
+	}
+	if in.OpenWorldHint != nil {
+		out.OpenWorldKnown = true
+		out.OpenWorldHint = *in.OpenWorldHint
+	}
+	return out
 }
 
 func formatMCPContent(contents []sdkmcp.Content, structured any) string {
 	parts := make([]string, 0, len(contents)+1)
+	// Transfer markers are kept separately and appended after visible output is
+	// truncated. Otherwise a server that returns a very large text block before
+	// an image could silently cut off the image evidence before the harness can
+	// attach it to the next vision-model turn.
+	markers := make([]string, 0)
 	for _, content := range contents {
 		switch item := content.(type) {
 		case *sdkmcp.TextContent:
@@ -438,7 +686,14 @@ func formatMCPContent(contents []sdkmcp.Content, structured any) string {
 				}
 			}
 		case *sdkmcp.ImageContent:
-			parts = append(parts, fmt.Sprintf("[图片内容] %s · %d bytes", item.MIMEType, len(item.Data)))
+			artifact, err := persistMCPImage(item.Data, item.MIMEType)
+			if err != nil {
+				parts = append(parts, fmt.Sprintf("[图片内容] %s · %d bytes · 保存失败: %v", item.MIMEType, len(item.Data), err))
+			} else {
+				raw, _ := json.Marshal(artifact)
+				parts = append(parts, fmt.Sprintf("[图片内容] %s · %d bytes · 已保存到 %s", artifact.MediaType, artifact.Size, artifact.Path))
+				markers = append(markers, imageArtifactMarker+string(raw))
+			}
 		case *sdkmcp.AudioContent:
 			parts = append(parts, fmt.Sprintf("[音频内容] %s · %d bytes", item.MIMEType, len(item.Data)))
 		default:
@@ -453,9 +708,90 @@ func formatMCPContent(contents []sdkmcp.Content, structured any) string {
 		}
 	}
 	if len(parts) == 0 {
-		return "(MCP 无可显示输出)"
+		parts = append(parts, "(MCP 无可显示输出)")
 	}
-	return truncateMCPText(strings.Join(parts, "\n"), 1<<20)
+	visible := truncateMCPText(strings.Join(parts, "\n"), 1<<20)
+	if len(markers) == 0 {
+		return visible
+	}
+	return visible + "\n" + strings.Join(markers, "\n")
+}
+
+// ExtractImageArtifacts removes internal transfer markers from model-visible
+// text and returns validated metadata for harness-side vision attachments.
+func ExtractImageArtifacts(text string) (string, []ImageArtifact) {
+	lines := strings.Split(text, "\n")
+	clean := make([]string, 0, len(lines))
+	artifacts := make([]ImageArtifact, 0)
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, imageArtifactMarker) {
+			var artifact ImageArtifact
+			if json.Unmarshal([]byte(strings.TrimPrefix(trimmed, imageArtifactMarker)), &artifact) == nil && artifact.Path != "" {
+				artifacts = append(artifacts, artifact)
+				continue
+			}
+		}
+		clean = append(clean, line)
+	}
+	return strings.TrimSpace(strings.Join(clean, "\n")), artifacts
+}
+
+func persistMCPImage(data []byte, declaredMIME string) (ImageArtifact, error) {
+	if len(data) == 0 {
+		return ImageArtifact{}, errors.New("图片数据为空")
+	}
+	if len(data) > maxMCPImageBytes {
+		return ImageArtifact{}, fmt.Errorf("图片超过 %d MiB 限制", maxMCPImageBytes>>20)
+	}
+	detected := strings.ToLower(strings.TrimSpace(strings.Split(http.DetectContentType(data), ";")[0]))
+	ext := ""
+	switch detected {
+	case "image/png":
+		ext = ".png"
+	case "image/jpeg":
+		ext = ".jpg"
+	case "image/gif":
+		ext = ".gif"
+	case "image/webp":
+		ext = ".webp"
+	default:
+		return ImageArtifact{}, fmt.Errorf("不支持的图片格式 %q（声明为 %q）", detected, declaredMIME)
+	}
+	dir := strings.TrimSpace(os.Getenv("DEEPSENTRY_MCP_ARTIFACT_DIR"))
+	if dir == "" {
+		cwd, err := os.Getwd()
+		if err != nil {
+			return ImageArtifact{}, err
+		}
+		dir = filepath.Join(cwd, "reports", "mcp-artifacts")
+	}
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return ImageArtifact{}, err
+	}
+	if err := os.MkdirAll(absDir, 0o700); err != nil {
+		return ImageArtifact{}, err
+	}
+	sum := sha256.Sum256(data)
+	digest := fmt.Sprintf("%x", sum[:])
+	name := fmt.Sprintf("mcp_%s_%s%s", time.Now().Format("20060102_150405.000000000"), digest[:12], ext)
+	path := filepath.Join(absDir, name)
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return ImageArtifact{}, err
+	}
+	_, writeErr := file.Write(data)
+	closeErr := file.Close()
+	if writeErr != nil {
+		_ = os.Remove(path)
+		return ImageArtifact{}, writeErr
+	}
+	if closeErr != nil {
+		_ = os.Remove(path)
+		return ImageArtifact{}, closeErr
+	}
+	return ImageArtifact{Path: path, Name: name, MediaType: detected, Size: int64(len(data)), SHA256: digest}, nil
 }
 
 func ListServerStatuses() []ServerStatus {
@@ -475,6 +811,72 @@ func ListServerStatuses() []ServerStatus {
 	return out
 }
 
+// ServerInventory is a compact per-connection tool count for banners and startup logs.
+type ServerInventory struct {
+	Name      string
+	ToolCount int
+}
+
+// ConnectedInventory lists currently connected MCP servers and how many tools
+// each exposed. SDK connection status is preferred; the tool registry is the
+// fallback when only the legacy stdio adapter is populated.
+func ConnectedInventory() []ServerInventory {
+	if items := inventoryFromStatuses(ListServerStatuses()); len(items) > 0 {
+		return items
+	}
+	return inventoryFromTools(Global().ListTools())
+}
+
+func inventoryFromStatuses(statuses []ServerStatus) []ServerInventory {
+	out := make([]ServerInventory, 0, len(statuses))
+	for _, status := range statuses {
+		if !strings.EqualFold(strings.TrimSpace(status.State), "connected") {
+			continue
+		}
+		name := strings.TrimSpace(status.Name)
+		if name == "" {
+			continue
+		}
+		out = append(out, ServerInventory{Name: name, ToolCount: status.Tools})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+func inventoryFromTools(tools []ExternalTool) []ServerInventory {
+	counts := map[string]int{}
+	for _, tool := range tools {
+		name := strings.TrimSpace(tool.Server)
+		if name == "" {
+			continue
+		}
+		counts[name]++
+	}
+	out := make([]ServerInventory, 0, len(counts))
+	for name, count := range counts {
+		out = append(out, ServerInventory{Name: name, ToolCount: count})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+// FormatConnectedInventory returns a one-line summary such as
+// "2 个已连接 · fofamap 15 · hx0-hawkeye 51". Empty when nothing is connected.
+func FormatConnectedInventory() string {
+	return formatConnectedInventory(ConnectedInventory())
+}
+
+func formatConnectedInventory(items []ServerInventory) string {
+	if len(items) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(items))
+	for _, item := range items {
+		parts = append(parts, fmt.Sprintf("%s %d", item.Name, item.ToolCount))
+	}
+	return fmt.Sprintf("%d 个已连接 · %s", len(items), strings.Join(parts, " · "))
+}
+
 func FormatServerStatus() string {
 	statuses := ListServerStatuses()
 	if len(statuses) == 0 {
@@ -491,6 +893,13 @@ func FormatServerStatus() string {
 		}
 		if status.Error != "" {
 			line += " · error=" + status.Error
+		}
+		if status.State != "connected" {
+			if status.Auth == "oauth" {
+				line += " · retry=/mcp login " + status.Name
+			} else {
+				line += " · retry=/mcp reconnect " + status.Name
+			}
 		}
 		b.WriteString(line + "\n")
 	}
@@ -689,6 +1098,7 @@ func closeSDKConnection(conn *sdkConnection) {
 	if conn == nil {
 		return
 	}
+	cleanupHawkEyeConnectionState(conn)
 	if conn.cancel != nil {
 		conn.cancel()
 	}
@@ -703,6 +1113,39 @@ func closeSDKConnection(conn *sdkConnection) {
 	globalRegistry.unregisterServer(conn.serverName)
 }
 
+// cleanupHawkEyeConnectionState is a best-effort safety net for process exit,
+// server replacement and explicit /mcp remove. It only reverts state that this
+// DeepSentry connection successfully changed. Intercept disable is first and
+// HawkEye defines it as "stop and release all", preventing a browser tab from
+// remaining hung even if the outer CLI cleanup has a short deadline.
+func cleanupHawkEyeConnectionState(conn *sdkConnection) {
+	if conn == nil || conn.session == nil {
+		return
+	}
+	conn.mu.RLock()
+	intercept, capture, resized := conn.hawkEyeInterceptArmed, conn.hawkEyeCaptureOwned, conn.hawkEyeResizeChanged
+	conn.mu.RUnlock()
+	if !intercept && !capture && !resized {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+	call := func(name string, args map[string]any) {
+		if ctx.Err() == nil {
+			_, _ = conn.session.CallTool(ctx, &sdkmcp.CallToolParams{Name: name, Arguments: args})
+		}
+	}
+	if intercept {
+		call("hawkeye_intercept", map[string]any{"action": "disable"})
+	}
+	if capture {
+		call("hawkeye_capture_stop", map[string]any{})
+	}
+	if resized {
+		call("browser_resize", map[string]any{"action": "reset"})
+	}
+}
+
 func closeSDKConnections() {
 	sdkConnections.RLock()
 	connections := make([]*sdkConnection, 0, len(sdkConnections.byName))
@@ -713,6 +1156,31 @@ func closeSDKConnections() {
 	for _, conn := range connections {
 		closeSDKConnection(conn)
 	}
+}
+
+// Reconnect replaces a failed/disconnected session without changing config.
+// Tool calls are never replayed automatically because a transport failure may
+// happen after a modifying server operation has already taken effect.
+func Reconnect(server string) error {
+	server = strings.TrimSpace(server)
+	if server == "" {
+		return fmt.Errorf("MCP Server 名称不能为空")
+	}
+	sdkConnections.RLock()
+	existing := sdkConnections.byName[server]
+	sdkConnections.RUnlock()
+	if existing == nil {
+		return fmt.Errorf("未找到 MCP Server 连接记录: %s", server)
+	}
+	existing.mu.RLock()
+	cfg := existing.config
+	auth := existing.status.Auth
+	existing.mu.RUnlock()
+	if auth == "oauth" {
+		return fmt.Errorf("MCP Server %s 使用 OAuth；请执行 /mcp login %s 重新授权", server, server)
+	}
+	closeSDKConnection(existing)
+	return Connect(cfg)
 }
 
 // Disconnect closes one live MCP connection and removes all tools, resources
@@ -726,8 +1194,11 @@ func Disconnect(server string) {
 	}
 }
 
-func setFailedServerStatus(name, transport string, err error) {
-	conn := &sdkConnection{serverName: name, transport: transport, status: ServerStatus{Name: name, Transport: transport, State: "failed", Error: err.Error()}}
+func setFailedServerStatus(name, transport, fingerprint string, cfg ServerConfig, oauth bool, err error) {
+	conn := &sdkConnection{
+		serverName: name, transport: transport, fingerprint: fingerprint, config: cfg,
+		status: ServerStatus{Name: name, Transport: transport, State: "failed", Error: err.Error(), Auth: mcpAuthMode(cfg, oauth)},
+	}
 	sdkConnections.Lock()
 	sdkConnections.byName[name] = conn
 	sdkConnections.Unlock()

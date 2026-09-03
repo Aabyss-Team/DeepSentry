@@ -44,6 +44,12 @@ func TestNetworkBaselineCommandProfiles(t *testing.T) {
 	if got := networkBaselineCommands("h3c"); len(got) == 0 || got[0] != "display version" {
 		t.Fatalf("h3c commands=%v", got)
 	}
+	if got := networkBaselineCommands("juniper"); len(got) == 0 || got[0] != "show version" {
+		t.Fatalf("juniper commands=%v", got)
+	}
+	if got := networkBaselineCommands("fortinet"); len(got) == 0 || !strings.Contains(got[0], "system status") {
+		t.Fatalf("fortinet commands=%v", got)
+	}
 }
 
 func TestNetworkDeviceDiagnoseUsesFocusedEvidenceSet(t *testing.T) {

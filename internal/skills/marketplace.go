@@ -148,13 +148,13 @@ func ManageMarketplace(args map[string]string) (string, error) {
 			return "", fmt.Errorf("inspect 需要 source")
 		}
 		return InspectMarketSkill(ctx, ref)
-	case "install", "add":
+	case "install", "add", "import":
 		if !truthy(args["confirm_install"]) {
 			return "", fmt.Errorf("安装第三方 Skill 前必须显式传 confirm_install=true")
 		}
 		ref := strings.TrimSpace(firstValue(args, "source", "ref", "name"))
 		if ref == "" {
-			return "", fmt.Errorf("install 需要 source，例如 clawhub:security-audit 或 skills:owner/repo@skill")
+			return "", fmt.Errorf("install 需要 source，例如 /path/demo.skill、clawhub:security-audit 或 skills:owner/repo@skill")
 		}
 		dest := strings.TrimSpace(args["dest"])
 		if dest == "" {
@@ -213,7 +213,7 @@ func ManageMarketplace(args map[string]string) (string, error) {
 		}
 		return AuditSkillRoot(dest)
 	default:
-		return "", fmt.Errorf("未知 skill_market action: %s；支持 search/inspect/install/managed/check_updates/update/pin/unpin/uninstall/rollback/audit", action)
+		return "", fmt.Errorf("未知 skill_market action: %s；支持 search/inspect/install/import/managed/check_updates/update/pin/unpin/uninstall/rollback/audit", action)
 	}
 }
 
@@ -345,6 +345,21 @@ func InspectMarketSkill(ctx context.Context, ref string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if market == "local" {
+		files, absolutePath, version, err := loadLocalSkillPackage(source)
+		if err != nil {
+			return "", err
+		}
+		audit, err := auditSkillFiles(files)
+		if err != nil {
+			return "", err
+		}
+		warningText := "无高风险静态模式"
+		if len(audit.Warnings) > 0 {
+			warningText = strings.Join(audit.Warnings, "、")
+		}
+		return fmt.Sprintf("本地 Skill 包: %s\nSkill: %s\n简介: %s\n文件: %d，大小: %d bytes\n版本: %s\n静态审查: %s\n提示: .skill 可为 ZIP 容器，也可为单文件 YAML frontmatter + Markdown；检查不会执行包内脚本。", absolutePath, audit.Name, audit.Description, audit.Files, audit.Bytes, version, warningText), nil
+	}
 	if market == "clawhub" {
 		meta, err := fetchClawMeta(ctx, source)
 		if err != nil {
@@ -412,7 +427,15 @@ func InstallMarketSkill(ctx context.Context, ref, destRoot string, force, acknow
 	}
 	var files []installFile
 	var version string
-	if market == "clawhub" {
+	lockedSource := ref
+	if market == "local" {
+		var absolutePath string
+		files, absolutePath, version, err = loadLocalSkillPackage(source)
+		if err != nil {
+			return "", err
+		}
+		lockedSource = "local:" + absolutePath
+	} else if market == "clawhub" {
 		meta, err := fetchClawMeta(ctx, source)
 		if err != nil {
 			return "", err
@@ -447,7 +470,94 @@ func InstallMarketSkill(ctx context.Context, ref, destRoot string, force, acknow
 		}
 	}
 
-	return installFiles(destRoot, market, ref, version, files, force, acknowledgeRisk)
+	return installFiles(destRoot, market, lockedSource, version, files, force, acknowledgeRisk)
+}
+
+// loadLocalSkillPackage imports a local .skill package without executing it.
+// A .skill file may be a ZIP container holding one SKILL.md tree, or a plain
+// UTF-8 SKILL.md document stored with the portable .skill suffix. Supporting
+// both forms is intentional: the open Agent Skills spec standardizes the
+// directory/SKILL.md layout but does not standardize a .skill container.
+func loadLocalSkillPackage(source string) ([]installFile, string, string, error) {
+	source = strings.TrimSpace(source)
+	source = strings.TrimPrefix(source, "local:")
+	source = strings.TrimPrefix(source, "file:")
+	source = strings.TrimPrefix(source, "//")
+	if source == "" {
+		return nil, "", "", fmt.Errorf("本地 Skill 路径为空")
+	}
+	absolutePath, err := filepath.Abs(expandSourcePath(source))
+	if err != nil {
+		return nil, "", "", fmt.Errorf("解析本地 Skill 路径失败: %w", err)
+	}
+	absolutePath = filepath.Clean(absolutePath)
+	info, err := os.Lstat(absolutePath)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("读取本地 Skill 包失败: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return nil, "", "", fmt.Errorf("本地 Skill 来源必须是普通文件，不接受符号链接或目录: %s", absolutePath)
+	}
+	if info.Size() > maxMarketplaceBytes {
+		return nil, "", "", fmt.Errorf("本地 Skill 包超过 %d MiB 限制", maxMarketplaceBytes>>20)
+	}
+	file, err := os.Open(absolutePath)
+	if err != nil {
+		return nil, "", "", err
+	}
+	raw, readErr := io.ReadAll(io.LimitReader(file, maxMarketplaceBytes+1))
+	closeErr := file.Close()
+	if readErr != nil {
+		return nil, "", "", readErr
+	}
+	if closeErr != nil {
+		return nil, "", "", closeErr
+	}
+	if len(raw) > maxMarketplaceBytes {
+		return nil, "", "", fmt.Errorf("本地 Skill 包超过 %d MiB 限制", maxMarketplaceBytes>>20)
+	}
+
+	var files []installFile
+	if bytes.HasPrefix(raw, []byte{'P', 'K', 3, 4}) || bytes.HasPrefix(raw, []byte{'P', 'K', 5, 6}) {
+		files, err = filesFromZip(raw)
+	} else {
+		lowerExt := strings.ToLower(filepath.Ext(absolutePath))
+		if lowerExt == ".zip" {
+			return nil, "", "", fmt.Errorf("无效 Skill zip: 文件缺少 ZIP 头")
+		}
+		if bytes.IndexByte(raw, 0) >= 0 || !strings.HasPrefix(strings.TrimSpace(string(raw)), "---") {
+			return nil, "", "", fmt.Errorf("本地 .skill 既不是有效 ZIP，也不是带 YAML frontmatter 的文本 Skill")
+		}
+		files = []installFile{{Path: "SKILL.md", Data: raw}}
+	}
+	if err != nil {
+		return nil, "", "", err
+	}
+	digest := digestFiles(files)
+	version := "sha256:" + digest[:12]
+	return files, absolutePath, version, nil
+}
+
+func auditSkillFiles(files []installFile) (SkillAudit, error) {
+	stage, err := os.MkdirTemp("", ".deepsentry-skill-inspect-")
+	if err != nil {
+		return SkillAudit{}, err
+	}
+	defer os.RemoveAll(stage)
+	for _, file := range files {
+		clean, err := cleanRelativePath(file.Path)
+		if err != nil {
+			return SkillAudit{}, err
+		}
+		path := filepath.Join(stage, filepath.FromSlash(clean))
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			return SkillAudit{}, err
+		}
+		if err := os.WriteFile(path, file.Data, 0o600); err != nil {
+			return SkillAudit{}, err
+		}
+	}
+	return AuditSkillDir(stage)
 }
 
 func filesFromZip(raw []byte) ([]installFile, error) {
@@ -1266,6 +1376,10 @@ func managedRemoteVersion(ctx context.Context, item managedSkill) (string, error
 		}
 		return meta.LatestVersion.Version, nil
 	}
+	if market == "local" {
+		_, _, version, err := loadLocalSkillPackage(source)
+		return version, err
+	}
 	repo, _, refName, err := parseGitSkillSource(source)
 	if err != nil {
 		return "", err
@@ -1464,21 +1578,38 @@ func mapSkillBool(value bool, yes, no string) string {
 func parseMarketRef(ref string) (market, source string, err error) {
 	ref = strings.TrimSpace(ref)
 	switch {
+	case strings.HasPrefix(ref, "local:"):
+		market, source = "local", strings.TrimPrefix(ref, "local:")
+	case strings.HasPrefix(ref, "file:"):
+		market, source = "local", strings.TrimPrefix(ref, "file:")
 	case strings.HasPrefix(ref, "clawhub:"):
 		market, source = "clawhub", strings.TrimPrefix(ref, "clawhub:")
 	case strings.HasPrefix(ref, "skills:"):
 		market, source = "skills.sh", strings.TrimPrefix(ref, "skills:")
 	case strings.HasPrefix(ref, "github:"):
 		market, source = "skills.sh", strings.TrimPrefix(ref, "github:")
+	case looksLikeLocalSkillPath(ref):
+		market, source = "local", ref
 	case safeSlugPattern.MatchString(ref):
 		market, source = "clawhub", ref
 	default:
-		return "", "", fmt.Errorf("无法识别 Skill 来源 %q；使用 clawhub:<slug> 或 skills:<owner/repo>@<skill>", ref)
+		return "", "", fmt.Errorf("无法识别 Skill 来源 %q；使用 /path/demo.skill、clawhub:<slug> 或 skills:<owner/repo>@<skill>", ref)
 	}
 	if strings.TrimSpace(source) == "" {
 		return "", "", fmt.Errorf("Skill 来源为空")
 	}
 	return market, source, nil
+}
+
+func looksLikeLocalSkillPath(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return false
+	}
+	lower := strings.ToLower(value)
+	return filepath.IsAbs(value) || strings.HasPrefix(value, "./") || strings.HasPrefix(value, "../") ||
+		strings.HasPrefix(value, "~/") || strings.ContainsAny(value, `/\\`) ||
+		strings.HasSuffix(lower, ".skill") || strings.HasSuffix(lower, ".zip") || strings.EqualFold(filepath.Base(value), "SKILL.md")
 }
 
 func parseGitSkillSource(source string) (repo, skillID, refName string, err error) {

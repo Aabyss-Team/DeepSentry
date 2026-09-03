@@ -15,9 +15,10 @@ license: Apache-2.0
 
 1. 明确题型、输入材料和授权范围；不要扫描第三方公网目标。
 2. Web 题优先使用 `headless_browser` 获取渲染后 DOM、表单、链接和文本；失败时接受静态回退。
-3. 文件/目录题优先 `glob`、`grep`、`file_ident`、`file_strings`、`flag_scan`。
-4. 日志/取证题优先 `read_log`、`read_gzip`、`log-analyst` 子 Agent。
-5. 每个结论必须绑定证据：路径、URL、匹配片段、响应状态或日志时间。
+3. 加密 ZIP 先 `load_skill zipcracker`，再用 `zip_password_recover`：`action=auto` 会按 ZipCracker 顺序先修伪加密，再对 1～6 字节条目做 CRC32 内容恢复，最后用内置 6000 字典。不要把 CRC32 命中的明文当成密码。已知明文/`bkcrack` 尚未复刻。
+4. 文件/目录题优先 `glob`、`grep`、`file_ident`、`file_strings`、`flag_scan`。
+5. 日志/取证题优先 `read_log`、`read_gzip`、`log-analyst` 子 Agent。
+6. 每个结论必须绑定证据：路径、URL、匹配片段、响应状态或日志时间。
 
 ## 推荐工具
 

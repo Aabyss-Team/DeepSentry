@@ -7,10 +7,10 @@ import (
 
 func TestAgentToolDefinitionsForCompactContextLimitsAndRanks(t *testing.T) {
 	definitions := AgentToolDefinitionsForContext(8, "请离线 analyze pcap 并检查 DNS 会话")
-	if len(definitions) < 3 || len(definitions) > 10 { // two base tools + only positive candidates
-		t.Fatalf("compact definitions=%d want 3..10", len(definitions))
+	if len(definitions) < 4 || len(definitions) > 11 { // always-visible natives + only positive candidates
+		t.Fatalf("compact definitions=%d want 4..11", len(definitions))
 	}
-	want := map[string]bool{"agent_action": false, "tool_catalog": false, "pcap_analyze": false}
+	want := map[string]bool{"agent_action": false, "tool_catalog": false, "skill": false, "pcap_analyze": false}
 	for _, definition := range definitions {
 		if _, ok := want[definition.Function.Name]; ok {
 			want[definition.Function.Name] = true
@@ -36,14 +36,14 @@ func TestRuntimeV3DeferredToolsBoundFullProfileAndKeepPinned(t *testing.T) {
 		{Role: "user", Content: "继续分析证据"},
 	}
 	definitions := nativeToolDefinitionsForRequest(cfg, messages)
-	if got, max := len(definitions), runtimeV3DeferredToolLimit+2; got < 4 || got > max {
-		t.Fatalf("v3 definitions=%d want 4..%d", got, max)
+	if got, max := len(definitions), runtimeV3DeferredToolLimit+alwaysVisibleNativeSchemaCount; got < 5 || got > max {
+		t.Fatalf("v3 definitions=%d want 5..%d", got, max)
 	}
 	seen := map[string]bool{}
 	for _, definition := range definitions {
 		seen[definition.Function.Name] = true
 	}
-	for _, name := range []string{"agent_action", "tool_catalog", "pcap_analyze", "webshell_hunt"} {
+	for _, name := range []string{"agent_action", "tool_catalog", "skill", "pcap_analyze", "webshell_hunt"} {
 		if !seen[name] {
 			t.Fatalf("v3 deferred schema lost %s", name)
 		}
@@ -62,7 +62,7 @@ func TestDeferredToolRetrievalDoesNotAlphabeticallyFillZeroScores(t *testing.T) 
 	if seen["config_manage"] {
 		t.Fatal("zero-relevance config_manage leaked into deferred candidates")
 	}
-	if len(definitions) >= runtimeV3DeferredToolLimit+2 {
+	if len(definitions) >= runtimeV3DeferredToolLimit+alwaysVisibleNativeSchemaCount {
 		t.Fatalf("deferred candidates were padded to the hard limit: %d", len(definitions))
 	}
 }

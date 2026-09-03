@@ -35,6 +35,46 @@ func CheckRisk(cmd string) (string, string) {
 	return "low", "只读/低副作用操作"
 }
 
+// LooksLikeFlagCommand reports whether the would-be shell command is actually a
+// CTF/AWD flag or extracted plaintext. Models sometimes try to execute
+// flag{...} after recovering an archive; that is not a command and must not be
+// confirmed as a high-risk shell action.
+func LooksLikeFlagCommand(cmd string) bool {
+	cmd = normalizeCommand(strings.TrimSpace(cmd))
+	if cmd == "" {
+		return false
+	}
+	if isCTFFlagToken(strings.Trim(cmd, `"'`)) {
+		return true
+	}
+	for _, sub := range splitShellCommands(cmd) {
+		fields := strings.Fields(strings.TrimSpace(sub))
+		if len(fields) == 0 {
+			continue
+		}
+		if isCTFFlagToken(strings.Trim(fields[0], `"'`)) {
+			return true
+		}
+	}
+	return false
+}
+
+func isCTFFlagToken(token string) bool {
+	token = strings.TrimSpace(token)
+	if len(token) < 6 || !strings.HasSuffix(token, "}") {
+		return false
+	}
+	lower := strings.ToLower(token)
+	for _, prefix := range []string{"flag{", "ctf{", "key{", "ans{", "answer{"} {
+		if !strings.HasPrefix(lower, prefix) {
+			continue
+		}
+		inner := token[len(prefix) : len(token)-1]
+		return inner != "" && !strings.ContainsAny(inner, " \t\n")
+	}
+	return false
+}
+
 func isReadOnlyNetworkCLI(command string) bool {
 	parts := strings.Split(command, "|")
 	if len(parts) == 0 {
@@ -83,6 +123,9 @@ func CanReviewHighRiskWithAI(cmd, reason string) bool {
 	cmd = strings.TrimSpace(cmd)
 	reason = strings.TrimSpace(reason)
 	if cmd == "" || reason == "" {
+		return false
+	}
+	if LooksLikeFlagCommand(cmd) {
 		return false
 	}
 	return true

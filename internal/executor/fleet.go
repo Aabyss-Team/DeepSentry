@@ -200,6 +200,7 @@ func NewEphemeralExecutor(target config.TargetConfig) (Executor, error) {
 		cfg.SSHUser = firstNonEmpty(target.User, cfg.SSHUser, "root")
 		cfg.SSHPassword = target.Password
 		cfg.SSHKeyPath = target.KeyPath
+		cfg.SSHKeyPassphrase = target.KeyPassphrase
 		cfg.SSHPrompt = target.Prompt
 		cfg.SSHDeviceType = target.DeviceType
 		cfg.SSHEnablePassword = target.EnablePassword

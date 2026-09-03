@@ -157,6 +157,23 @@ func (r *SubAgentRunner) Run(spec subagent.Spec, taskPrompt string, sysCtx colle
 			r.UI.Emit(UIEvent{Kind: EventSubAgentAction, Message: spec.Name, Action: &actCopy, TargetName: r.Target.Name, TargetProtocol: r.Target.Protocol, TargetHost: r.Target.Host})
 		}
 
+		if decision := r.State.LoopBeforeExecute(action); !decision.Allow {
+			warning := strings.TrimSpace(decision.Warning)
+			if warning == "" {
+				warning = strings.TrimSpace(decision.Output)
+			}
+			if decision.HardStop {
+				return warning, nil
+			}
+			result := blockedActionResult(action, decision.Output)
+			appendActionResultHistory(&subHistory, action, result)
+			if warning != "" {
+				subHistory = append(subHistory, analyzer.Message{Role: "user", Content: warning})
+			}
+			r.State.LoopRecordSkip(action)
+			continue
+		}
+
 		if action.Type == ActionTask {
 			subHistory = append(subHistory, analyzer.Message{
 				Role: "user", Content: "子 Agent 不能委派 task，请直接执行。",
@@ -231,6 +248,12 @@ func (r *SubAgentRunner) Run(spec subagent.Spec, taskPrompt string, sysCtx colle
 
 		result.Output = out
 		appendActionResultHistory(&subHistory, action, result)
+		if warning := r.State.LoopAfterExecute(action, out, false); warning != "" {
+			subHistory = append(subHistory, analyzer.Message{Role: "user", Content: warning})
+			if r.State.LoopShouldHalt() {
+				return warning, nil
+			}
+		}
 	}
 
 	summary := strings.Join(results, "\n---\n")
@@ -354,6 +377,11 @@ func subAgentAssignmentForEstimate(prompt string) string {
 func authorizeSubAgentExecute(action *AgentAction, sysCtx collector.SystemContext, batchMode bool, ui UISink, confirmFn func(*AgentAction) bool, reviewer commandRiskReviewer) (bool, string) {
 	if action == nil || strings.TrimSpace(action.Command) == "" {
 		return true, ""
+	}
+	if security.LooksLikeFlagCommand(action.Command) {
+		action.RiskLevel = "blocked"
+		action.Reason = "比赛 flag/文件内容不是 shell 命令"
+		return false, "flag{...} 是解出的比赛答案或文件内容，不是可执行命令。不要 execute，请用 finish 提交该 flag。"
 	}
 	if batchMode {
 		if ui != nil {

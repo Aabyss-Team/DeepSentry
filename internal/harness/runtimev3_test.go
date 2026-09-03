@@ -62,6 +62,28 @@ func TestParseActionUnwrapsProviderNativeToolEnvelope(t *testing.T) {
 	}
 }
 
+func TestParseActionUnwrapsSingleMCPToolEnvelope(t *testing.T) {
+	action := ParseAction(analyzer.AgentResponse{
+		Action:   "tool",
+		ToolName: "fofamap__fofa_icon_search",
+		ToolArgs: parseNativeToolArgs(`{"action":"tool","tool_name":"fofamap__fofa_icon_search","tool_args":{"url":"https://www.bilibili.com","size":"3"},"thought":"x","is_finished":false}`),
+	})
+	if action.Type != ActionTool || action.ToolArgs["url"] != "https://www.bilibili.com" || action.ToolArgs["size"] != "3" || action.ToolArgs["tool_args"] != "" {
+		t.Fatalf("single MCP envelope was not unwrapped: %#v", action)
+	}
+}
+
+func TestParseActionUnwrapsMCPEnvelopeWithoutExactToolName(t *testing.T) {
+	action := ParseAction(analyzer.AgentResponse{
+		Action:   "tool",
+		ToolName: "fofamap__fofa_host_profile",
+		ToolArgs: parseNativeToolArgs(`{"action":"tool","tool_args":{"host":"1.1.1.1"},"thought":"x"}`),
+	})
+	if action.ToolArgs["host"] != "1.1.1.1" || action.ToolArgs["thought"] != "" {
+		t.Fatalf("empty tool_name envelope should still unwrap: %#v", action.ToolArgs)
+	}
+}
+
 func TestNativeToolEnvelopeRequiresMatchingToolName(t *testing.T) {
 	args := parseNativeToolArgs(`{"action":"tool","tool_name":"file_upload","tool_args":{"remote_path":"/evidence.bin"}}`)
 	got := unwrapNativeToolEnvelope("file_download", args)
@@ -77,6 +99,20 @@ func TestAppendActionResultHistoryUsesProviderToolProtocol(t *testing.T) {
 	appendActionResultHistory(&history, action, result)
 	if len(history) != 2 || history[0].Role != "assistant" || history[0].ReasoningContent != "signed-thought" || len(history[0].ToolCalls) != 1 || history[1].Role != "tool" || history[1].ToolCallID != "call_1" {
 		t.Fatalf("history=%#v", history)
+	}
+}
+
+func TestAppendActionResultHistorySplitsLargeImageEvidenceBatch(t *testing.T) {
+	action := AgentAction{Type: ActionToolBatch, ToolCalls: []ToolCallAction{{ID: "call_1", Name: "browser_screenshot"}}}
+	attachments := make([]analyzer.ImageAttachment, analyzer.MaxImagesPerMessage+1)
+	for i := range attachments {
+		attachments[i] = analyzer.ImageAttachment{Path: "/tmp/example.png", Size: 1}
+	}
+	result := &ActionResult{ToolResults: []ToolCallResult{{ID: "call_1", Name: "browser_screenshot", Output: "ok", Attachments: attachments}}}
+	var history []analyzer.Message
+	appendActionResultHistory(&history, action, result)
+	if len(history) != 4 || len(history[2].Attachments) != analyzer.MaxImagesPerMessage || len(history[3].Attachments) != 1 {
+		t.Fatalf("image evidence was not split safely: %#v", history)
 	}
 }
 

@@ -24,7 +24,7 @@ func TestFormatCatalog(t *testing.T) {
 
 func TestRegistryCount(t *testing.T) {
 	ConfigureEnabled(nil, nil)
-	const releaseToolCount = 70
+	const releaseToolCount = 71
 	if got := CountEnabled(); got != releaseToolCount {
 		t.Fatalf("enabled tool count = %d, want release count %d; update the release docs and this gate together", got, releaseToolCount)
 	}
@@ -138,6 +138,28 @@ func TestToolContractsValidateCanonicalCalls(t *testing.T) {
 	invalidAction := map[string]string{"action": "list_targets", "force": "true"}
 	if err := ValidateCall("config_manage", invalidAction); err == nil || !strings.Contains(err.Error(), "fleet_inventory") {
 		t.Fatalf("hallucinated action should point to fleet_inventory: %v", err)
+	}
+}
+
+func TestValidateCallDropsShadowActionKeys(t *testing.T) {
+	args := map[string]string{
+		"action":  "auto",
+		"source":  "/tmp/test02.zip",
+		"extract": "true",
+		"crc32":   "true",
+	}
+	if err := ValidateCall("zip_password_recover", args); err != nil {
+		t.Fatalf("shadow crc32 key should be ignored: %v", err)
+	}
+	if args["crc32"] != "" || args["action"] != "auto" {
+		t.Fatalf("shadow key not dropped: %#v", args)
+	}
+	crcOnly := map[string]string{"source": "/tmp/test03.zip", "crc32": "true"}
+	if err := ValidateCall("zip_password_recover", crcOnly); err != nil {
+		t.Fatalf("crc32 shadow should become action: %v", err)
+	}
+	if crcOnly["action"] != "crc32" || crcOnly["crc32"] != "" {
+		t.Fatalf("crc32 shadow was not promoted: %#v", crcOnly)
 	}
 }
 

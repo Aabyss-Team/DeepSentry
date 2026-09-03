@@ -7,7 +7,29 @@
 
 ## [未发布]
 
-尚无已记录的未发布变更。
+暂无已记录的未发布变更。
+
+## [2.0.3 Ultimate] - 2026-09-03
+
+### 多模态与交互
+
+- 新增图片文件、系统剪贴板和纯图片消息输入，支持 PNG/JPEG/GIF/WebP；OpenAI Chat Completions、Responses 与 Anthropic Messages 均使用原生图片内容块。
+- `vision_mode: auto` 按精确模型目录识别图片能力；图片仅在发送请求时读取，checkpoint 保存路径、类型、大小与哈希，不保存 Base64 正文。
+- TUI 支持 `⌘V`（macOS）和 `Ctrl+V` 图片优先、文本回退粘贴，并保留 `/image [路径]` 入口。
+
+### 原生工具与扩展
+
+- 内置工具增至 71 个，新增 `zip_password_recover`：支持 ZipCrypto/WinZip AES 字典与掩码恢复、伪加密修复、短明文 CRC32 恢复及安全解压，所有策略均带资源上限。
+- 深度适配 FofaMap v2.0.1 的 15 个工具与 HawkEye MCP 1.0.6 的 51 个工具，补齐任务路由、分页、长任务超时、真实输入和动作级风险审批。
+- MCP 增加断线重连；图片结果以私有权限保存并校验后回灌视觉模型，单张限制 20 MiB。
+
+### 兼容性与可靠性
+
+- 更新 OpenAI、Claude、Gemini、DeepSeek、千问、GLM、MiniMax、MiMo、混元与 xAI 的内置模型预设和多模态能力目录。
+- SSH 增加旧算法可选兼容、keyboard-interactive、加密私钥口令和 PTY 回退；网络设备识别扩展至 ASA、Juniper、Fortinet、Palo Alto、山石、深信服、Check Point 等平台。
+- Skill 可按任务自动匹配并注入；循环守卫会阻止无效重复，同时保留一次瞬时失败重试机会。
+- 高风险会话授权按目标与操作类型复用，任意执行、写入及敏感参数变化继续使用严格指纹。
+- Go 工具链与网络、加密依赖升级到已修复版本，二进制符号级漏洞扫描未发现可达漏洞。
 
 ## [2.0.2 Ultimate] - 2026-07-22
 
@@ -159,7 +181,8 @@
 - 自动生成包含任务步骤、执行输出和结论的 Markdown 报告。
 - 提供内置 SSH/SFTP 能力和 Windows、macOS、Linux 多架构单文件程序。
 
-[未发布]: https://github.com/asaotomo/DeepSentry/compare/DeepSentry_v2.0.2_Ultimate...HEAD
+[未发布]: https://github.com/asaotomo/DeepSentry/compare/DeepSentry_v2.0.3_Ultimate...HEAD
+[2.0.3 Ultimate]: https://github.com/asaotomo/DeepSentry/releases/tag/DeepSentry_v2.0.3_Ultimate
 [2.0.2 Ultimate]: https://github.com/asaotomo/DeepSentry/releases/tag/DeepSentry_v2.0.2_Ultimate
 [2.0.1 Ultimate]: https://github.com/asaotomo/DeepSentry/releases/tag/DeepSentry_v2.0.1_Ultimate
 [2.0 Ultimate]: https://github.com/asaotomo/DeepSentry/releases/tag/DeepSentry_v2.0_Ultimate

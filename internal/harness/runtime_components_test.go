@@ -86,7 +86,7 @@ func TestToolsAndSubAgentMiddlewareValidationPaths(t *testing.T) {
 	if result, handled, _ := mw.HandleAction(ctx, &AgentAction{Type: ActionTool, ToolName: "fleet_exec", ToolArgs: map[string]string{"selector": "all"}}); !handled || !strings.Contains(result.Output, "command") {
 		t.Fatalf("fleet validation result=%#v handled=%v", result, handled)
 	}
-	if !skillMarketMutation("install") || skillMarketMutation("search") || !skillConfigMutation("disable_skill") || skillConfigMutation("status") {
+	if !skillMarketMutation("install") || !skillMarketMutation("import") || skillMarketMutation("search") || !skillConfigMutation("disable_skill") || skillConfigMutation("status") {
 		t.Fatal("skill mutation classifiers are inconsistent")
 	}
 

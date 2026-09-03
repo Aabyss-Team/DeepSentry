@@ -3,6 +3,7 @@ package tui
 import (
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"ai-edr/internal/ui"
 
@@ -24,6 +25,8 @@ func TestRenderWelcomeBannerFitsWidth(t *testing.T) {
 		WorkDir:    "/opt/deepsentry",
 		ModeLine:   "🔌 [模式切换] 本地执行模式",
 		ToolCount:  51,
+		MCPCount:   2,
+		MCPSummary: "2 个已连接 · fofamap 15 · hx0-hawkeye 51",
 		Tip:        "Tab 聚焦输入框，Enter 发送安全任务",
 	}
 	for _, w := range []int{96, 120, 140} {
@@ -49,11 +52,17 @@ func TestRenderWelcomeBannerFitsWidth(t *testing.T) {
 		if !strings.Contains(plain, "DeepSentry") {
 			t.Fatalf("banner should include brand title: %q", plain)
 		}
+		if !strings.Contains(plain, "Hx0 Studio") || !strings.Contains(plain, "官网 · https://hx0studio.com/") {
+			t.Fatalf("banner should include Hx0 Studio and 官网 URL: %q", plain)
+		}
 		if !strings.Contains(plain, "深海哨兵") {
 			t.Fatalf("banner should include brand tagline: %q", plain)
 		}
 		if !strings.Contains(plain, "小技巧") {
 			t.Fatalf("banner should include usage tip: %q", plain)
+		}
+		if !strings.Contains(plain, "MCP") || !strings.Contains(plain, "fofamap 15") {
+			t.Fatalf("banner should list MCP connections and tool counts: %q", plain)
 		}
 		if !strings.Contains(plain, "目录") || !strings.Contains(plain, "报告") {
 			t.Fatalf("banner should include workdir and report paths: %q", plain)
@@ -110,6 +119,87 @@ func TestBannerColumnRatio(t *testing.T) {
 	}
 }
 
+func TestPadLinesCenteredPutsLogoBelowTop(t *testing.T) {
+	even := padLinesCentered([]string{"logo", "title"}, 6)
+	if strings.Join(even, ",") != ",,logo,title,," {
+		t.Fatalf("even gap should be vertically centered: %#v", even)
+	}
+	odd := padLinesCentered([]string{"logo", "title"}, 5)
+	if strings.Join(odd, ",") != ",,logo,title," {
+		t.Fatalf("odd gap should bias extra space above: %#v", odd)
+	}
+
+	info := StartupInfo{
+		Version: "2.0.3", BuildTime: "2026-09-03", ModelInfo: "deepseek / demo",
+		ConnInfo: "本地模式", OS: "Darwin", Arch: "arm64", Username: "demo",
+		Hostname: "host", WorkDir: "/opt/deepsentry", ReportPath: "reports/a.md",
+		ToolCount: 71, SubAgentCount: 8, SkillCount: 3, NativeTools: true,
+		MCPCount: 2, MCPSummary: "2 个已连接 · fofamap 15 · hx0-hawkeye 51",
+		Tip: "Tab 聚焦输入框", AwaitGoal: true, StartedAt: "2026-09-03 14:56:02",
+		Notices: []string{"定时任务调度已启用"},
+	}
+	plain := stripANSIForTest(renderWelcomeBanner(info, 120))
+	rows := strings.Split(plain, "\n")
+	contentTop := 1
+	contentBottom := len(rows) - 2
+	leftFirst, leftLast := bannerColumnSpan(rows, true)
+	rightFirst, rightLast := bannerColumnSpan(rows, false)
+	if leftFirst < 0 || leftLast < 0 {
+		t.Fatalf("logo column missing in banner:\n%s", plain)
+	}
+	if rightFirst < 0 || rightLast < 0 {
+		t.Fatalf("info column missing in banner:\n%s", plain)
+	}
+	if !strings.Contains(plain, "Hx0 Studio") || !strings.Contains(plain, "官网 · https://hx0studio.com/") {
+		t.Fatalf("left column should show Hx0 Studio and 官网 URL:\n%s", plain)
+	}
+	for name, span := range map[string][2]int{
+		"left":  {leftFirst, leftLast},
+		"right": {rightFirst, rightLast},
+	} {
+		first, last := span[0], span[1]
+		if first <= contentTop {
+			t.Fatalf("%s column still top-aligned: first=%d", name, first)
+		}
+		if last >= contentBottom {
+			t.Fatalf("%s column should leave space below, last=%d bottom=%d", name, last, contentBottom)
+		}
+		above := first - contentTop
+		below := contentBottom - last
+		if above < below {
+			t.Fatalf("%s column still too high: %d rows above, %d below", name, above, below)
+		}
+	}
+}
+
+func bannerColumnSpan(rows []string, left bool) (first, last int) {
+	first, last = -1, -1
+	for i, row := range rows {
+		if !strings.HasPrefix(row, "│") && !strings.HasPrefix(row, "|") {
+			continue
+		}
+		inner := strings.TrimPrefix(strings.TrimPrefix(row, "│"), "|")
+		inner = strings.TrimSuffix(strings.TrimSuffix(inner, "│"), "|")
+		cut := strings.IndexAny(inner, "│|")
+		if cut <= 0 {
+			continue
+		}
+		_, size := utf8.DecodeRuneInString(inner[cut:])
+		cell := strings.TrimSpace(inner[:cut])
+		if !left {
+			cell = strings.TrimSpace(inner[cut+size:])
+		}
+		if cell == "" {
+			continue
+		}
+		if first < 0 {
+			first = i
+		}
+		last = i
+	}
+	return first, last
+}
+
 func TestRobotLogoSymmetric(t *testing.T) {
 	lines := ui.RobotLogoLines()
 	if len(lines) != 9 {
@@ -141,6 +231,8 @@ func TestRandomUsageTipStablePool(t *testing.T) {
 		"ctx=", "64K、128K", "context_window_tokens", "tool_catalog", "config_manage",
 		"fleet_inventory", "parallel_tasks", "核心线索", "schedule_task", "headless_browser",
 		"pcap_analyze", "db_config_audit", "MCP", "Native Tool schema", "checkpoint",
+		"zip_password_recover", "fofa_rules", "bilibili-play", "ssh_legacy_compat",
+		"nuclei_plan", "mcp_server_configs", "⌘V",
 	} {
 		if !strings.Contains(joined, feature) {
 			t.Fatalf("tip pool missing latest capability %q", feature)

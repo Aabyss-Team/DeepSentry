@@ -36,7 +36,9 @@ type SkillCatalog struct {
 }
 
 // LoadCatalog 从多个来源路径加载 Skill 目录
-// sources 按优先级排列，后加载的同名 skill 覆盖先加载的
+// sources 按优先级排列，后加载的同名 skill 覆盖先加载的。
+// 例外：DeepSentry 内置的 FofaMap MCP playbook 不会被市场里带
+// scripts/fofa_recon.py 的同名 Skill 覆盖。
 func LoadCatalog(sources []string) (*SkillCatalog, error) {
 	catalog := &SkillCatalog{Sources: append([]string(nil), sources...)}
 	seen := make(map[string]int)
@@ -70,6 +72,9 @@ func LoadCatalog(sources []string) (*SkillCatalog, error) {
 			}
 
 			if idx, exists := seen[meta.Name]; exists {
+				if keepMCPAdapterSkill(catalog.Skills[idx], meta) {
+					continue
+				}
 				catalog.Skills[idx] = meta
 			} else {
 				seen[meta.Name] = len(catalog.Skills)
@@ -223,8 +228,8 @@ func (c *SkillCatalog) FormatCatalogPrompt() string {
 	}
 
 	var b strings.Builder
-	b.WriteString("\n【可用 Skills — 按需加载】\n")
-	b.WriteString("使用 action=\"load_skill\" + skill_name 加载完整指令。仅在需要时加载，避免浪费上下文。\n\n")
+	b.WriteString("\n【可用 Skills】\n")
+	b.WriteString("目录只有名称和描述。任务明显匹配某个 name/description 时，先调用 skill(name=精确名) 或 action=load_skill，再动手；不要先 pwd/ls 或盲目点页面。运行器也可能已按匹配自动注入，见到【已加载 Skills】就按其 playbook 执行。\n\n")
 	const maxCatalogChars = 8000
 	included, hidden, omitted := 0, 0, 0
 	for _, s := range c.Skills {
@@ -323,6 +328,40 @@ func parseSkillMeta(skillFile, skillDir string) (SkillMeta, error) {
 	}
 
 	return meta, nil
+}
+
+// keepMCPAdapterSkill prevents ClawHub's python fofa_recon.py wrapper from
+// replacing DeepSentry's bundled FofaMap MCP playbook when both are named
+// "fofamap". A later MCP-oriented skill (for example the official 2.0.1
+// agent-kit copy) can still overwrite the bundled one.
+func keepMCPAdapterSkill(existing, incoming SkillMeta) bool {
+	if !strings.EqualFold(strings.TrimSpace(existing.Name), "fofamap") {
+		return false
+	}
+	if isPythonFOFAPlaybook(incoming.Dir) && isMCPFofaMapPlaybook(existing) {
+		return true
+	}
+	return false
+}
+
+func isPythonFOFAPlaybook(dir string) bool {
+	if strings.TrimSpace(dir) == "" {
+		return false
+	}
+	_, err := os.Stat(filepath.Join(dir, "scripts", "fofa_recon.py"))
+	return err == nil
+}
+
+func isMCPFofaMapPlaybook(meta SkillMeta) bool {
+	if isPythonFOFAPlaybook(meta.Dir) {
+		return false
+	}
+	blob := strings.ToLower(meta.Description + "\n" + meta.Path)
+	if data, err := os.ReadFile(meta.Path); err == nil {
+		blob += "\n" + strings.ToLower(string(data))
+	}
+	return strings.Contains(blob, "mcp") &&
+		(strings.Contains(blob, "fofa_account") || strings.Contains(blob, "fofa_search") || strings.Contains(blob, "fofa_rules"))
 }
 
 func expandSourcePath(path string) string {

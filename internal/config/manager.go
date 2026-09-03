@@ -537,6 +537,9 @@ func manageSetSSH(root *yaml.Node, args map[string]string) (string, error) {
 	setScalar(root, "ssh_user", user)
 	setScalar(root, "ssh_password", password)
 	setScalar(root, "ssh_key_path", keyPath)
+	if passphrase := firstConfigArg(args, "key_passphrase", "ssh_key_passphrase", "passphrase"); passphrase != "" {
+		setScalar(root, "ssh_key_passphrase", passphrase)
+	}
 	setScalar(root, "ssh_device_type", deviceType)
 	setScalar(root, "ssh_prompt", firstConfigArg(args, "prompt", "ssh_prompt"))
 	setScalar(root, "ssh_enable_password", firstConfigArg(args, "enable_password", "ssh_enable_password"))
@@ -614,6 +617,18 @@ func validateManagedScalar(key, value string) error {
 			return nil
 		default:
 			return fmt.Errorf("ssh_host_key_policy 必须是 strict|accept-new|insecure，收到 %q", value)
+		}
+	case "ssh_legacy_compat":
+		switch strings.ToLower(value) {
+		case "true", "1", "yes", "on", "false", "0", "no", "off":
+			return nil
+		default:
+			return fmt.Errorf("ssh_legacy_compat 必须是 true|false，收到 %q", value)
+		}
+	case "ssh_connect_timeout_sec":
+		n, err := strconv.Atoi(value)
+		if err != nil || n < 0 || n > 120 {
+			return fmt.Errorf("ssh_connect_timeout_sec 必须是 0-120 的整数，收到 %q", value)
 		}
 	case "archive_max_entries":
 		n, err := strconv.Atoi(value)
@@ -744,11 +759,13 @@ func validateConfigNode(doc *yaml.Node) error {
 	reader.SetConfigType("yaml")
 	reader.SetDefault("provider", "deepseek")
 	reader.SetDefault("api_protocol", "auto")
-	reader.SetDefault("api_url", "https://api.deepseek.com/v1")
-	reader.SetDefault("model_name", "deepseek-v4-pro")
+	reader.SetDefault("api_url", "https://api.deepseek.com")
+	reader.SetDefault("model_name", "deepseek-v4-flash-vision-exp")
 	reader.SetDefault("model_profile", "auto")
 	reader.SetDefault("ssh_host_key_policy", "accept-new")
 	reader.SetDefault("ssh_known_hosts_path", "~/.deepsentry/known_hosts")
+	reader.SetDefault("ssh_legacy_compat", "true")
+	reader.SetDefault("ssh_connect_timeout_sec", 25)
 	reader.SetDefault("scheduler_timezone", "Local")
 	if err := reader.ReadConfig(bytes.NewReader(data)); err != nil {
 		return fmt.Errorf("解析配置失败: %w", err)
@@ -1120,6 +1137,7 @@ func targetNode(t TargetConfig) *yaml.Node {
 		{"user", t.User},
 		{"password", t.Password},
 		{"key_path", t.KeyPath},
+		{"key_passphrase", t.KeyPassphrase},
 		{"prompt", t.Prompt},
 		{"auth_prompt_regex", t.AuthPromptRegex},
 		{"device_type", t.DeviceType},
@@ -1235,6 +1253,7 @@ func configTargetFromArgs(name, protocol, host string, args map[string]string) T
 		User:                     valueOr(firstConfigArg(args, "user", "ssh_user", "username"), defaultUser(protocol)),
 		Password:                 firstConfigArg(args, "password", "ssh_password", "pass"),
 		KeyPath:                  firstConfigArg(args, "key_path", "ssh_key_path", "key"),
+		KeyPassphrase:            firstConfigArg(args, "key_passphrase", "ssh_key_passphrase", "passphrase"),
 		Prompt:                   firstConfigArg(args, "prompt"),
 		AuthPromptRegex:          firstConfigArg(args, "auth_prompt_regex", "telnet_auth_prompt_regex"),
 		DeviceType:               valueOr(firstConfigArg(args, "device_type", "ssh_device_type", "telnet_device_type"), "auto"),
@@ -1264,6 +1283,7 @@ func currentSingleTarget(root *yaml.Node) (TargetConfig, bool) {
 			User:           valueOr(readScalar(root, "ssh_user"), "root"),
 			Password:       readScalar(root, "ssh_password"),
 			KeyPath:        readScalar(root, "ssh_key_path"),
+			KeyPassphrase:  readScalar(root, "ssh_key_passphrase"),
 			Prompt:         readScalar(root, "ssh_prompt"),
 			DeviceType:     valueOr(readScalar(root, "ssh_device_type"), "auto"),
 			EnablePassword: readScalar(root, "ssh_enable_password"),
@@ -1309,7 +1329,7 @@ func currentSingleTarget(root *yaml.Node) (TargetConfig, bool) {
 
 func clearSingleTargetScalars(root *yaml.Node) {
 	for _, key := range []string{
-		"ssh_host", "ssh_user", "ssh_password", "ssh_key_path", "ssh_device_type", "ssh_prompt", "ssh_enable_password",
+		"ssh_host", "ssh_user", "ssh_password", "ssh_key_path", "ssh_key_passphrase", "ssh_device_type", "ssh_prompt", "ssh_enable_password",
 		"telnet_host", "telnet_user", "telnet_password", "telnet_prompt", "telnet_auth_prompt_regex", "telnet_device_type", "telnet_enable_password",
 		"ftp_host", "ftp_user", "ftp_password", "ftp_tls_mode", "ftp_tls_server_name", "ftp_tls_ca_file", "ftp_data_mode", "ftp_active_address",
 	} {
@@ -1335,6 +1355,7 @@ func readTargets(root *yaml.Node) []TargetConfig {
 			User:                     readScalar(item, "user"),
 			Password:                 readScalar(item, "password"),
 			KeyPath:                  readScalar(item, "key_path"),
+			KeyPassphrase:            readScalar(item, "key_passphrase"),
 			Prompt:                   readScalar(item, "prompt"),
 			AuthPromptRegex:          readScalar(item, "auth_prompt_regex"),
 			DeviceType:               readScalar(item, "device_type"),
@@ -1430,7 +1451,7 @@ func allowedScalarConfigKey(key string) bool {
 		"reserved_output_tokens", "native_tool_limit", "agent_runtime", "terminal_theme",
 		"llm_timeout_sec", "llm_retries", "ssh_command_timeout_sec", "ssh_max_output_bytes",
 		"max_steps", "subagent_max_steps", "target_protocol", "ssh_host", "ssh_user",
-		"ssh_password", "ssh_key_path", "ssh_host_key_policy", "ssh_known_hosts_path", "ssh_device_type", "ssh_prompt", "ssh_enable_password", "telnet_host", "telnet_user", "telnet_password",
+		"ssh_password", "ssh_key_path", "ssh_key_passphrase", "ssh_host_key_policy", "ssh_known_hosts_path", "ssh_legacy_compat", "ssh_connect_timeout_sec", "ssh_device_type", "ssh_prompt", "ssh_enable_password", "telnet_host", "telnet_user", "telnet_password",
 		"telnet_prompt", "telnet_auth_prompt_regex", "telnet_device_type", "telnet_enable_password", "ftp_host", "ftp_user", "ftp_password", "ftp_tls_mode", "ftp_tls_server_name", "ftp_tls_ca_file", "ftp_tls_insecure_skip_verify", "ftp_data_mode", "ftp_active_address", "ftp_connect_timeout_sec", "ftp_command_timeout_sec", "ftp_transfer_timeout_sec", "use_native_tools",
 		"controller_proxy", "browser_binary", "browser_timeout_sec", "browser_artifact_dir",
 		"archive_max_entries", "archive_max_file_bytes", "archive_max_total_bytes",
