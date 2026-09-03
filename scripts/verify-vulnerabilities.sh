@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# DeepSentry v2.0.3 CI: reachable vulnerability gate for release binaries.
 
 set -euo pipefail
 

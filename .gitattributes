@@ -1,3 +1,4 @@
+# DeepSentry v2.0.3: normalize text to LF; keep Windows scripts and binaries intact.
 * text=auto eol=lf
 *.bat text eol=crlf
 *.cmd text eol=crlf
