@@ -27,6 +27,7 @@
 
 - 更新 OpenAI、Claude、Gemini、DeepSeek、千问、GLM、MiniMax、MiMo、混元与 xAI 的内置模型预设和多模态能力目录。
 - SSH 增加旧算法可选兼容、keyboard-interactive、加密私钥口令和 PTY 回退；网络设备识别扩展至 ASA、Juniper、Fortinet、Palo Alto、山石、深信服、Check Point 等平台。
+- SSH 主机密钥协商会优先使用 `known_hosts` 已固定的算法；真实密钥变更会显示旧/新 SHA256 指纹，并只在用户独立核对、明确确认后替换对应记录。
 - Skill 可按任务自动匹配并注入；循环守卫会阻止无效重复，同时保留一次瞬时失败重试机会。
 - 高风险会话授权按目标与操作类型复用，任意执行、写入及敏感参数变化继续使用严格指纹。
 - Go 工具链与网络、加密依赖升级到已修复版本，二进制符号级漏洞扫描未发现可达漏洞。

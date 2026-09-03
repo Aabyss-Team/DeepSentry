@@ -717,6 +717,8 @@ teleai, ctyun, minimax, mimo, glm, xai, grok, ollama, lmstudio, custom
 | `ssh_key_passphrase` | 加密私钥口令；未加密私钥可留空 |
 | `telnet_prompt` | 老设备 Telnet 命令提示符；自动识别不稳定时显式配置 |
 
+当 `known_hosts` 已固定某种主机密钥，而服务器同时提供新的 RSA、ECDSA 或 ED25519 密钥时，DeepSentry 会优先协商已固定的算法，避免把“同一服务器新增另一种密钥”误判为身份变化。如果已固定的密钥确实不再提供，程序会同时显示旧指纹和本次收到的新 SHA256 指纹；只有选择“核对并更新 SSH 主机密钥”、通过云控制台或管理员独立核对并再次确认后，才会替换该目标的旧记录。重新输入密码或启用 `ssh_legacy_compat` 都不会绕过主机身份校验。
+
 启动时可像 fscan 一样临时指定代理，命令行优先于 `controller_proxy`，但不会写回配置文件：
 
 ```bash

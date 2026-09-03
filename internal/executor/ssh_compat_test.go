@@ -1,10 +1,13 @@
 package executor
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +16,7 @@ import (
 	"ai-edr/internal/config"
 
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/knownhosts"
 )
 
 func TestSSHLegacyAlgorithmListsIncludeOldServerSuites(t *testing.T) {
@@ -70,6 +74,45 @@ func TestBuildSSHClientConfigCanDisableLegacy(t *testing.T) {
 	}
 	if len(client.KeyExchanges) != 0 || len(client.Ciphers) != 0 {
 		t.Fatalf("modern mode should leave algorithm lists empty so Go defaults apply: kex=%v ciphers=%v", client.KeyExchanges, client.Ciphers)
+	}
+}
+
+func TestBuildSSHClientConfigPrefersPinnedHostKeyType(t *testing.T) {
+	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pinnedKey, err := ssh.NewPublicKey(&privateKey.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host := "[127.0.0.1]:2222"
+	knownHosts := filepath.Join(t.TempDir(), "known_hosts")
+	line := knownhosts.Line([]string{knownhosts.Normalize(host)}, pinnedKey) + "\n"
+	if err := os.WriteFile(knownHosts, []byte(line), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	client, err := buildSSHClientConfig(config.Config{
+		SSHHost:           host,
+		SSHUser:           "root",
+		SSHPassword:       "test",
+		SSHHostKeyPolicy:  "accept-new",
+		SSHKnownHostsPath: knownHosts,
+	}, ssh.InsecureIgnoreHostKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(client.HostKeyAlgorithms) == 0 || client.HostKeyAlgorithms[0] != ssh.KeyAlgoECDSA256 {
+		t.Fatalf("pinned ECDSA key should be preferred, got %v", client.HostKeyAlgorithms)
+	}
+}
+
+func TestFormatSSHHandshakeErrorPreservesCause(t *testing.T) {
+	cause := errors.New("host key mismatch")
+	wrapped := formatSSHHandshakeError("127.0.0.1:22", cause)
+	if !errors.Is(wrapped, cause) {
+		t.Fatalf("handshake wrapper lost cause: %v", wrapped)
 	}
 }
 

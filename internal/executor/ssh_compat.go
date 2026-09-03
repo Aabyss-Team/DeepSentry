@@ -40,7 +40,9 @@ func buildSSHClientConfig(cfg config.Config, hostKeyCallback ssh.HostKeyCallback
 		client.KeyExchanges = kex
 		client.Ciphers = ciphers
 		client.MACs = macs
-		client.HostKeyAlgorithms = hostKeys
+		client.HostKeyAlgorithms = preferPinnedSSHHostKeyAlgorithms(cfg, hostKeys)
+	} else {
+		client.HostKeyAlgorithms = preferPinnedSSHHostKeyAlgorithms(cfg, ssh.SupportedAlgorithms().HostKeys)
 	}
 	return client, nil
 }
@@ -144,5 +146,5 @@ func formatSSHHandshakeError(addr string, err error) error {
 	case strings.Contains(lower, "unable to authenticate") || strings.Contains(lower, "permission denied"):
 		hint = "；已同时尝试公钥、keyboard-interactive 和 password。请核对用户名/密码/私钥口令"
 	}
-	return fmt.Errorf("SSH握手失败 (%s): %v%s", addr, err, hint)
+	return fmt.Errorf("SSH握手失败 (%s): %w%s", addr, err, hint)
 }

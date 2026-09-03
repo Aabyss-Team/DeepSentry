@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -795,6 +796,234 @@ type SSHExecutor struct {
 
 var knownHostsMu sync.Mutex
 
+type sshHostKeyMismatchError struct {
+	hostname            string
+	knownHostsPath      string
+	knownFingerprints   []string
+	receivedFingerprint string
+	receivedKey         ssh.PublicKey
+	wantLines           map[int]struct{}
+	knownHostsDigest    [sha256.Size]byte
+	cause               error
+}
+
+func (e *sshHostKeyMismatchError) Error() string {
+	known := strings.Join(e.knownFingerprints, ", ")
+	if known == "" {
+		known = "未知"
+	}
+	return fmt.Sprintf(
+		"SSH 主机密钥已变化（%s）：已记录 %s，当前 %s；这不是算法降级问题，请先通过云控制台或主机管理员独立核对当前指纹",
+		e.hostname,
+		known,
+		e.receivedFingerprint,
+	)
+}
+
+func (e *sshHostKeyMismatchError) Unwrap() error { return e.cause }
+
+// SSHHostKeyMismatchInfo contains public fingerprints only. It deliberately
+// excludes credentials and the raw server key so callers can display it in a
+// confirmation prompt without leaking authentication material.
+type SSHHostKeyMismatchInfo struct {
+	Hostname            string
+	KnownHostsPath      string
+	KnownFingerprints   []string
+	ReceivedFingerprint string
+}
+
+// InspectSSHHostKeyMismatch returns details when an SSH failure was caused by
+// a changed key for an already-pinned host.
+func InspectSSHHostKeyMismatch(err error) (SSHHostKeyMismatchInfo, bool) {
+	var mismatch *sshHostKeyMismatchError
+	if !errors.As(err, &mismatch) || mismatch == nil {
+		return SSHHostKeyMismatchInfo{}, false
+	}
+	return SSHHostKeyMismatchInfo{
+		Hostname:            mismatch.hostname,
+		KnownHostsPath:      mismatch.knownHostsPath,
+		KnownFingerprints:   append([]string(nil), mismatch.knownFingerprints...),
+		ReceivedFingerprint: mismatch.receivedFingerprint,
+	}, true
+}
+
+// ReplaceSSHHostKeyFromMismatch replaces only the known_hosts lines that
+// matched the failed host-key check. The mismatch object is bound to the file
+// digest observed during the handshake, so an external edit causes a safe
+// failure instead of overwriting newer trust data.
+func ReplaceSSHHostKeyFromMismatch(err error) error {
+	var mismatch *sshHostKeyMismatchError
+	if !errors.As(err, &mismatch) || mismatch == nil || mismatch.receivedKey == nil {
+		return fmt.Errorf("SSH 错误中没有可确认的主机密钥变更")
+	}
+
+	knownHostsMu.Lock()
+	defer knownHostsMu.Unlock()
+
+	raw, readErr := os.ReadFile(mismatch.knownHostsPath)
+	if readErr != nil {
+		return fmt.Errorf("读取 SSH known_hosts 失败: %w", readErr)
+	}
+	if sha256.Sum256(raw) != mismatch.knownHostsDigest {
+		return fmt.Errorf("SSH known_hosts 已在核对期间发生变化，请重新连接并再次确认")
+	}
+
+	lines := strings.Split(string(raw), "\n")
+	kept := make([]string, 0, len(lines)+1)
+	removed := 0
+	for index, line := range lines {
+		if _, drop := mismatch.wantLines[index+1]; drop {
+			if !knownHostsLineTargetsOnly(line, mismatch.hostname) {
+				return fmt.Errorf("目标记录包含别名、哈希或通配符，无法只替换当前主机；请手动核对 %s 第 %d 行", mismatch.knownHostsPath, index+1)
+			}
+			removed++
+			continue
+		}
+		kept = append(kept, line)
+	}
+	if removed == 0 {
+		return fmt.Errorf("未定位到需要替换的 SSH known_hosts 记录")
+	}
+
+	content := strings.Join(kept, "\n")
+	if content != "" && !strings.HasSuffix(content, "\n") {
+		content += "\n"
+	}
+	content += knownhosts.Line([]string{knownhosts.Normalize(mismatch.hostname)}, mismatch.receivedKey) + "\n"
+
+	dir := filepath.Dir(mismatch.knownHostsPath)
+	tmp, createErr := os.CreateTemp(dir, ".known_hosts-*.tmp")
+	if createErr != nil {
+		return fmt.Errorf("创建 SSH known_hosts 临时文件失败: %w", createErr)
+	}
+	tmpPath := tmp.Name()
+	committed := false
+	defer func() {
+		_ = tmp.Close()
+		if !committed {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if chmodErr := tmp.Chmod(0o600); chmodErr != nil {
+		return fmt.Errorf("设置 SSH known_hosts 权限失败: %w", chmodErr)
+	}
+	if _, writeErr := tmp.WriteString(content); writeErr != nil {
+		return fmt.Errorf("写入 SSH known_hosts 失败: %w", writeErr)
+	}
+	if syncErr := tmp.Sync(); syncErr != nil {
+		return fmt.Errorf("同步 SSH known_hosts 失败: %w", syncErr)
+	}
+	if closeErr := tmp.Close(); closeErr != nil {
+		return fmt.Errorf("关闭 SSH known_hosts 临时文件失败: %w", closeErr)
+	}
+	if replaceErr := replaceKnownHostsFile(tmpPath, mismatch.knownHostsPath); replaceErr != nil {
+		return fmt.Errorf("替换 SSH known_hosts 失败: %w", replaceErr)
+	}
+	committed = true
+	return nil
+}
+
+func knownHostsLineTargetsOnly(line, hostname string) bool {
+	fields := strings.Fields(line)
+	if len(fields) < 3 {
+		return false
+	}
+	hostIndex := 0
+	if strings.HasPrefix(fields[0], "@") {
+		hostIndex = 1
+	}
+	return len(fields) > hostIndex && fields[hostIndex] == knownhosts.Normalize(hostname)
+}
+
+func replaceKnownHostsFile(src, dst string) error {
+	if err := os.Rename(src, dst); err == nil {
+		return nil
+	} else if runtime.GOOS != "windows" {
+		return err
+	}
+	if err := os.Remove(dst); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return os.Rename(src, dst)
+}
+
+type sshKnownHostAddr string
+
+func (a sshKnownHostAddr) Network() string { return "tcp" }
+func (a sshKnownHostAddr) String() string  { return string(a) }
+
+// preferPinnedSSHHostKeyAlgorithms keeps all configured algorithms available,
+// but asks the server for a key type that is already pinned first. This avoids
+// a false key-mismatch when a server still presents the trusted key while also
+// advertising a newly added ED25519/RSA/ECDSA key.
+func preferPinnedSSHHostKeyAlgorithms(cfg config.Config, algorithms []string) []string {
+	policy := strings.ToLower(strings.TrimSpace(cfg.SSHHostKeyPolicy))
+	if policy == "insecure" || strings.TrimSpace(cfg.SSHHost) == "" || len(algorithms) < 2 {
+		return algorithms
+	}
+	path, err := resolveKnownHostsPath(cfg.SSHKnownHostsPath)
+	if err != nil {
+		return algorithms
+	}
+	check, err := knownhosts.New(path)
+	if err != nil {
+		return algorithms
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return algorithms
+	}
+
+	address := normalizeSSHHost(cfg.SSHHost)
+	pinnedTypes := map[string]bool{}
+	scanner := bufio.NewScanner(bytes.NewReader(raw))
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) < 3 || strings.HasPrefix(fields[0], "#") {
+			continue
+		}
+		keyIndex := 1
+		if strings.HasPrefix(fields[0], "@") {
+			keyIndex = 2
+		}
+		if len(fields) <= keyIndex+1 {
+			continue
+		}
+		key, _, _, _, parseErr := ssh.ParseAuthorizedKey([]byte(strings.Join(fields[keyIndex:], " ")))
+		if parseErr != nil {
+			continue
+		}
+		if check(address, sshKnownHostAddr(address), key) == nil {
+			pinnedTypes[key.Type()] = true
+		}
+	}
+	if len(pinnedTypes) == 0 {
+		return algorithms
+	}
+
+	isPinned := func(algorithm string) bool {
+		if pinnedTypes[algorithm] {
+			return true
+		}
+		if pinnedTypes[ssh.KeyAlgoRSA] {
+			return algorithm == ssh.KeyAlgoRSASHA512 || algorithm == ssh.KeyAlgoRSASHA256 || algorithm == ssh.KeyAlgoRSA
+		}
+		return false
+	}
+	ordered := make([]string, 0, len(algorithms))
+	for _, algorithm := range algorithms {
+		if isPinned(algorithm) {
+			ordered = append(ordered, algorithm)
+		}
+	}
+	for _, algorithm := range algorithms {
+		if !isPinned(algorithm) {
+			ordered = append(ordered, algorithm)
+		}
+	}
+	return ordered
+}
+
 func normalizeSSHHost(host string) string {
 	host = strings.TrimSpace(host)
 	if host == "" {
@@ -878,7 +1107,38 @@ func sshHostKeyCallback(cfg config.Config) (ssh.HostKeyCallback, error) {
 			return nil
 		}
 		var keyErr *knownhosts.KeyError
-		if policy != "accept-new" || !errors.As(err, &keyErr) || len(keyErr.Want) > 0 {
+		if errors.As(err, &keyErr) && len(keyErr.Want) > 0 {
+			raw, readErr := os.ReadFile(path)
+			if readErr != nil {
+				return fmt.Errorf("读取 SSH known_hosts 失败: %w", readErr)
+			}
+			fingerprints := make([]string, 0, len(keyErr.Want))
+			seenFingerprints := map[string]bool{}
+			wantLines := make(map[int]struct{}, len(keyErr.Want))
+			for _, wanted := range keyErr.Want {
+				if wanted.Key != nil {
+					fingerprint := ssh.FingerprintSHA256(wanted.Key)
+					if !seenFingerprints[fingerprint] {
+						seenFingerprints[fingerprint] = true
+						fingerprints = append(fingerprints, fingerprint)
+					}
+				}
+				if wanted.Line > 0 {
+					wantLines[wanted.Line] = struct{}{}
+				}
+			}
+			return &sshHostKeyMismatchError{
+				hostname:            hostname,
+				knownHostsPath:      path,
+				knownFingerprints:   fingerprints,
+				receivedFingerprint: ssh.FingerprintSHA256(key),
+				receivedKey:         key,
+				wantLines:           wantLines,
+				knownHostsDigest:    sha256.Sum256(raw),
+				cause:               err,
+			}
+		}
+		if policy != "accept-new" || !errors.As(err, &keyErr) {
 			return fmt.Errorf("SSH 主机密钥校验失败（%s）: %w", hostname, err)
 		}
 

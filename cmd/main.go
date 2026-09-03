@@ -413,20 +413,34 @@ func runCLI() (exitCode int) {
 			}
 			fmt.Printf("\n%s%s\n", ui.Prefix("❌", "[ERR]"), ui.StripANSIIfPlain(fmt.Sprintf("\033[1;31mSSH 连接失败: %v\033[0m", err)))
 			choice := ""
+			options := make([]string, 0, 4)
+			if _, keyMismatch := executor.InspectSSHHostKeyMismatch(err); keyMismatch {
+				options = append(options, ui.Prefix("🔐", "[TRUST]")+"核对并更新 SSH 主机密钥")
+			}
+			options = append(options,
+				ui.Prefix("🔧", "[CFG]")+"修改 SSH 配置 (重新输入密码)",
+				ui.Prefix("💻", "[LOCAL]")+"切换为 本地模式 (清除 SSH 配置)",
+				ui.Prefix("❌", "[EXIT]")+"退出程序",
+			)
 			prompt := &survey.Select{
 				Message: "检测到 SSH 连接失败，请选择操作:",
-				Options: []string{
-					ui.Prefix("🔧", "[CFG]") + "修改 SSH 配置 (重新输入密码)",
-					ui.Prefix("💻", "[LOCAL]") + "切换为 本地模式 (清除 SSH 配置)",
-					ui.Prefix("❌", "[EXIT]") + "退出程序",
-				},
+				Options: options,
 			}
 			if err := askOne(prompt, &choice); err != nil {
 				fmt.Printf("%sSSH 连接失败且未选择处理方式: %v\n", ui.Prefix("❌", "[ERR]"), err)
 				ui.Exit(1)
 			}
 			ui.ResetTerminalState()
-			if strings.Contains(choice, "修改 SSH 配置") {
+			if strings.Contains(choice, "核对并更新 SSH 主机密钥") {
+				updated, updateErr := confirmAndReplaceSSHHostKey(err)
+				if updateErr != nil {
+					fmt.Printf("%s更新 SSH 主机密钥失败: %v\n", ui.Prefix("❌", "[ERR]"), updateErr)
+				}
+				if updated {
+					fmt.Println(ui.Prefix("🔄", "[RETRY]") + "主机密钥已更新，正在使用原认证配置重新连接...")
+				}
+				continue
+			} else if strings.Contains(choice, "修改 SSH 配置") {
 				if wizardErr := runSSHWizard(false); wizardErr != nil {
 					fmt.Printf("%sSSH 配置向导已中止: %v\n", ui.Prefix("❌", "[ERR]"), wizardErr)
 					ui.Exit(1)
@@ -1267,6 +1281,40 @@ func waitForSignal() {
 // ---------------------------------------------------------------------
 // 辅助函数：向导与循环
 // ---------------------------------------------------------------------
+
+func confirmAndReplaceSSHHostKey(connectErr error) (bool, error) {
+	info, ok := executor.InspectSSHHostKeyMismatch(connectErr)
+	if !ok {
+		return false, fmt.Errorf("当前错误不是可确认的 SSH 主机密钥变更")
+	}
+
+	fmt.Printf("\n%sSSH 主机密钥发生变化。这不是旧算法兼容或密码错误。\n", ui.Prefix("⚠️", "[HOST KEY]"))
+	fmt.Printf("   目标: %s\n", info.Hostname)
+	fmt.Printf("   known_hosts: %s\n", info.KnownHostsPath)
+	for _, fingerprint := range info.KnownFingerprints {
+		fmt.Printf("   已记录指纹: %s\n", fingerprint)
+	}
+	fmt.Printf("   当前指纹（尚未验证）: %s\n", info.ReceivedFingerprint)
+	fmt.Println("   请通过云厂商控制台、服务器本地终端或管理员提供的可信渠道独立核对当前指纹。")
+
+	confirmed := false
+	if err := askOne(&survey.Confirm{
+		Message: "我已独立核对当前 SHA256 指纹，确认仅替换该目标的旧记录:",
+		Default: false,
+	}, &confirmed); err != nil {
+		return false, err
+	}
+	ui.ResetTerminalState()
+	if !confirmed {
+		fmt.Println(ui.Prefix("🛑", "[SAFE]") + "已取消更新；known_hosts 保持不变。")
+		return false, nil
+	}
+	if err := executor.ReplaceSSHHostKeyFromMismatch(connectErr); err != nil {
+		return false, err
+	}
+	fmt.Printf("%s已安全替换 %s 中该目标的旧主机密钥记录。\n", ui.Prefix("✅", "[OK]"), info.KnownHostsPath)
+	return true, nil
+}
 
 // runSSHWizard 统一的 SSH 配置向导
 func runSSHWizard(skipHostName bool) error {
