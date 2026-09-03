@@ -22,7 +22,8 @@
 
 DeepSentry 是一个 AI 安全应急与智能运维 Agent。你只需要用自然语言描述任务，它会自动规划步骤、调用 Shell 或内置 Go 原生工具、连接本地或远程目标、持续观察结果，并生成可审计的 Markdown 报告。
 
-<img width="1672" height="941" alt="DeepSentry v2.0.3 Ultimate" src="docs/images/deepsentry-v2.0.3-poster.png" />
+<img width="1672" height="941" alt="2.0.3" src="https://github.com/user-attachments/assets/db4362cf-1150-46bc-befb-9e0025bc4bc4" />
+
 
 > 仅允许在你拥有或已获得明确授权的系统中使用。请不要将 DeepSentry 用于未授权扫描、入侵、破坏、绕过访问控制或任何违法用途。
 
